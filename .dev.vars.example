@@ -1,0 +1,68 @@
+# Copy to .dev.vars for local development (`wrangler dev`), and set the same
+# names in production with: npx wrangler secret put <NAME> --config wrangler.local.jsonc
+#
+# Every value that identifies a particular Discord server, channel, member or
+# FIR set lives here rather than in wrangler.jsonc, so nothing operator-specific
+# is ever committed. `wrangler types` reads the NAMES from this file.
+
+# --- Discord ---------------------------------------------------------------
+DISCORD_BOT_TOKEN=""
+# Channels that receive online/offline notification cards (comma-separated).
+DISCORD_CHANNEL_IDS=""
+# Optional role to ping when ATC comes online. Empty disables the mention.
+MENTION_ROLE_ID=""
+
+# --- Monitored airspace ----------------------------------------------------
+# Required ICAO callsign prefixes to watch (comma-separated, 1–4 letters each).
+# Empty or malformed coverage stops polling without changing session state.
+FIR_PREFIXES=""
+# Optional private roster labels. Fictional example:
+# [{"prefixes":["XA"],"flag":"🌐","name":"Example"}]
+# Names: 1–12 characters; flag: country flag or globe; prefixes must not overlap.
+# Empty uses neutral labels. Never commit real coverage or display mappings.
+FIR_LABELS=""
+# Callsigns that never trigger notifications (comma-separated, exact match).
+EXCLUDED_CALLSIGNS=""
+
+# --- Guest Controller Approval reminders (optional) ------------------------
+# "true" enables reminder DMs. Anything else keeps them off.
+GCA_DM_ENABLED="false"
+# Discord server and member role used to map IVAO member IDs to accounts.
+GCA_DISCORD_GUILD_ID=""
+GCA_MEMBER_ROLE_ID=""
+# Optional staff account that receives a copy of each confirmed reminder.
+GCA_COPY_USER_ID=""
+# Private coverage as JSON (fictional example; replace with your own policy):
+# {"AA":{"name":"Example region","prefixes":["XA"],"homeCountries":["AA","AB"]}}
+# Region keys and home countries are uppercase two-letter codes. homeCountries
+# defaults to [region]; it must include the region. Prefixes are 1–4 uppercase
+# letters and must not overlap. Home countries cannot belong to multiple regions.
+# Missing or malformed coverage disables reminders. Never commit real coverage.
+GCA_REGIONS=""
+# Approval records, as JSON: {"<member id>":[{"region":"AA","level":3}]}
+# Region must exist in GCA_REGIONS. Levels: 1 DEL/GND/TWR, 2 APP/DEP, 3 CTR.
+# `{}` means nobody is approved.
+# Reminders stay OFF until this parses: an empty record would accuse
+# controllers who do hold an approval.
+GCA_APPROVALS=""
+# Home-region overrides, as JSON: {"<member id>":"AA"}. Optional.
+GCA_HOME_OVERRIDES=""
+# Optional https link to the division's GCA policy, included in the DM.
+# Invalid links or links longer than 2048 characters are omitted.
+GCA_POLICY_URL=""
+
+# --- IVAO API (optional) ---------------------------------------------------
+# OAuth2 client credentials (developers portal -> your application).
+# Without them the bot falls back to unauthenticated requests.
+IVAO_CLIENT_ID=""
+IVAO_CLIENT_SECRET=""
+
+# --- Manual poll trigger ---------------------------------------------------
+# Shared secret for /poll, /health, /gca-history and confirmed history cleanup.
+# Generate with: python3 -c "import secrets;print(secrets.token_urlsafe(32))"
+POLL_SECRET=""
+
+# Optional stable coordinator identity for an existing deployment.
+# Leave empty for a new installation (defaults to onfreq). Set this to the
+# existing object name BEFORE upgrading if it differs, to preserve all state.
+COORDINATOR_NAME=""

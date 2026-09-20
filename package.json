@@ -1,0 +1,44 @@
+{
+  "name": "onfreq",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Discord bot on Cloudflare Workers that notifies when IVAO ATC comes online or goes offline in the FIRs you monitor",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --config wrangler.local.jsonc",
+    "types": "wrangler types --strict-vars=false",
+    "typecheck": "npm run types && tsc --noEmit",
+    "test": "vitest run && node --test scripts/test-health-monitor.mjs",
+    "tail": "wrangler tail --config wrangler.local.jsonc",
+    "lint:docs": "markdownlint-cli2"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "markdownlint-cli2": "0.23.3",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.0.0"
+  },
+  "overrides": {
+    "sharp": "0.35.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EMOEMOJAI/onfreq.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EMOEMOJAI/onfreq/issues"
+  },
+  "homepage": "https://github.com/EMOEMOJAI/onfreq#readme",
+  "keywords": [
+    "ivao",
+    "atc",
+    "discord-bot",
+    "cloudflare-workers",
+    "durable-objects",
+    "flight-simulation",
+    "typescript"
+  ]
+}

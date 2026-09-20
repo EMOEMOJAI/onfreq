@@ -1,0 +1,21 @@
+{
+  "globs": [
+    "*.md",
+    "docs/*.md",
+    "llms.txt"
+  ],
+  "config": {
+    "MD013": false,
+    "MD033": {
+      "allowed_elements": [
+        "p",
+        "img",
+        "h1",
+        "br",
+        "strong",
+        "a"
+      ]
+    },
+    "MD041": false
+  }
+}

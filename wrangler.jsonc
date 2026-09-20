@@ -1,0 +1,42 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "onfreq",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "triggers": {
+    // Poll IVAO once per minute. Whazzup data refreshes ~every 15s upstream.
+    "crons": ["* * * * *"]
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "POLL_COORDINATOR", "class_name": "PollCoordinator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PollCoordinator"] }],
+  "kv_namespaces": [
+    {
+      // Public template only. Copy this file to wrangler.local.jsonc and replace
+      // the placeholder there with your own namespace ID. Never commit it.
+      "binding": "ATC_STATE",
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  "vars": {
+    // Consecutive polls a callsign must be missing before an "offline" notification
+    // is sent. 2 = tolerate one missed poll (brief disconnect / API hiccup).
+    "OFFLINE_GRACE_POLLS": "2"
+  }
+  // Everything that identifies a particular Discord server, channel, member or
+  // FIR set is a secret rather than a var: secrets are never written to this
+  // file, so a clone carries no operator's Discord, member or airspace config.
+  // Set them with `npx wrangler secret put <NAME> --config wrangler.local.jsonc`.
+  // See docs/setup.md. The KV ID above is a nonfunctional placeholder.
+  //   DISCORD_BOT_TOKEN, DISCORD_CHANNEL_IDS, MENTION_ROLE_ID, FIR_PREFIXES, FIR_LABELS,
+  //   EXCLUDED_CALLSIGNS, GCA_DM_ENABLED, GCA_DISCORD_GUILD_ID,
+  //   GCA_MEMBER_ROLE_ID, GCA_COPY_USER_ID, GCA_REGIONS, GCA_APPROVALS,
+  //   GCA_HOME_OVERRIDES, GCA_POLICY_URL, IVAO_CLIENT_ID, IVAO_CLIENT_SECRET,
+  //   POLL_SECRET, COORDINATOR_NAME
+}

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent that triggers the bot's poll endpoint every 60s.
+  Replace __HOME__ with your home directory, then:
+
+    cp com.onfreq.poll.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.onfreq.poll.plist
+
+  StartInterval counts from when the agent was loaded, not from the top of
+  the minute, so this naturally lands off :00 and won't collide with the
+  Cloudflare cron if that ever recovers.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.onfreq.poll</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>__HOME__/.onfreq/poll-trigger.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- The script writes its own timestamped log; these catch anything that
+         escapes it (a syntax error, a missing interpreter). -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/onfreq-poll.err.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/onfreq-poll.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

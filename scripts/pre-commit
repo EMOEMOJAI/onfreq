@@ -1,0 +1,25 @@
+#!/bin/sh
+# Blocks any commit whose staged changes contain a secret.
+#
+# .gitignore only protects files whose *names* match a pattern; it does nothing
+# about a token pasted into a source file. This catches that case.
+#
+# Install (per clone — git hooks are not themselves versioned):
+#   Check `git config --get core.hooksPath` first. Only if unset:
+#     git config core.hooksPath scripts
+#   Preserve existing hooks and any private-history push guard.
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  printf 'pre-commit: install gitleaks before committing (https://github.com/gitleaks/gitleaks).\n' >&2
+  exit 1
+fi
+
+if ! output=$(git diff --cached | gitleaks stdin --no-banner --redact 2>&1); then
+  printf '\n%s\n' "$output" >&2
+  printf '\npre-commit: BLOCKED — staged changes look like they contain a secret.\n' >&2
+  printf 'Unstage it, move the value into .dev.vars (gitignored) or a Wrangler secret.\n' >&2
+  printf 'If it is genuinely a false positive, append a "gitleaks:allow" comment on that line.\n' >&2
+  exit 1
+fi
+
+exit 0

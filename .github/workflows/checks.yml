@@ -1,0 +1,118 @@
+name: Checks
+
+on:
+  # Weekly dependency and regression checks; Sunday 19:00 UTC.
+  schedule:
+    - cron: "0 19 * * 0"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-and-lint:
+    name: Secrets, shell and workflow checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Pin tool versions and verify release archives before executing them.
+      # Install outside the checkout so downloads never become scan inputs.
+      - name: Install verified scanning tools
+        shell: bash
+        run: |
+          tool_dir=$(mktemp -d "$RUNNER_TEMP/onfreq-tools.XXXXXX")
+          cd "$tool_dir"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 3 --max-time 120 -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' gitleaks.tar.gz | sha256sum --check --strict
+          tar -xzf gitleaks.tar.gz gitleaks
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 3 --max-time 120 -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          printf '%s  %s\n' '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' actionlint.tar.gz | sha256sum --check --strict
+          tar -xzf actionlint.tar.gz actionlint
+          printf '%s\n' "$tool_dir" >> "$GITHUB_PATH"
+
+      - name: Scan reachable commit history for secrets
+        run: gitleaks git . --log-opts=HEAD --redact --no-banner
+
+      - name: Check POSIX shell scripts
+        run: shellcheck scripts/health-monitor.sh scripts/pre-commit
+
+      - name: Check GitHub Actions workflows
+        run: actionlint
+
+  macos-monitor:
+    name: macOS monitor and launchd checks
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Validate launchd plists and shell syntax
+        run: |
+          plutil -lint scripts/com.onfreq.health.plist scripts/com.onfreq.poll.plist
+          zsh -n scripts/poll-trigger.sh
+          sh -n scripts/health-monitor.sh
+          sh -n scripts/pre-commit
+
+      # The test harness uses temporary files and mocked curl/osascript.
+      # It never installs agents, calls production or displays notifications.
+      - name: Test Mac health monitoring
+        run: node --test scripts/test-health-monitor.mjs
+
+  checks:
+    # Use disposable GitHub-hosted machines. Never attach a persistent/private
+    # runner to this repository: pull requests can change workflow YAML.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install (lockfile-pinned)
+        run: npm ci
+
+      - name: Markdown lint
+        run: npm run lint:docs
+
+      # `wrangler types` derives the Env type from .dev.vars (gitignored); the example file
+      # carries the secret NAMES with placeholder values, which is all the type needs.
+      - name: Provide placeholder dev vars for type generation
+        run: cp .dev.vars.example .dev.vars
+
+      - name: Typecheck (wrangler types + tsc)
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Dependency audit (high and above)
+        run: npm audit --audit-level=high
+
+      - name: Validate deploy bundle without publishing
+        run: npx wrangler deploy --dry-run --outdir .wrangler/dry-run

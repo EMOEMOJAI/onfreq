@@ -1,0 +1,13 @@
+# onfreq
+
+> MIT-licensed, self-hosted IVAO ATC notification bot for Discord on Cloudflare Workers.
+
+Live session cards, FIR coverage, durable retries and optional GCA reminders with privately configured coverage. Public delivery is at least once. Deployment credentials, region policies and member approval records are operator-managed and excluded from this repository.
+
+## Documentation
+
+- [Overview](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/README.md): Features and contribution workflow.
+- [Setup](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/docs/setup.md): Deployment, configuration, Mac monitoring and maintenance.
+- [Agent instructions](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/AGENTS.md): Commands and implementation invariants.
+- [Security](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/SECURITY.md): Sensitive reporting and data retention.
+- [License](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/LICENSE): MIT terms.

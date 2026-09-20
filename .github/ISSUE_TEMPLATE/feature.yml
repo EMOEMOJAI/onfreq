@@ -1,0 +1,27 @@
+name: Feature request
+description: Explain a use case or suggest an improvement.
+body:
+  - type: markdown
+    attributes:
+      value: Please use synthetic examples and leave out member records, IDs, credentials and private deployment details.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the use case and who would benefit.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested behaviour
+      description: Describe the change and any alternatives you considered.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: This request contains no credentials, personal information or private deployment details.
+          required: true
