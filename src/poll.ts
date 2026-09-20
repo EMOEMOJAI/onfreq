@@ -21,6 +21,7 @@ import { diffState, newestCardedSession } from './state';
 import { enrichMemberCountries } from './member-country';
 import { sendGcaReminders } from './gca';
 import { syncRosterMessages, type RosterTarget } from './roster';
+import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import type { PendingOffline, OnlineAtc, PostedMessage, RosterMessage, StateMap, TrackedAtc } from './types';
 
 function parseGracePolls(raw: string | undefined): number {
@@ -48,6 +49,8 @@ async function announceOnline(
   mentionedChannels: Set<string>,
   current: OnlineAtc[],
   labels: FirLabel[],
+  limits: DiscordRateLimits,
+  nowIso: string,
 ): Promise<PostedMessage[]> {
   const embed = buildOnlineEmbed(atc, current, labels);
   const posted: PostedMessage[] = [];
@@ -59,8 +62,8 @@ async function announceOnline(
         ? `<@&${env.MENTION_ROLE_ID}>`
         : undefined;
     try {
-      const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content);
-      posted.push({ channelId, messageId, onlineEmbed: JSON.stringify(embed) });
+      const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits);
+      posted.push({ channelId, messageId, postedAt: nowIso, onlineEmbed: JSON.stringify(embed) });
       if (content) mentionedChannels.add(channelId);
     } catch (err) {
       logFailure('online_post_failed', atc.callsign, channelId, err);
@@ -72,6 +75,7 @@ async function announceOnline(
 /** Reconcile displayed cards, retrying only messages whose last edit failed. */
 async function syncOnlineCards(
   env: Env, next: StateMap, current: OnlineAtc[], gracePolls: number, labels: FirLabel[],
+  limits: DiscordRateLimits,
 ): Promise<{ targets: RosterTarget[]; failed: boolean }> {
   const coverage = current.map((atc) => next[atc.callsign] ?? atc);
   let targets: RosterTarget[];
@@ -80,20 +84,22 @@ async function syncOnlineCards(
   do {
     targets = [];
     removedMessage = false;
-    const holderCallsign = newestCardedSession(next);
+    const channels = new Set(Object.values(next).flatMap((session) =>
+      (session.messages ?? []).map((ref) => ref.channelId)));
+    const holders = new Map([...channels].map((channel) => [channel, newestCardedSession(next, channel)]));
     for (const [callsign, session] of Object.entries(next)) {
       // An ended session retained solely for offline retries must never turn green again.
       if (session.pending || session.missed >= gracePolls) continue;
-      const others = callsign === holderCallsign
-        ? coverage.filter((atc) => atc.callsign !== callsign)
-        : [];
-      const [embed, ...continuations] = buildOnlineEmbeds(session, others, coverage, labels);
-      const rendered = JSON.stringify(embed);
+      let hostsRoster = false;
       for (const ref of [...(session.messages ?? [])]) {
+        const isHolder = callsign === holders.get(ref.channelId);
+        const others = isHolder ? coverage.filter((atc) => atc.callsign !== callsign) : [];
+        const [embed, ...continuations] = buildOnlineEmbeds(session, others, coverage, labels);
+        const rendered = JSON.stringify(embed);
         let updated = ref.onlineEmbed === rendered;
         if (!updated) {
           try {
-            await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, embed);
+            await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, embed, limits);
             ref.onlineEmbed = rendered;
             updated = true;
           } catch (err) {
@@ -106,12 +112,13 @@ async function syncOnlineCards(
             failed = true;
           }
         }
-        if (callsign === holderCallsign || !updated) {
+        if (isHolder && formatRoster(others, labels)) hostsRoster = true;
+        if (isHolder || !updated) {
           targets.push({ channelId: ref.channelId, parentMessageId: ref.messageId,
             ...(updated ? { embeds: continuations } : {}) });
         }
       }
-      if (session.messages?.length && formatRoster(others, labels)) session.roster = true;
+      if (hostsRoster) session.roster = true;
       else delete session.roster;
     }
     // A deleted host cannot carry coverage. Reconcile again to choose a
@@ -121,28 +128,31 @@ async function syncOnlineCards(
 }
 
 /** Close only unresolved destinations; successful deliveries are never repeated. */
-async function announceOffline(env: Env, job: PendingOffline, labels: FirLabel[]): Promise<number> {
+async function announceOffline(env: Env, job: PendingOffline, labels: FirLabel[], limits: DiscordRateLimits): Promise<number> {
   const endedEmbed = buildSessionEndedEmbed(job.event, labels);
   const fallbackEmbed = buildOfflineEmbed(job.event, labels);
   const remaining: PostedMessage[] = [];
   let delivered = 0;
+  let deliveryFailure = false;
   for (const ref of job.messages) {
     try {
-      await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, endedEmbed);
+      await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, endedEmbed, limits);
       delivered++;
       continue;
     } catch (err) {
       logFailure('offline_edit_failed', job.event.callsign, ref.channelId, err);
       if (!(err instanceof DiscordApiError && err.isGone)) {
+        if (!(err instanceof DiscordRateLimitError)) deliveryFailure = true;
         remaining.push(ref);
         continue;
       }
     }
     try {
-      await postMessage(env.DISCORD_BOT_TOKEN, ref.channelId, fallbackEmbed);
+      await postMessage(env.DISCORD_BOT_TOKEN, ref.channelId, fallbackEmbed, undefined, undefined, limits);
       delivered++;
     } catch (err) {
       logFailure('offline_post_failed', job.event.callsign, ref.channelId, err);
+      if (!(err instanceof DiscordRateLimitError)) deliveryFailure = true;
       remaining.push(ref);
     }
   }
@@ -150,15 +160,17 @@ async function announceOffline(env: Env, job: PendingOffline, labels: FirLabel[]
   const remainingChannels: string[] = [];
   for (const channelId of job.channelIds) {
     try {
-      await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed);
+      await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed, undefined, undefined, limits);
       delivered++;
     } catch (err) {
       logFailure('offline_post_failed', job.event.callsign, channelId, err);
+      if (!(err instanceof DiscordRateLimitError)) deliveryFailure = true;
       remainingChannels.push(channelId);
     }
   }
   job.channelIds = remainingChannels;
-  job.attempts++;
+  // Waiting for Discord's cooldown must never exhaust the closeout retry budget.
+  if (deliveryFailure) job.attempts++;
   return delivered;
 }
 
@@ -182,6 +194,7 @@ export async function runPoll(
   const prefixes = parsePrefixes(env.FIR_PREFIXES);
   const labels = parseFirLabels(env.FIR_LABELS);
   const gracePolls = parseGracePolls(env.OFFLINE_GRACE_POLLS);
+  const limits = await DiscordRateLimits.load(storage);
 
   const auth = ivaoAuthFromEnv(env);
   const currentAll = await fetchDivisionAtc(prefixes, auth);
@@ -206,7 +219,7 @@ export async function runPoll(
 
   if (storage) {
     try {
-      await sendGcaReminders(env, current, storage, Date.parse(nowIso));
+      await sendGcaReminders(env, current, storage, Date.parse(nowIso), limits);
     } catch {
       // DM lookup/storage failures must not break the public ATC cards.
       console.error(JSON.stringify({ event: 'gca_poll_failed' }));
@@ -244,7 +257,7 @@ export async function runPoll(
     const targets = entry.pendingChannelIds.filter((id) => channelIds.includes(id) &&
       !entry.messages?.some((ref) => ref.channelId === id));
     attempted += targets.length;
-    const posted = await announceOnline(env, entry, targets, mentionedChannels, coverage, labels);
+    const posted = await announceOnline(env, entry, targets, mentionedChannels, coverage, labels, limits, nowIso);
     delivered += posted.length;
     if (posted.length) {
       entry.messages = [...(entry.messages ?? []), ...posted];
@@ -265,7 +278,7 @@ export async function runPoll(
   const pendingOffline: PendingOffline[] = [];
   for (const job of jobs) {
     attempted += job.messages.length + job.channelIds.length;
-    delivered += await announceOffline(env, job, labels);
+    delivered += await announceOffline(env, job, labels, limits);
     if (job.messages.length || job.channelIds.length) {
       deliveryFailed = true;
       if (job.attempts <= OFFLINE_RETRY_POLLS) pendingOffline.push(job);
@@ -273,8 +286,8 @@ export async function runPoll(
     }
   }
 
-  const cards = await syncOnlineCards(env, next, current, gracePolls, labels);
-  const roster = await syncRosterMessages(env.DISCORD_BOT_TOKEN, previousRosterMessages, cards.targets);
+  const cards = await syncOnlineCards(env, next, current, gracePolls, labels, limits);
+  const roster = await syncRosterMessages(env.DISCORD_BOT_TOKEN, previousRosterMessages, cards.targets, limits);
   const rosterMessages = roster.messages;
   const rosterFailed = cards.failed || roster.failed;
 

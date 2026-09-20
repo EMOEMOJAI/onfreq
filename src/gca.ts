@@ -1,6 +1,6 @@
 import { EMBED_FOOTER, firOf, parseFirLabels, type FirLabel } from './config';
 import type { DiscordEmbed } from './discord';
-import { fetchBuffered } from './http';
+import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import { hasFrequency } from './ivao';
 import { countryCode } from './member-country';
 import type { OnlineAtc } from './types';
@@ -11,7 +11,6 @@ const MAX_LEVEL = 3;
 // Leave room for the reminder text within Discord's 4096-character description.
 const MAX_POLICY_URL_LENGTH = 2048;
 const names = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none' });
-const API = 'https://discord.com/api/v10';
 const INITIALIZED_KEY = 'gca-initialized-v1'; // gitleaks:allow — storage key name, not a credential
 const BACKOFF_KEY = 'gca-discord-backoff-v1';
 const RETENTION_MS = 7 * 86_400_000;
@@ -105,7 +104,7 @@ function parseHomeOverrides(raw: string | undefined): Record<number, string> | n
   if (!object) return null;
   const result: Record<number, string> = {};
   for (const [key, value] of Object.entries(object)) {
-    if (!isVid(key) || typeof value !== 'string' || !/^[A-Z]{2}$/.test(value)) return null;
+    if (!isVid(key) || typeof value !== 'string' || countryCode(value) !== value) return null;
     result[Number(key)] = value;
   }
   return result;
@@ -159,7 +158,7 @@ export function gcaMismatch(atc: OnlineAtc, policy: GcaPolicy): GcaMismatch | nu
   const level = LEVELS[position];
   // Unconfigured regions and unknown position types are excluded.
   if (!region || !level || !hasFrequency(atc)) return null;
-  const home = policy.homeOverrides[atc.userId] ?? countryCode(atc.memberCountry?.countryId);
+  const home = countryCode(policy.homeOverrides[atc.userId] ?? atc.memberCountry?.countryId);
   if (!home) return null;
   const normalizedHome = policy.homeRegions[home] ?? home;
   if (normalizedHome === region) return null;
@@ -227,25 +226,21 @@ class GcaDiscordError extends Error {
 }
 
 /** No inline retries: a slow Discord service must not hold the poll indefinitely. */
-async function discordJson(token: string, path: string, payload?: unknown): Promise<unknown> {
-  const response = await fetchBuffered(`${API}${path}`, {
+async function discordJson(limits: DiscordRateLimits, token: string, path: string, payload?: unknown): Promise<unknown> {
+  const response = await limits.fetch(path, {
     method: payload === undefined ? 'GET' : 'POST',
     headers: { authorization: `Bot ${token}`, 'content-type': 'application/json' },
     ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
   });
   if (!response.ok) {
-    let seconds = Number(response.headers.get('retry-after'));
-    if (response.status === 429) {
-      const body = await response.json().catch(() => null) as { retry_after?: unknown } | null;
-      if (typeof body?.retry_after === 'number') seconds = Math.max(seconds, body.retry_after);
-    }
+    const seconds = Number(response.headers.get('retry-after'));
     throw new GcaDiscordError(response.status, Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 60_000);
   }
   return response.json();
 }
 
-async function openDm(token: string, recipient: string): Promise<string> {
-  const channel = await discordJson(token, '/users/@me/channels', { recipient_id: recipient }) as {
+async function openDm(limits: DiscordRateLimits, token: string, recipient: string): Promise<string> {
+  const channel = await discordJson(limits, token, '/users/@me/channels', { recipient_id: recipient }) as {
     id?: string; type?: number; recipients?: { id: string }[];
   } | null;
   if (!channel || typeof channel.id !== 'string' || !/^\d{17,20}$/.test(channel.id) ||
@@ -265,13 +260,13 @@ function isMember(value: unknown): value is GuildMember {
     Array.isArray(m.roles) && m.roles.every((role) => typeof role === 'string');
 }
 
-async function fetchMembers(token: string, guildId: string, deadline: number): Promise<GuildMember[]> {
+async function fetchMembers(limits: DiscordRateLimits, token: string, guildId: string, deadline: number): Promise<GuildMember[]> {
   const members: GuildMember[] = [];
   let after = '0';
   // Never use a partial list: a duplicate VID could occur on a later page.
   for (let page = 0; page < 10; page++) {
     if (Date.now() >= deadline) throw new Error('Discord member lookup exceeded poll budget');
-    const body = await discordJson(token, `/guilds/${guildId}/members?limit=1000&after=${after}`);
+    const body = await discordJson(limits, token, `/guilds/${guildId}/members?limit=1000&after=${after}`);
     if (!Array.isArray(body) || !body.every(isMember)) throw new Error('Invalid Discord member list');
     members.push(...body);
     if (body.length < 1000) return members;
@@ -287,6 +282,7 @@ type ReminderRow = { status: string; attempts: number; retry_at: number };
 /** Called inside the coordinator's serialized poll, before channel notifications. */
 async function sendMemberReminders(
   env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number,
+  limits: DiscordRateLimits,
 ): Promise<void> {
   if (env.GCA_DM_ENABLED !== 'true') return;
   // Missing or unusable configuration disables reminders for this poll; it
@@ -351,8 +347,10 @@ async function sendMemberReminders(
   }
   if (!candidates.length || (await storage.get<number>(BACKOFF_KEY) ?? 0) > now) return;
   const deadline = Date.now() + 25_000;
-  const members = await fetchMembers(env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
-    if (err instanceof GcaDiscordError) await storage.put(BACKOFF_KEY, Date.now() + err.retryMs);
+  const members = await fetchMembers(limits, env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
+    if (err instanceof GcaDiscordError || err instanceof DiscordRateLimitError) {
+      await storage.put(BACKOFF_KEY, Date.now() + err.retryMs);
+    }
     throw err;
   });
   const index = indexMemberVids(members, memberRoleId);
@@ -378,14 +376,14 @@ async function sendMemberReminders(
     const payload = { embeds: [buildGcaEmbed(atc, mismatch, occurrence, policy.policyUrl, labels)], allowed_mentions: { parse: [] } };
     let messageAttempted = false;
     try {
-      const channelId = await openDm(env.DISCORD_BOT_TOKEN, recipient);
+      const channelId = await openDm(limits, env.DISCORD_BOT_TOKEN, recipient);
       if (Date.now() >= deadline) break;
       // Persist reservation BEFORE the message POST. An ambiguous timeout or crash
       // must never generate repeated warning DMs on a later poll/redeployment.
       sql.exec("UPDATE gca_reminders SET status = 'reserved', attempts = attempts + 1 WHERE session_key = ?", key);
       await storage.sync();
       messageAttempted = true;
-      const message = await discordJson(env.DISCORD_BOT_TOKEN, `/channels/${channelId}/messages`, payload) as { id?: string } | null;
+      const message = await discordJson(limits, env.DISCORD_BOT_TOKEN, `/channels/${channelId}/messages`, payload) as { id?: string } | null;
       if (!message?.id) throw new Error('Discord message response missing id');
       storage.transactionSync(() => {
         sql.exec("UPDATE gca_reminders SET status = 'sent' WHERE session_key = ?", key);
@@ -398,16 +396,17 @@ async function sendMemberReminders(
       });
       console.log(JSON.stringify({ event: 'gca_dm_sent', userId: atc.userId, callsign: atc.callsign, occurrence }));
     } catch (err) {
-      const rateLimited = err instanceof GcaDiscordError && err.status === 429;
+      const rateLimited = err instanceof DiscordRateLimitError;
       const permanent = err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && !rateLimited;
       // 429 is an explicit rejection, safe to retry after its requested delay.
       // Timeouts/5xx after the message POST may have delivered: do not retry those.
-      const retry = !permanent && (!messageAttempted || rateLimited) && attempts + 1 < MAX_ATTEMPTS;
-      const delay = err instanceof GcaDiscordError ? err.retryMs : 60_000;
+      const used = attempts + (rateLimited && !err.requestMade ? 0 : 1);
+      const retry = !permanent && (!messageAttempted || rateLimited) && used < MAX_ATTEMPTS;
+      const delay = err instanceof GcaDiscordError || rateLimited ? err.retryMs : 60_000;
       sql.exec('UPDATE gca_reminders SET status = ?, attempts = ?, retry_at = ? WHERE session_key = ?',
-        retry ? 'pending' : 'failed', attempts + 1, Date.now() + delay, key);
+        retry ? 'pending' : 'failed', used, Date.now() + delay, key);
       console.warn(JSON.stringify({ event: 'gca_dm_failed', userId: atc.userId,
-        status: err instanceof GcaDiscordError ? err.status : 'unavailable', retry }));
+        status: err instanceof GcaDiscordError || rateLimited ? err.status : 'unavailable', retry }));
       if (rateLimited) {
         await storage.put(BACKOFF_KEY, Date.now() + delay);
         break;
@@ -418,7 +417,7 @@ async function sendMemberReminders(
 
 type CopyRow = ReminderRow & { session_key: string; recipient_id: string; payload: string };
 
-async function sendPendingCopies(env: Env, storage: DurableObjectStorage): Promise<void> {
+async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits): Promise<void> {
   if (!/^\d{17,20}$/.test(env.GCA_COPY_USER_ID ?? '') ||
       (await storage.get<number>(BACKOFF_KEY) ?? 0) > Date.now()) return;
   const sql = storage.sql;
@@ -431,24 +430,25 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage): Promi
     let messageAttempted = false;
     try {
       const payload: unknown = JSON.parse(row.payload);
-      const channelId = await openDm(env.DISCORD_BOT_TOKEN, row.recipient_id);
+      const channelId = await openDm(limits, env.DISCORD_BOT_TOKEN, row.recipient_id);
       if (Date.now() >= deadline) break;
       sql.exec("UPDATE gca_copies SET status = 'reserved', attempts = attempts + 1 WHERE session_key = ?", row.session_key);
       await storage.sync();
       messageAttempted = true;
-      const message = await discordJson(env.DISCORD_BOT_TOKEN, `/channels/${channelId}/messages`, payload) as { id?: string } | null;
+      const message = await discordJson(limits, env.DISCORD_BOT_TOKEN, `/channels/${channelId}/messages`, payload) as { id?: string } | null;
       if (!message?.id) throw new Error('Discord message response missing id');
       sql.exec("UPDATE gca_copies SET status = 'sent', payload = '' WHERE session_key = ?", row.session_key);
       console.log(JSON.stringify({ event: 'gca_copy_sent', sessionKey: row.session_key }));
     } catch (err) {
-      const rateLimited = err instanceof GcaDiscordError && err.status === 429;
+      const rateLimited = err instanceof DiscordRateLimitError;
       const permanent = err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && !rateLimited;
-      const retry = !permanent && (!messageAttempted || rateLimited) && row.attempts + 1 < MAX_ATTEMPTS;
-      const delay = err instanceof GcaDiscordError ? err.retryMs : 60_000;
+      const used = row.attempts + (rateLimited && !err.requestMade ? 0 : 1);
+      const retry = !permanent && (!messageAttempted || rateLimited) && used < MAX_ATTEMPTS;
+      const delay = err instanceof GcaDiscordError || rateLimited ? err.retryMs : 60_000;
       sql.exec('UPDATE gca_copies SET status = ?, attempts = ?, retry_at = ?, payload = ? WHERE session_key = ?',
-        retry ? 'pending' : 'failed', row.attempts + 1, Date.now() + delay, retry ? row.payload : '', row.session_key);
+        retry ? 'pending' : 'failed', used, Date.now() + delay, retry ? row.payload : '', row.session_key);
       console.warn(JSON.stringify({ event: 'gca_copy_failed', sessionKey: row.session_key,
-        status: err instanceof GcaDiscordError ? err.status : 'unavailable', retry }));
+        status: err instanceof GcaDiscordError || rateLimited ? err.status : 'unavailable', retry }));
       if (rateLimited) {
         await storage.put(BACKOFF_KEY, Date.now() + delay);
         break;
@@ -460,16 +460,18 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage): Promi
 /** Serialized by the coordinator; copy failures never retry the member's DM. */
 export async function sendGcaReminders(
   env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number,
+  rateLimits?: DiscordRateLimits,
 ): Promise<void> {
   if (env.GCA_DM_ENABLED !== 'true') return;
+  const limits = rateLimits ?? await DiscordRateLimits.load(storage);
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS gca_copies (
     session_key TEXT PRIMARY KEY, recipient_id TEXT NOT NULL, payload TEXT NOT NULL,
     status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
   )`);
   try {
-    await sendMemberReminders(env, current, storage, now);
+    await sendMemberReminders(env, current, storage, now, limits);
   } finally {
-    await sendPendingCopies(env, storage).catch(() => {
+    await sendPendingCopies(env, storage, limits).catch(() => {
       console.warn(JSON.stringify({ event: 'gca_copy_poll_failed' }));
     });
   }

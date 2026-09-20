@@ -8,10 +8,8 @@ import {
 } from './config';
 import { hasFrequency } from './ivao';
 import type { OfflineEvent, OnlineAtc, TrackedAtc } from './types';
-import { fetchBuffered } from './http';
+import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import { countryCode } from './member-country';
-
-const DISCORD_API = 'https://discord.com/api/v10';
 
 export interface DiscordEmbed {
   title?: string;
@@ -312,56 +310,45 @@ export class DiscordApiError extends Error {
 }
 
 const MAX_ATTEMPTS = 4;
-const MAX_RETRY_DELAY_MS = 10_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Honour Discord's `retry_after` (seconds) when present, else back off. */
-function retryDelayMs(res: Response, body: string, attempt: number): number {
-  const header = res.headers.get('retry-after');
-  let seconds = header ? Number.parseFloat(header) : NaN;
-  if (!Number.isFinite(seconds)) {
-    try {
-      const parsed = JSON.parse(body) as { retry_after?: number };
-      if (typeof parsed.retry_after === 'number') seconds = parsed.retry_after;
-    } catch {
-      // Not JSON — fall through to exponential backoff.
-    }
-  }
-  const ms = Number.isFinite(seconds) ? seconds * 1000 : 500 * 2 ** (attempt - 1);
-  return Math.min(Math.max(ms, 0), MAX_RETRY_DELAY_MS);
-}
-
 /**
- * One Discord REST call, retrying rate limits (429) and server errors.
- * Posting one message per controller makes bursts possible, so 429s are
- * expected rather than exceptional.
+ * Retry transient server errors within a bounded budget. Positive rate-limit
+ * cooldowns defer delivery to a later poll instead of holding the coordinator.
  */
 async function discordRequest(
   botToken: string,
   method: 'POST' | 'PATCH' | 'DELETE',
   path: string,
   payload?: unknown,
+  limits = new DiscordRateLimits(),
 ): Promise<Response> {
   for (let attempt = 1; ; attempt++) {
-    const res = await fetchBuffered(`${DISCORD_API}${path}`, {
+    const res = await limits.fetch(path, {
       method,
       headers: {
         authorization: `Bot ${botToken}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify(payload),
+    }).catch((err: unknown) => {
+      // A zero-second rejection permits a bounded immediate retry.
+      if (err instanceof DiscordRateLimitError && err.requestMade &&
+          err.retryAt <= Date.now() && attempt < MAX_ATTEMPTS) return null;
+      throw err;
     });
+    if (!res) continue;
     if (res.ok) return res;
 
     const body = await res.text();
-    const retryable = res.status === 429 || res.status >= 500;
+    const retryable = res.status >= 500;
     if (!retryable || attempt >= MAX_ATTEMPTS) {
       throw new DiscordApiError(res.status, body);
     }
-    await sleep(retryDelayMs(res, body, attempt));
+    await sleep(500 * 2 ** (attempt - 1));
   }
 }
 
@@ -372,13 +359,14 @@ export async function postMessage(
   embed: DiscordEmbed,
   content?: string,
   replyTo?: string,
+  limits?: DiscordRateLimits,
 ): Promise<string> {
   const res = await discordRequest(botToken, 'POST', `/channels/${channelId}/messages`, {
     content,
     embeds: [embed],
     allowed_mentions: { parse: ['roles'], replied_user: false },
     ...(replyTo ? { message_reference: { message_id: replyTo, fail_if_not_exists: false } } : {}),
-  });
+  }, limits);
   const message = (await res.json()) as { id?: string };
   if (!message.id) throw new Error('Discord API returned a message without an id');
   return message.id;
@@ -390,16 +378,17 @@ export async function editMessage(
   channelId: string,
   messageId: string,
   embed: DiscordEmbed,
+  limits?: DiscordRateLimits,
 ): Promise<void> {
   await discordRequest(botToken, 'PATCH', `/channels/${channelId}/messages/${messageId}`, {
     embeds: [embed],
-  });
+  }, limits);
 }
 
 /** Remove an obsolete roster continuation; already-deleted messages are clean. */
-export async function deleteMessage(botToken: string, channelId: string, messageId: string): Promise<void> {
+export async function deleteMessage(botToken: string, channelId: string, messageId: string, limits?: DiscordRateLimits): Promise<void> {
   try {
-    await discordRequest(botToken, 'DELETE', `/channels/${channelId}/messages/${messageId}`);
+    await discordRequest(botToken, 'DELETE', `/channels/${channelId}/messages/${messageId}`, undefined, limits);
   } catch (err) {
     if (!(err instanceof DiscordApiError && err.status === 404)) throw err;
   }

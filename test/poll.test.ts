@@ -198,6 +198,118 @@ describe('polling through the Durable Object', () => {
     }).poll());
   }
 
+  it.each([false, true])('persists full public cooldowns across eviction (global=%s)', async (global) => {
+    await seed({});
+    feed = [entry(a)];
+    const original = network.getMockImplementation()!;
+    const calls: { channel: string; at: number }[] = [];
+    let limited = false;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.includes('/channels/')) {
+        const channel = url.split('/')[6]!;
+        calls.push({ channel, at: now });
+        if (channel === 'test-channel' && !limited) {
+          limited = true;
+          return Response.json({ retry_after: 65, global }, { status: 429, headers: { 'retry-after': '65' } });
+        }
+      }
+      return original(input, init);
+    });
+    await expect(configuredPoll()).rejects.toThrow('Discord notifications failed');
+    expect(calls.filter((call) => call.channel === 'test-channel')).toHaveLength(1);
+    expect(calls.filter((call) => call.channel === 'test-channel-b')).toHaveLength(global ? 0 : 1);
+    const firstCalls = calls.length;
+    await evictDurableObject(stub());
+    now += 60_000;
+    await expect(configuredPoll()).rejects.toThrow('Discord notifications failed');
+    expect(calls).toHaveLength(firstCalls);
+    await evictDurableObject(stub());
+    now += 60_000;
+    await expect(configuredPoll()).resolves.toEqual({ skipped: false });
+    expect(calls.filter((call) => call.channel === 'test-channel').map((call) => call.at))
+      .toEqual([START, START + 120_000]);
+    expect((await snapshot())?.state?.[a]?.messages).toHaveLength(2);
+  });
+
+  it('does not abandon offline cards while waiting through a long cooldown', async () => {
+    await seed({ [a]: { ...session(a), missed: 1 } });
+    const original = network.getMockImplementation()!;
+    let attempts = 0;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).endsWith(`/messages/${a}`) && ++attempts === 1) {
+        return Response.json({ retry_after: 1200 }, { status: 429 });
+      }
+      return original(input, init);
+    });
+    for (let i = 0; i < 12; i++) {
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow('Discord notifications failed');
+      if (i === 0) await evictDurableObject(stub());
+      now += 60_000;
+    }
+    expect(attempts).toBe(1);
+    expect((await snapshot())?.pendingOffline?.[0]?.attempts).toBe(0);
+    now = START + 1_200_000;
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+    expect(attempts).toBe(2);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('keeps a roster in each channel during partial delivery and moves it after retry', async () => {
+    const old = session(a);
+    old.messages!.push({ channelId: 'test-channel-b', messageId: 'older-b' });
+    await seed({ [a]: old });
+    feed = [entry(a), entry(b)];
+    failures.add('test-channel-b');
+    // Only reject new cards in B; its existing card remains editable.
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const blocked = failures.delete('test-channel-b');
+      try {
+        if (blocked && String(input).includes('/test-channel-b/') && init?.method === 'POST') {
+          return new Response(null, { status: 403 });
+        }
+        return await original(input, init);
+      } finally { if (blocked) failures.add('test-channel-b'); }
+    });
+    await expect(configuredPoll()).rejects.toThrow();
+    expect(roster('older-b')).toContain(b);
+    const hostA = (await snapshot())!.state![b]!.messages![0]!.messageId;
+    expect(roster(hostA)).toContain(a);
+    failures.clear();
+    now += 60_000;
+    await configuredPoll();
+    const hostB = (await snapshot())!.state![b]!.messages!.find((ref) => ref.channelId === 'test-channel-b')!.messageId;
+    expect(roster(hostB)).toContain(a);
+    expect(roster('older-b')).toBeUndefined();
+    expect((await snapshot())!.state![b]!.messages!.map((ref) => ref.postedAt))
+      .toEqual([new Date(START).toISOString(), new Date(START + 60_000).toISOString()]);
+  });
+
+  it('re-homes a deleted host only in the affected channel and survives eviction', async () => {
+    const older = session(a);
+    const newer = session(b, START - 30_000);
+    older.messages!.push({ channelId: 'test-channel-b', messageId: 'older-b' });
+    newer.messages!.push({ channelId: 'test-channel-b', messageId: 'newer-b' });
+    await seed({ [a]: older, [b]: newer });
+    feed = [entry(a), entry(b)];
+    await configuredPoll();
+    failures.add('newer-b');
+    failureStatus = 404;
+    feed = [entry(a, 121.7), entry(b)];
+    now += 60_000;
+    await configuredPoll();
+    expect(roster(b)).toContain(a);
+    expect(roster(a)).toBeUndefined();
+    expect(roster('older-b')).toContain(b);
+    expect((await snapshot())!.state![b]!.messages).toHaveLength(1);
+    const count = sent.length;
+    await evictDurableObject(stub());
+    now += 60_000;
+    await configuredPoll();
+    expect(sent).toHaveLength(count);
+  });
+
   it.each([
     { FIR_PREFIXES: '' }, { FIR_PREFIXES: '*' }, { FIR_LABELS: 'invalid private mapping' },
   ])('preserves session state and avoids network calls with unusable geography: %j', async (overrides) => {
@@ -741,6 +853,37 @@ describe('polling through the Durable Object', () => {
         .filter((field) => field.name.startsWith('Also online'))
         .flatMap((field) => field.value.match(/\b(?:QCTT_TWR|QESS_APP|QE\d{3}_TWR)\b/g) ?? []));
     }
+
+    it('moves continuation pages only in the channel whose host was deleted', async () => {
+      await prepare(400);
+      const state = (await snapshot())!.state!;
+      state[a]!.messages!.push({ channelId: 'test-channel-b', messageId: 'host-b' });
+      state[b]!.messages!.push({ channelId: 'test-channel-b', messageId: 'fallback-b' });
+      await seed(state);
+      await configuredPoll();
+      const original = (await snapshot())!.rosterMessages!;
+      const pagesA = original.filter((page) => page.channelId === 'test-channel');
+      const pagesB = original.filter((page) => page.channelId === 'test-channel-b');
+      expect(pagesA.length).toBeGreaterThan(1);
+      expect(pagesB).toHaveLength(pagesA.length);
+      cards.delete('host-b');
+      failures.add('host-b');
+      failureStatus = 404;
+      feed.find((atc) => atc.callsign === a)!.atcSession.frequency = 121.7;
+      now += 60_000;
+      await configuredPoll();
+      const current = (await snapshot())!.rosterMessages!;
+      expect(current.filter((page) => page.channelId === 'test-channel')).toEqual(pagesA);
+      const replacement = current.filter((page) => page.channelId === 'test-channel-b');
+      expect(replacement).toHaveLength(pagesB.length);
+      expect(replacement.every((page) => page.parentMessageId === 'fallback-b')).toBe(true);
+      expect(deleted.sort()).toEqual(pagesB.map((page) => page.messageId).sort());
+      const count = sent.length;
+      await evictDurableObject(stub());
+      now += 60_000;
+      await configuredPoll();
+      expect(sent).toHaveLength(count);
+    });
 
     it('keeps every station visible after eviction and leaves unchanged pages alone', async () => {
       await prepare(400);

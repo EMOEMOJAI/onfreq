@@ -49,7 +49,7 @@ jobs:
         run: gitleaks git . --log-opts=HEAD --redact --no-banner
 
       - name: Check POSIX shell scripts
-        run: shellcheck scripts/health-monitor.sh scripts/pre-commit
+        run: shellcheck scripts/health-monitor.sh scripts/poll-trigger.sh scripts/pre-commit
 
       - name: Check GitHub Actions workflows
         run: actionlint
@@ -76,8 +76,8 @@ jobs:
 
       # The test harness uses temporary files and mocked curl/osascript.
       # It never installs agents, calls production or displays notifications.
-      - name: Test Mac health monitoring
-        run: node --test scripts/test-health-monitor.mjs
+      - name: Test Mac polling and health monitoring
+        run: node --test scripts/test-*.mjs
 
   checks:
     # Use disposable GitHub-hosted machines. Never attach a persistent/private

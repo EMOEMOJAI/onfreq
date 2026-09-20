@@ -10,7 +10,7 @@
     "deploy": "wrangler deploy",
     "types": "wrangler types --strict-vars=false --env-interface CloudflareBindings --env-file .dev.vars.example",
     "typecheck": "npm run types && tsc --noEmit",
-    "test": "vitest run && node --test scripts/test-health-monitor.mjs",
+    "test": "vitest run && node --test scripts/test-*.mjs",
     "tail": "wrangler tail --config wrangler.local.jsonc",
     "lint:docs": "markdownlint-cli2",
     "predeploy": "node scripts/check-deploy.mjs",

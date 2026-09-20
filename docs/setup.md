@@ -64,6 +64,8 @@ The public `npm run deploy` command uses `wrangler.jsonc`. It stops if a private
 
 GCA coverage is private configuration, with no built-in region list. Set `GCA_REGIONS` before upgrading an existing reminder deployment. Malformed or absent coverage or approval records disable reminders; `{}` explicitly means no approvals. These records are not an authoritative registry. A first enabled poll baselines existing connections. Possible DM deliveries are not repeated, so ambiguous failures can mean a missed reminder. See [data retention](../SECURITY.md#data-retention) before enabling this feature.
 
+**Recipient setup:** staff must verify each member's VID and assign the member role. The server nickname must contain exactly one six-digit VID, for example `Example (600001)`, with no other numbers. Duplicate VIDs anywhere in the server are skipped; restrict nickname changes to keep this mapping trustworthy. Supply a known home country through IVAO API credentials or `GCA_HOME_OVERRIDES`; unknown codes such as `ZZ` are invalid. Test a new connection after setup: existing connections are baselined, and fixing an unmapped nickname does not retry that same connection.
+
 `OFFLINE_GRACE_POLLS` is the only plain Wrangler variable; the default is two missed polls. Public cards retry failed destinations without resetting connection times; crashes between Discord acceptance and storage can still cause duplicates.
 
 ## Health and optional Mac fallback

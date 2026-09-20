@@ -6,7 +6,8 @@ import {
   type GuildMember,
 } from '../src/gca';
 import type { OnlineAtc } from '../src/types';
-import type { DiscordEmbed } from '../src/discord';
+import { postMessage, type DiscordEmbed } from '../src/discord';
+import { DiscordRateLimits } from '../src/discord-rate-limit';
 import { cleanupGcaCopies } from '../src/retention';
 
 const START = Date.parse('2026-09-09T12:00:00Z');
@@ -154,6 +155,16 @@ describe('GCA coverage', () => {
     expect(gcaMismatch(atc({ memberCountry: country('ZZ') }), policy())).toBeNull();
     expect(gcaMismatch(atc({ frequency: 0 }), policy())).toBeNull();
     expect(gcaMismatch(atc({ position: 'FSS' }), policy())).toBeNull();
+  });
+
+  it('never turns an unknown home override into an approval warning', async () => {
+    const config = { ...settings(), GCA_HOME_OVERRIDES: '{"600001":"ZZ"}' };
+    expect(parseGcaPolicy(config)).toBeNull();
+    const unvalidated = { ...policy(), homeOverrides: { 600001: 'ZZ' } };
+    expect(gcaMismatch(atc(), unvalidated)).toBeNull();
+    await check([], config);
+    await check([atc()], config);
+    expect(network).not.toHaveBeenCalled();
   });
 
   it('uses the approved paragraph-only embed with escaped external station text', () => {
@@ -546,6 +557,30 @@ describe('durable GCA delivery', () => {
     expect(sent).toHaveLength(2); // First POST was rejected; only the second delivered.
     await check([atc()]);
     expect(sent).toHaveLength(2);
+  });
+
+  it('shares a global reminder cooldown with public cards across restart', async () => {
+    await check([]);
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).endsWith(`/channels/${CHANNEL}/messages`)) {
+        return Response.json({ retry_after: 65, global: true }, { status: 429 });
+      }
+      if (String(input).endsWith('/channels/public/messages')) return Response.json({ id: 'synthetic-public' });
+      return original(input, init);
+    });
+    await check([atc()]);
+    const calls = network.mock.calls.length;
+    await evictDurableObject(stub());
+    const publicPost = () => runInDurableObject(stub(), async (_, ctx) => {
+      const limits = await DiscordRateLimits.load(ctx.storage);
+      return postMessage('test-token', 'public', { title: 'Synthetic' }, undefined, undefined, limits);
+    });
+    now += 60_000;
+    await expect(publicPost()).rejects.toMatchObject({ status: 429, requestMade: false });
+    expect(network).toHaveBeenCalledTimes(calls);
+    now += 5_000;
+    await expect(publicPost()).resolves.toBe('synthetic-public');
   });
 
   it('retries opening a DM on transient errors, but abandons closed DMs', async () => {

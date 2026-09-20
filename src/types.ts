@@ -73,6 +73,8 @@ export interface MemberCountry {
 export interface PostedMessage {
   channelId: string;
   messageId: string;
+  /** Successful initial delivery time in this channel; absent on legacy cards. */
+  postedAt?: string;
   /** Last successfully rendered online embed; absent on legacy cards. */
   onlineEmbed?: string;
 }

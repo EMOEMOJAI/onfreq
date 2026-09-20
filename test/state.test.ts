@@ -176,6 +176,21 @@ describe('diffState', () => {
 describe('newestCardedSession', () => {
   const card = [{ channelId: '1', messageId: '2' }];
 
+  it('chooses each channel host by successful delivery time, with legacy fallback', () => {
+    const state = {
+      QCTT_TWR: tracked('QCTT_TWR', { cardAt: '2026-08-18T10:00:00Z', messages: [
+        { channelId: '1', messageId: 'a' },
+        { channelId: '2', messageId: 'b', postedAt: '2026-08-18T12:00:00Z' },
+      ] }),
+      QESS_APP: tracked('QESS_APP', { cardAt: '2026-08-18T11:00:00Z', messages: [
+        { channelId: '1', messageId: 'c' }, { channelId: '2', messageId: 'd' },
+      ] }),
+    };
+    expect(newestCardedSession(state, '1')).toBe('QESS_APP');
+    expect(newestCardedSession(state, '2')).toBe('QCTT_TWR');
+    expect(newestCardedSession(state, '3')).toBeUndefined();
+  });
+
   it('returns undefined when nothing is tracked', () => {
     expect(newestCardedSession({})).toBeUndefined();
   });

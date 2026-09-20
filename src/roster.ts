@@ -1,5 +1,6 @@
 import { deleteMessage, DiscordApiError, editMessage, postMessage, type DiscordEmbed } from './discord';
 import type { RosterMessage } from './types';
+import type { DiscordRateLimits } from './discord-rate-limit';
 
 export interface RosterTarget {
   channelId: string;
@@ -11,6 +12,7 @@ export interface RosterTarget {
 /** Reconcile separately sent pages, retaining failed edits/deletions for later polls. */
 export async function syncRosterMessages(
   botToken: string, previous: RosterMessage[], targets: RosterTarget[],
+  limits?: DiscordRateLimits,
 ): Promise<{ messages: RosterMessage[]; failed: boolean }> {
   const messages: RosterMessage[] = [];
   let failed = false;
@@ -28,7 +30,7 @@ export async function syncRosterMessages(
       continue;
     }
     try {
-      await deleteMessage(botToken, ref.channelId, ref.messageId);
+      await deleteMessage(botToken, ref.channelId, ref.messageId, limits);
     } catch (err) {
       messages.push({ ...ref });
       logFailure('delete', ref.channelId, ref.parentMessageId, err);
@@ -44,7 +46,7 @@ export async function syncRosterMessages(
       if (ref?.onlineEmbed === rendered) continue;
       if (ref) {
         try {
-          await editMessage(botToken, ref.channelId, ref.messageId, embed);
+          await editMessage(botToken, ref.channelId, ref.messageId, embed, limits);
           ref.onlineEmbed = rendered;
           continue;
         } catch (err) {
@@ -56,7 +58,7 @@ export async function syncRosterMessages(
         }
       }
       try {
-        const messageId = await postMessage(botToken, target.channelId, embed, undefined, target.parentMessageId);
+        const messageId = await postMessage(botToken, target.channelId, embed, undefined, target.parentMessageId, limits);
         messages.push({ channelId: target.channelId, parentMessageId: target.parentMessageId,
           page, messageId, onlineEmbed: rendered });
       } catch (err) {

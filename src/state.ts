@@ -110,12 +110,14 @@ export function diffState(
  * card cannot host it. Ties select the later insertion (last card posted in
  * that poll). ISO timestamps compare chronologically as plain strings.
  */
-export function newestCardedSession(state: StateMap): string | undefined {
+export function newestCardedSession(state: StateMap, channelId?: string): string | undefined {
   let newest: string | undefined;
   let newestAt = '';
   for (const [callsign, session] of Object.entries(state)) {
     if (session.pending || session.missed > 0 || !session.messages?.length) continue;
-    const at = session.cardAt ?? session.since;
+    if (channelId !== undefined && !session.messages.some((ref) => ref.channelId === channelId)) continue;
+    const at = (channelId === undefined ? undefined :
+      session.messages.find((ref) => ref.channelId === channelId)?.postedAt) ?? session.cardAt ?? session.since;
     if (at >= newestAt) {
       newestAt = at;
       newest = callsign;
