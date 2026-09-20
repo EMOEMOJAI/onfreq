@@ -1,14 +1,19 @@
 # onfreq
 
-> MIT-licensed, self-hosted IVAO ATC notification bot for Discord on Cloudflare Workers.
+> onfreq is an MIT-licensed, self-hosted Discord bot for IVAO air traffic control (ATC) notifications, built with TypeScript on Cloudflare Workers.
 
-Live session cards, FIR coverage, durable retries and optional GCA reminders with privately configured coverage. Public delivery is at least once. Deployment credentials, region policies and member approval records are operator-managed and excluded from this repository.
+Use it to show controller connections, disconnections and flight information region (FIR) coverage in Discord. Features include live session cards, durable retries and optional GCA reminders with privately configured coverage. Public delivery is at least once. Deployment credentials, region policies and member approval records are operator-managed and excluded from this repository.
 
 ## Documentation
 
 - [Overview](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/README.md): Features and contribution workflow.
 - [Setup](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/docs/setup.md): Deploy to Cloudflare guided setup, manual deployment, Mac monitoring and maintenance.
 - [Optional settings](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/config/optional-secrets.example): Private configuration formats for optional features.
-- [Agent instructions](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/AGENTS.md): Commands and implementation invariants.
+- [Agent instructions](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/AGENTS.md): Source map, commands, privacy rules and implementation invariants shared across coding tools.
 - [Security](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/SECURITY.md): Sensitive reporting and data retention.
 - [License](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/LICENSE): MIT terms.
+
+## Implementation
+
+- [Source](https://github.com/EMOEMOJAI/onfreq/tree/main/src): Worker routes, Durable Object coordination, Discord delivery and private policy parsing.
+- [Tests](https://github.com/EMOEMOJAI/onfreq/tree/main/test): Synthetic examples and expected behavior; run with the checks in AGENTS.md.

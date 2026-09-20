@@ -2,11 +2,11 @@
   <img src="assets/banner.png" alt="onfreq — on frequency" width="760">
 </p>
 
-<h1 align="center">IVAO ATC, live in Discord.</h1>
+<h1 align="center">onfreq — IVAO ATC, live in Discord.</h1>
 
 <p align="center">
-  Live session cards, airspace coverage and optional approval reminders.<br>
-  Built with TypeScript and Cloudflare Workers.
+  An open-source Discord bot for IVAO air traffic control notifications.<br>
+  Your airspace. Your server. Built with TypeScript and Cloudflare Workers.
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-65d993" alt="License: MIT"></a>
 </p>
 
-- Choose which FIRs and Discord channels to monitor.
+- Choose your flight information regions (FIRs) and Discord channels.
 - Cards appear when controllers tune in and turn grey when they disconnect.
 - Coverage rosters, reconnect grace and durable retries keep updates useful.
 - Optional approval reminders follow your privately configured policy.
@@ -24,19 +24,29 @@
 
 ## Get started
 
-Create and invite your own Discord bot, then deploy to your Cloudflare account:
+**Bring your airspace into Discord.** Use the guided setup in your browser — no local Node.js installation needed.
+
+1. **Create your bot.** [Create a Discord application](https://discord.com/developers/applications) and invite its bot with the [required permissions](docs/setup.md#guided-deployment).
+2. **Deploy to Cloudflare.** Use the button below to copy the project into your own account and create its storage.
+3. **Choose your airspace.** Enter your bot token, channel IDs, callsign prefixes and a polling secret, then deploy.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/EMOEMOJAI/onfreq)
 
-The guided flow creates storage and asks for four settings. Follow the **[setup guide](docs/setup.md#guided-deployment)** for bot permissions, values to enter and optional features. No local Node.js installation is needed for the button flow.
+The first poll quietly records existing connections; new connections then appear as cards. You host and control your own installation.
 
-Public delivery is at least once. This is self-hosted software, not a hosted bot service.
+**[Follow the setup guide →](docs/setup.md#guided-deployment)** · [CLI setup](docs/setup.md#manual-deployment-and-upgrades) · [Optional features](docs/setup.md#optional-settings)
+
+Public delivery is at least once; retries can occasionally produce duplicate cards.
 
 ## Contribute
 
-Open an [issue](https://github.com/EMOEMOJAI/onfreq/issues/new/choose) to discuss a bug or idea. Maintainer changes go directly to main after checks; please do not open pull requests.
+**Help make the next session better.** Bug reports, feature ideas and feedback on setup are welcome.
 
-Run `npm ci`, `npm run lint:docs`, `npm run typecheck` and `npm test`. CI also checks secrets, dependencies, workflows, shell scripts and macOS helpers. Coding agents: see [AGENTS.md](AGENTS.md).
+**[Report a bug](https://github.com/EMOEMOJAI/onfreq/issues/new?template=bug.yml)** · **[Suggest an idea](https://github.com/EMOEMOJAI/onfreq/issues/new?template=feature.yml)** · [Report a security issue privately](SECURITY.md)
+
+Share a small, anonymized example so others can reproduce the problem. Maintainer changes go directly to main after checks; please do not open pull requests.
+
+Working on the code? Start with [AGENTS.md](AGENTS.md) for the source map and checks. AI tools can use the [documentation index](llms.txt); shared instructions also have entry points for Claude, Gemini and GitHub Copilot.
 
 [Security & privacy](SECURITY.md) · [MIT license](LICENSE)
 

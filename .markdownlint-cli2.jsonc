@@ -2,6 +2,7 @@
   "globs": [
     "*.md",
     "docs/*.md",
+    ".github/copilot-instructions.md",
     "llms.txt"
   ],
   "config": {

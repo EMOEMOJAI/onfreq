@@ -2,6 +2,10 @@
 
 TypeScript Discord bot on Cloudflare Workers. Read [README.md](README.md) and [setup](docs/setup.md); source and tests are authoritative.
 
+## Source map
+
+[src/index.ts](src/index.ts) routes HTTP and cron events; [src/coordinator.ts](src/coordinator.ts) serializes polling. [src/poll.ts](src/poll.ts), [src/state.ts](src/state.ts) and [src/roster.ts](src/roster.ts) handle notification delivery. [src/gca.ts](src/gca.ts) handles optional reminders. Tests live in [test/](test/); deployment and Mac helpers live in [scripts/](scripts/).
+
 ## Checks
 
 Use Node.js 24. Run `npm ci`; copy `.dev.vars.example` to `.dev.vars` only if absent. Run `npm run lint:docs`, `npm run typecheck`, `npm test` and `npx wrangler deploy --dry-run`. Script changes also need ShellCheck (POSIX files), actionlint, zsh syntax checks and macOS plist validation. Maintainer deployment uses `npm run deploy:local` with ignored `wrangler.local.jsonc` and requires task authorization. The public `deploy` script is for new installations and must refuse a checkout containing private deployment config.

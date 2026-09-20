@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
-  "description": "Discord bot on Cloudflare Workers that notifies when IVAO ATC comes online or goes offline in the FIRs you monitor",
+  "description": "Self-hosted IVAO air traffic control Discord bot with live ATC session cards and FIR coverage, built with TypeScript on Cloudflare Workers.",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
@@ -37,10 +37,14 @@
   "keywords": [
     "ivao",
     "atc",
+    "air-traffic-control",
+    "aviation",
     "discord-bot",
     "cloudflare-workers",
     "durable-objects",
     "flight-simulation",
+    "self-hosted",
+    "notifications",
     "typescript"
   ],
   "cloudflare": {
