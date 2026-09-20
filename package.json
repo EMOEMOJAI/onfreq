@@ -7,12 +7,14 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy --config wrangler.local.jsonc",
-    "types": "wrangler types --strict-vars=false",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types --strict-vars=false --env-interface CloudflareBindings --env-file .dev.vars.example",
     "typecheck": "npm run types && tsc --noEmit",
     "test": "vitest run && node --test scripts/test-health-monitor.mjs",
     "tail": "wrangler tail --config wrangler.local.jsonc",
-    "lint:docs": "markdownlint-cli2"
+    "lint:docs": "markdownlint-cli2",
+    "predeploy": "node scripts/check-deploy.mjs",
+    "deploy:local": "wrangler deploy --config wrangler.local.jsonc"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
@@ -40,5 +42,27 @@
     "durable-objects",
     "flight-simulation",
     "typescript"
-  ]
+  ],
+  "cloudflare": {
+    "bindings": {
+      "DISCORD_BOT_TOKEN": {
+        "description": "Create your own bot in the [Discord Developer Portal](https://discord.com/developers/applications), then copy its token from the **Bot** page. Keep this secret."
+      },
+      "DISCORD_CHANNEL_IDS": {
+        "description": "Enable **Developer Mode** in Discord, right-click each destination text channel and select **Copy Channel ID**. Separate multiple IDs with commas. Invite the bot with View Channel, Send Messages, Embed Links and Read Message History."
+      },
+      "FIR_PREFIXES": {
+        "description": "Enter the ICAO callsign prefixes you want to monitor, separated by commas. Each prefix must contain 1–4 letters. Choose your own airspace; there is no default region."
+      },
+      "POLL_SECRET": {
+        "description": "Generate and save a random secret with your password manager or `openssl rand -hex 32`. It protects health checks and manual polling. Never reuse your Discord token or commit this value."
+      },
+      "ATC_STATE": {
+        "description": "Private cache for this installation. Cloudflare creates a KV namespace automatically."
+      },
+      "POLL_COORDINATOR": {
+        "description": "Stores session state and coordinates polling. Cloudflare creates the Durable Object binding automatically."
+      }
+    }
+  }
 }

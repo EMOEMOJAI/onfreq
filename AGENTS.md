@@ -4,7 +4,7 @@ TypeScript Discord bot on Cloudflare Workers. Read [README.md](README.md) and [s
 
 ## Checks
 
-Use Node.js 24. Run `npm ci`; copy `.dev.vars.example` to `.dev.vars` only if absent. Run `npm run lint:docs`, `npm run typecheck`, `npm test` and `npx wrangler deploy --dry-run`. Script changes also need ShellCheck (POSIX files), actionlint, zsh syntax checks and macOS plist validation. Real deployment uses ignored `wrangler.local.jsonc` and requires task authorization.
+Use Node.js 24. Run `npm ci`; copy `.dev.vars.example` to `.dev.vars` only if absent. Run `npm run lint:docs`, `npm run typecheck`, `npm test` and `npx wrangler deploy --dry-run`. Script changes also need ShellCheck (POSIX files), actionlint, zsh syntax checks and macOS plist validation. Maintainer deployment uses `npm run deploy:local` with ignored `wrangler.local.jsonc` and requires task authorization. The public `deploy` script is for new installations and must refuse a checkout containing private deployment config.
 
 ## Invariants
 
@@ -16,7 +16,7 @@ Use Node.js 24. Run `npm ci`; copy `.dev.vars.example` to `.dev.vars` only if ab
 
 ## Workflow and privacy
 
-Use synthetic fixtures. Never read or publish production secrets for routine development. Keep local configuration ignored and the public KV ID all-zero. Store scratch work under ignored `.local/`.
+Use synthetic fixtures. Never read or publish production secrets for routine development. Keep local configuration ignored and the public KV ID all-zero. Keep `.dev.vars.example` limited to the four first-run secrets; optional settings belong in `config/optional-secrets.example` and `src/env.d.ts`. Store scratch work under ignored `.local/`.
 
 Validate changes and push directly to main; no PRs or PR-opening bots. Do not rewrite published history without explicit authorization, merge private historical branches, or disable existing Git hooks. Use GitHub-hosted CI with pinned actions and minimal permissions; CI never deploys.
 

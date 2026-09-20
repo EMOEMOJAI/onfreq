@@ -291,7 +291,9 @@ async function sendMemberReminders(
   if (env.GCA_DM_ENABLED !== 'true') return;
   // Missing or unusable configuration disables reminders for this poll; it
   // must never throw, or one bad setting would stop the online cards too.
-  if (!/^\d{17,20}$/.test(env.GCA_DISCORD_GUILD_ID ?? '') || !/^\d{17,20}$/.test(env.GCA_MEMBER_ROLE_ID ?? '')) {
+  const guildId = env.GCA_DISCORD_GUILD_ID ?? '';
+  const memberRoleId = env.GCA_MEMBER_ROLE_ID ?? '';
+  if (!/^\d{17,20}$/.test(guildId) || !/^\d{17,20}$/.test(memberRoleId)) {
     console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'guild_or_role' }));
     return;
   }
@@ -349,11 +351,11 @@ async function sendMemberReminders(
   }
   if (!candidates.length || (await storage.get<number>(BACKOFF_KEY) ?? 0) > now) return;
   const deadline = Date.now() + 25_000;
-  const members = await fetchMembers(env.DISCORD_BOT_TOKEN, env.GCA_DISCORD_GUILD_ID, deadline).catch(async (err: unknown) => {
+  const members = await fetchMembers(env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
     if (err instanceof GcaDiscordError) await storage.put(BACKOFF_KEY, Date.now() + err.retryMs);
     throw err;
   });
-  const index = indexMemberVids(members, env.GCA_MEMBER_ROLE_ID);
+  const index = indexMemberVids(members, memberRoleId);
   let attemptsThisPoll = 0;
   for (const { atc, key, mismatch, attempts } of candidates) {
     if (attemptsThisPoll >= MAX_SENDS_PER_POLL || Date.now() >= deadline) break;

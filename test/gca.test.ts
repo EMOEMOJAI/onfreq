@@ -30,7 +30,7 @@ const APPROVALS = JSON.stringify({
   610006: [{ region: 'AA', level: 1 }],
 });
 const HOME_OVERRIDES = JSON.stringify({ 620001: 'AC' });
-const settings = () => ({
+const settings = (): Env => ({
   ...env, GCA_DM_ENABLED: 'true', GCA_MEMBER_ROLE_ID: QDLE,
   GCA_REGIONS: REGIONS, GCA_APPROVALS: APPROVALS, GCA_HOME_OVERRIDES: HOME_OVERRIDES,
 });

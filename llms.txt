@@ -7,7 +7,8 @@ Live session cards, FIR coverage, durable retries and optional GCA reminders wit
 ## Documentation
 
 - [Overview](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/README.md): Features and contribution workflow.
-- [Setup](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/docs/setup.md): Deployment, configuration, Mac monitoring and maintenance.
+- [Setup](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/docs/setup.md): Deploy to Cloudflare guided setup, manual deployment, Mac monitoring and maintenance.
+- [Optional settings](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/config/optional-secrets.example): Private configuration formats for optional features.
 - [Agent instructions](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/AGENTS.md): Commands and implementation invariants.
 - [Security](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/SECURITY.md): Sensitive reporting and data retention.
 - [License](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/LICENSE): MIT terms.

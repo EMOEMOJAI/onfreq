@@ -24,7 +24,11 @@
 
 ## Get started
 
-You need Node.js 24, Cloudflare and your own Discord bot. Follow the **[setup guide](docs/setup.md)** for deployment and optional Mac monitoring.
+Create and invite your own Discord bot, then deploy to your Cloudflare account:
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/EMOEMOJAI/onfreq)
+
+The guided flow creates storage and asks for four settings. Follow the **[setup guide](docs/setup.md#guided-deployment)** for bot permissions, values to enter and optional features. No local Node.js installation is needed for the button flow.
 
 Public delivery is at least once. This is self-hosted software, not a hosted bot service.
 

@@ -123,7 +123,7 @@ beforeEach(() => {
       return Response.json([entry('EGLL_TWR'), ...feed], { status: feedStatus });
     }
     if (url.includes('/guilds/') && url.includes('/members?')) {
-      return Response.json([{ user: { id: '200000000000000001' }, nick: 'Member (600001)', roles: [env.GCA_MEMBER_ROLE_ID] }], { status: gcaMemberStatus });
+      return Response.json([{ user: { id: '200000000000000001' }, nick: 'Member (600001)', roles: [(env as Env).GCA_MEMBER_ROLE_ID] }], { status: gcaMemberStatus });
     }
     if (url.endsWith('/users/@me/channels')) {
       return Response.json({ id: '300000000000000001', type: 1, recipients: [{ id: '200000000000000001' }] });
@@ -172,6 +172,26 @@ afterEach(async () => {
 });
 
 describe('polling through the Durable Object', () => {
+  it('baselines and announces new sessions with only the four first-run secrets', async () => {
+    const minimal: Env = {
+      ATC_STATE: env.ATC_STATE, POLL_COORDINATOR: env.POLL_COORDINATOR,
+      OFFLINE_GRACE_POLLS: '2', DISCORD_BOT_TOKEN: env.DISCORD_BOT_TOKEN,
+      DISCORD_CHANNEL_IDS: 'test-channel', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
+    };
+    const firstRunPoll = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, minimal).poll());
+    feed = [entry(b)];
+    await firstRunPoll();
+    expect(sent).toHaveLength(0);
+    now += 60_000;
+    feed = [entry(a), entry(b)];
+    await firstRunPoll();
+    const newCards = sent.filter((item) => item.method === 'POST');
+    expect(newCards).toHaveLength(1);
+    expect(newCards[0]!.embed.title).toContain(`${a} is now ONLINE`);
+    expect(gcaMessages).toHaveLength(0);
+    expect(network.mock.calls.some(([url]) => String(url).includes('/v2/users/'))).toBe(false);
+  });
+
   function configuredPoll(overrides: Partial<Env> = {}) {
     return runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
       ...env, DISCORD_CHANNEL_IDS: 'test-channel,test-channel-b,test-channel', ...overrides,

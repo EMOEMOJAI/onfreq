@@ -100,9 +100,8 @@ jobs:
       - name: Markdown lint
         run: npm run lint:docs
 
-      # `wrangler types` derives the Env type from .dev.vars (gitignored); the example file
-      # carries the secret NAMES with placeholder values, which is all the type needs.
-      - name: Provide placeholder dev vars for type generation
+      # Only the four public first-run settings; optional features use test fixtures.
+      - name: Provide local test placeholders
         run: cp .dev.vars.example .dev.vars
 
       - name: Typecheck (wrangler types + tsc)
@@ -115,4 +114,4 @@ jobs:
         run: npm audit --audit-level=high
 
       - name: Validate deploy bundle without publishing
-        run: npx wrangler deploy --dry-run --outdir .wrangler/dry-run
+        run: npm run deploy -- --dry-run --outdir .wrangler/dry-run

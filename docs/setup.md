@@ -2,11 +2,28 @@
 
 [Overview](../README.md) · [Security](../SECURITY.md)
 
-## Deploy
+## Guided deployment
 
-1. Create a bot in the [Discord Developer Portal](https://discord.com/developers/applications).
-2. Invite it with **View Channel**, **Send Messages**, **Embed Links** and **Read Message History** in every destination channel. Channel overrides must allow these permissions; roster continuations are replies.
-3. Install Node.js 24 and clone this repository. Run:
+1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications). On its **Bot** page, generate and privately save the bot token. Invite it to your server with **View Channel**, **Send Messages**, **Embed Links** and **Read Message History** in every destination channel.
+2. Click the button below. Sign in to Cloudflare, connect GitHub or GitLab and choose your own account, repository and Worker name. Cloudflare creates the KV namespace and Durable Object for you.
+3. Fill in these four **Worker secrets**, then deploy. Keep the detected deploy command, `npm run deploy`.
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/EMOEMOJAI/onfreq)
+
+| Setting | What to enter |
+| --- | --- |
+| `DISCORD_BOT_TOKEN` | The token from your application's **Bot** page |
+| `DISCORD_CHANNEL_IDS` | Enable Discord **Developer Mode**, right-click each text channel → **Copy Channel ID**; separate multiple IDs with commas |
+| `FIR_PREFIXES` | Your chosen ICAO callsign prefixes, separated by commas; each is 1–4 letters, with no default region |
+| `POLL_SECRET` | Generate a random secret with your password manager or `openssl rand -hex 32`; save it privately for health checks |
+
+Channel overrides must allow all four permissions; roster continuations are replies. Store values as encrypted **Worker secrets**, never in repository files, build variables or GitHub Actions. GCA reminders stay off until configured. Usage follows your [Cloudflare plan](https://developers.cloudflare.com/durable-objects/platform/pricing/).
+
+After deployment, cron polls once per minute. **The first poll quietly records existing connections**; cards appear for subsequent connections. Use authenticated `GET /health` to check polling. For optional features, open your Worker → **Settings → Variables and Secrets**, add the required secrets, and deploy those settings. Your copied repository is connected to Workers Builds for future deployments.
+
+## Manual deployment and upgrades
+
+For CLI deployment, install Node.js 24, clone the repository and create/invite your bot as above. Run:
 
 ```sh
 npm ci
@@ -23,16 +40,16 @@ npx wrangler secret put DISCORD_BOT_TOKEN --config wrangler.local.jsonc
 npx wrangler secret put DISCORD_CHANNEL_IDS --config wrangler.local.jsonc
 npx wrangler secret put FIR_PREFIXES --config wrangler.local.jsonc
 npx wrangler secret put POLL_SECRET --config wrangler.local.jsonc
-npm run deploy
+npm run deploy:local
 ```
 
-Channel IDs and FIR prefixes are required, comma-separated settings; there is no default airspace. Generate a strong random `POLL_SECRET`; never commit it. The first poll quietly records existing connections. Cron then polls once per minute. Usage follows your [Cloudflare plan](https://developers.cloudflare.com/durable-objects/platform/pricing/).
+The public `npm run deploy` command uses `wrangler.jsonc`. It stops if a private `wrangler.local.jsonc` exists; use `deploy:local` for that installation. Keep an existing button installation's generated resource IDs when managing its copied repository.
 
 **Upgrading:** set `FIR_PREFIXES`, and migrate any custom labels to private `FIR_LABELS` before deploying. Preserve the existing Worker, KV namespace, Durable Object class and migration tag in your private config. If its coordinator object name differs from `onfreq`, set the `COORDINATOR_NAME` secret to the exact existing name **before deploying**. Changing identity disconnects stored state. Do not restart an old KV-only deployment against stale state.
 
 ## Optional settings
 
-[`.dev.vars.example`](../.dev.vars.example) lists every setting and the approval JSON formats. Use `wrangler secret put <NAME> --config wrangler.local.jsonc` for production; `.dev.vars` is local only.
+[Optional settings and JSON formats](../config/optional-secrets.example) are separate from the four first-run prompts. Add them as Worker secrets in Cloudflare, or use `wrangler secret put <NAME> --config wrangler.local.jsonc` for a CLI-managed installation. For local development, add only the settings you need to `.dev.vars`.
 
 | Setting | Purpose |
 | --- | --- |
