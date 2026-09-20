@@ -248,11 +248,73 @@ describe('polling through the Durable Object', () => {
       now += 60_000;
     }
     expect(attempts).toBe(1);
-    expect((await snapshot())?.pendingOffline?.[0]?.attempts).toBe(0);
+    expect((await snapshot())?.pendingOffline?.[0]?.attemptsByChannel).toEqual({ 'test-channel': 0 });
     now = START + 1_200_000;
     await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
     expect(attempts).toBe(2);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it.each(['edit', 'fallback', 'standalone'])('keeps a rate-limited %s closeout after another channel exhausts retries', async (kind) => {
+    const old = { ...session(a), missed: 1 };
+    old.messages!.push({ channelId: 'test-channel-b', messageId: 'ended-b' });
+    if (kind === 'standalone') delete old.messages;
+    await seed({ [a]: old });
+    failures.add('test-channel-b');
+    failureStatus = kind === 'edit' ? 400 : 403;
+    const original = network.getMockImplementation()!;
+    let limited = false;
+    let callsToA = 0;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).includes('/channels/test-channel/')) {
+        callsToA++;
+        if (kind === 'fallback' && init?.method === 'PATCH') return new Response(null, { status: 404 });
+        if (!limited) {
+          limited = true;
+          return Response.json({ retry_after: 1200 }, { status: 429 });
+        }
+      }
+      return original(input, init);
+    });
+    for (let i = 0; i < 12; i++) {
+      await expect(configuredPoll()).rejects.toThrow('Discord notifications failed');
+      await evictDurableObject(stub());
+      now += 60_000;
+    }
+    expect(callsToA).toBe(kind === 'fallback' ? 2 : 1);
+    const job = (await snapshot())!.pendingOffline![0]!;
+    expect([...job.messages.map((ref) => ref.channelId), ...job.channelIds]).toEqual(['test-channel']);
+    expect(job.attemptsByChannel).toEqual({ 'test-channel': 0 });
+    expect(job.attempts).toBe(0);
+    const callsToB = network.mock.calls.filter(([input]) => String(input).includes('/test-channel-b/')).length;
+    now = START + 1_200_000;
+    await expect(configuredPoll()).resolves.toEqual({ skipped: false });
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    expect(network.mock.calls.filter(([input]) => String(input).includes('/test-channel-b/'))).toHaveLength(callsToB);
+    expect(sent.some((item) => item.channelId === 'test-channel' && item.embed.title?.includes('OFFLINE'))).toBe(true);
+  });
+
+  it('imports legacy retry counts and reports a destination abandoned alongside successful delivery', async () => {
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
+        event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
+        messages: [{ channelId: 'test-channel', messageId: a }, { channelId: 'test-channel-b', messageId: 'old-b' }],
+        channelIds: [], attempts: 9,
+      }] } satisfies PollSnapshot);
+    });
+    failures.add('test-channel');
+    failures.add('test-channel-b');
+    await expect(configuredPoll()).rejects.toThrow('all Discord notifications failed');
+    expect((await snapshot())?.pendingOffline?.[0]?.attemptsByChannel)
+      .toEqual({ 'test-channel': 10, 'test-channel-b': 10 });
+    await evictDurableObject(stub());
+    now += 60_000;
+    failures.delete('test-channel');
+    await expect(configuredPoll()).rejects.toThrow('some Discord notifications failed');
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    expect((await snapshot())?.lastSuccessfulPollAt).toBeUndefined();
+    now += 60_000;
+    await expect(configuredPoll()).resolves.toEqual({ skipped: false });
   });
 
   it('keeps a roster in each channel during partial delivery and moves it after retry', async () => {

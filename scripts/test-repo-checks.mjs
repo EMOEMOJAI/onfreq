@@ -55,6 +55,52 @@ test('rejects PNG text/EXIF and JPEG/WebP metadata without exposing it', () => {
   assert.match(imagePrivacy('image.webp', webp), /metadata/);
 });
 
+// A generated one-pixel black JPEG, containing no external image or member data.
+const jpeg = Buffer.from('/9j/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AJUAB//Z', 'base64');
+function jpegSegment(type, payload = Buffer.alloc(0)) {
+  const segment = Buffer.alloc(4 + payload.length);
+  segment[0] = 0xff; segment[1] = type;
+  segment.writeUInt16BE(payload.length + 2, 2); payload.copy(segment, 4);
+  return segment;
+}
+
+test('checks JPEG metadata before and after scan data, including between later scans', () => {
+  assert.equal(imagePrivacy('fixture.jpg', jpeg), null);
+  for (const type of [0xe1, 0xed, 0xfe]) {
+    const metadata = jpegSegment(type, Buffer.from('Synthetic private author: person@example.test'));
+    for (const offset of [2, jpeg.length - 2]) {
+      const image = Buffer.concat([jpeg.subarray(0, offset), metadata, jpeg.subarray(offset)]);
+      const result = imagePrivacy('fixture.jpg', image);
+      assert.match(result, /metadata/);
+      assert.doesNotMatch(result, /person|example\.test/);
+    }
+  }
+  // Marker-level progressive framing: scans are separated by table segments.
+  const scan = jpegSegment(0xda, Buffer.from([1, 1, 0, 0, 63, 0]));
+  const between = [jpeg.subarray(0, -2), jpegSegment(0xc4), scan, Buffer.from([1, 2, 3])];
+  assert.equal(imagePrivacy('fixture.jpg', Buffer.concat([...between, Buffer.from([0xff, 0xd9])])), null);
+  assert.match(imagePrivacy('fixture.jpg', Buffer.concat([...between, jpegSegment(0xfe), Buffer.from([0xff, 0xd9])])), /metadata/);
+});
+
+test('walks stuffed bytes, restart/fill markers and in-scan DNL without hiding later metadata', () => {
+  const entropy = Buffer.from([1, 0xff, 0, 2, 0xff, 0xd0, 3, 0xff, 0xff, 0xd7, 4]);
+  const parts = [jpeg.subarray(0, -2), entropy, jpegSegment(0xdc, Buffer.from([0, 1])), Buffer.from([5])];
+  assert.equal(imagePrivacy('fixture.jpg', Buffer.concat([...parts, Buffer.from([0xff, 0xd9])])), null);
+  assert.match(imagePrivacy('fixture.jpg', Buffer.concat([...parts, jpegSegment(0xe1), Buffer.from([0xff, 0xd9])])), /metadata/);
+});
+
+test('fails closed on truncated JPEGs, malformed segments and trailing payloads', () => {
+  for (const image of [jpeg.subarray(0, -2), jpeg.subarray(0, -1),
+    Buffer.concat([jpeg, Buffer.from('extra')]),
+    Buffer.from([0xff, 0xd8, 0xff, 0xda, 0, 1]),
+    Buffer.from([0xff, 0xd8, 0xff, 0xda, 0, 20, 1]),
+    Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+    Buffer.from([0xff, 0xd8, 0xff, 0xd0]),
+    Buffer.from([0xff, 0xd8, 0xff, 0x00])]) {
+    assert.ok(imagePrivacy('fixture.jpg', image));
+  }
+});
+
 test('validates guided setup and rejects changed prompts, values and deployment identities', () => {
   const config = jsonc(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));

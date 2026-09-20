@@ -138,7 +138,10 @@ export interface PendingOffline {
   event: OfflineEvent;
   messages: PostedMessage[];
   channelIds: string[];
-  attempts: number;
+  /** Legacy shared counter, imported when a destination next needs retrying. */
+  attempts?: number;
+  /** Failed delivery polls per destination; cooldown waits do not count. */
+  attemptsByChannel?: Record<string, number>;
 }
 
 export interface DiffResult {

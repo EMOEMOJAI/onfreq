@@ -128,32 +128,47 @@ async function syncOnlineCards(
 }
 
 /** Close only unresolved destinations; successful deliveries are never repeated. */
-async function announceOffline(env: Env, job: PendingOffline, labels: FirLabel[], limits: DiscordRateLimits): Promise<number> {
+async function announceOffline(
+  env: Env, job: PendingOffline, labels: FirLabel[], limits: DiscordRateLimits,
+): Promise<{ delivered: number; failed: boolean }> {
   const endedEmbed = buildSessionEndedEmbed(job.event, labels);
   const fallbackEmbed = buildOfflineEmbed(job.event, labels);
   const remaining: PostedMessage[] = [];
   let delivered = 0;
-  let deliveryFailure = false;
+  let failed = false;
+  const attempts = job.attemptsByChannel ??= {};
+  const keepForRetry = (channelId: string, err: unknown): boolean => {
+    failed = true;
+    const rateLimited = err instanceof DiscordRateLimitError;
+    const used = (attempts[channelId] ?? job.attempts ?? 0) + (rateLimited ? 0 : 1);
+    if (rateLimited || used <= OFFLINE_RETRY_POLLS) {
+      attempts[channelId] = used;
+      return true;
+    }
+    delete attempts[channelId];
+    console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign, channelId }));
+    return false;
+  };
   for (const ref of job.messages) {
     try {
       await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, endedEmbed, limits);
       delivered++;
+      delete attempts[ref.channelId];
       continue;
     } catch (err) {
       logFailure('offline_edit_failed', job.event.callsign, ref.channelId, err);
       if (!(err instanceof DiscordApiError && err.isGone)) {
-        if (!(err instanceof DiscordRateLimitError)) deliveryFailure = true;
-        remaining.push(ref);
+        if (keepForRetry(ref.channelId, err)) remaining.push(ref);
         continue;
       }
     }
     try {
       await postMessage(env.DISCORD_BOT_TOKEN, ref.channelId, fallbackEmbed, undefined, undefined, limits);
       delivered++;
+      delete attempts[ref.channelId];
     } catch (err) {
       logFailure('offline_post_failed', job.event.callsign, ref.channelId, err);
-      if (!(err instanceof DiscordRateLimitError)) deliveryFailure = true;
-      remaining.push(ref);
+      if (keepForRetry(ref.channelId, err)) remaining.push(ref);
     }
   }
   job.messages = remaining;
@@ -162,16 +177,16 @@ async function announceOffline(env: Env, job: PendingOffline, labels: FirLabel[]
     try {
       await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed, undefined, undefined, limits);
       delivered++;
+      delete attempts[channelId];
     } catch (err) {
       logFailure('offline_post_failed', job.event.callsign, channelId, err);
-      if (!(err instanceof DiscordRateLimitError)) deliveryFailure = true;
-      remainingChannels.push(channelId);
+      if (keepForRetry(channelId, err)) remainingChannels.push(channelId);
     }
   }
   job.channelIds = remainingChannels;
-  // Waiting for Discord's cooldown must never exhaust the closeout retry budget.
-  if (deliveryFailure) job.attempts++;
-  return delivered;
+  // Keep a numeric legacy field so an older Worker can still retry on rollback.
+  job.attempts = 0;
+  return { delivered, failed };
 }
 
 export interface PollOutcome {
@@ -273,17 +288,15 @@ export async function runPoll(
   const jobs: PendingOffline[] = structuredClone(previousPendingOffline);
   for (const offline of wentOffline) {
     const { messages = [], pendingChannelIds: _pending, ...event } = offline;
-    jobs.push({ event, messages, channelIds: messages.length ? [] : [...channelIds], attempts: 0 });
+    jobs.push({ event, messages, channelIds: messages.length ? [] : [...channelIds] });
   }
   const pendingOffline: PendingOffline[] = [];
   for (const job of jobs) {
     attempted += job.messages.length + job.channelIds.length;
-    delivered += await announceOffline(env, job, labels, limits);
-    if (job.messages.length || job.channelIds.length) {
-      deliveryFailed = true;
-      if (job.attempts <= OFFLINE_RETRY_POLLS) pendingOffline.push(job);
-      else console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign }));
-    }
+    const result = await announceOffline(env, job, labels, limits);
+    delivered += result.delivered;
+    deliveryFailed ||= result.failed;
+    if (job.messages.length || job.channelIds.length) pendingOffline.push(job);
   }
 
   const cards = await syncOnlineCards(env, next, current, gracePolls, labels, limits);

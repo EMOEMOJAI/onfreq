@@ -42,15 +42,33 @@ export function imagePrivacy(file, data) {
   if (/\.jpe?g$/i.test(file)) {
     if (data.length < 2 || data.readUInt16BE(0) !== 0xffd8) return 'invalid JPEG';
     let offset = 2;
-    while (offset + 4 <= data.length && data[offset] === 0xff) {
-      const type = data[offset + 1];
+    let inScan = false;
+    let sawScan = false;
+    while (offset < data.length) {
+      // Scan data escapes literal FF bytes as FF00. Restart markers do not
+      // end the scan; other markers resume ordinary segment parsing.
+      if (inScan) while (offset < data.length && data[offset] !== 0xff) offset++;
+      if (data[offset] !== 0xff) return 'invalid JPEG marker';
+      while (data[offset] === 0xff) offset++; // optional marker fill bytes
+      if (offset >= data.length) return 'incomplete JPEG marker';
+      const type = data[offset++];
+      if (inScan && (type === 0 || (type >= 0xd0 && type <= 0xd7))) continue;
+      if (type === 0 || type === 0xd8 || (type >= 0xd0 && type <= 0xd7)) return 'invalid JPEG marker';
+      if (type === 0xd9) {
+        if (!sawScan) return 'JPEG has no image scan';
+        return offset === data.length ? null : 'JPEG has trailing data';
+      }
+      if (type === 0x01) continue; // standalone arithmetic-coding TEM marker
       if ([0xe1, 0xed, 0xfe].includes(type)) return 'JPEG contains EXIF/XMP/IPTC/comment metadata';
-      if (type === 0xda || type === 0xd9) return null;
-      const size = data.readUInt16BE(offset + 2);
-      if (size < 2 || offset + size + 2 > data.length) return 'invalid JPEG segment';
-      offset += size + 2;
+      if (offset + 2 > data.length) return 'incomplete JPEG segment';
+      const size = data.readUInt16BE(offset);
+      if (size < 2 || offset + size > data.length) return 'invalid JPEG segment';
+      offset += size;
+      // DNL may occur inside a scan; SOS starts each progressive scan.
+      inScan = type === 0xda || (inScan && type === 0xdc);
+      if (type === 0xda) sawScan = true;
     }
-    return 'invalid JPEG';
+    return 'incomplete JPEG';
   }
   if (/\.webp$/i.test(file)) {
     if (data.toString('ascii', 0, 4) !== 'RIFF' || data.toString('ascii', 8, 12) !== 'WEBP') return 'invalid WebP';
