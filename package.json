@@ -14,10 +14,17 @@
     "tail": "wrangler tail --config wrangler.local.jsonc",
     "lint:docs": "markdownlint-cli2",
     "predeploy": "node scripts/check-deploy.mjs",
-    "deploy:local": "wrangler deploy --config wrangler.local.jsonc"
+    "deploy:local": "wrangler deploy --config wrangler.local.jsonc",
+    "check:privacy": "node scripts/check-privacy.mjs",
+    "check:setup": "node scripts/check-setup.mjs",
+    "check:links": "node scripts/check-links.mjs",
+    "check:repo": "npm run check:privacy && npm run check:setup && npm run check:links"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "github-slugger": "2.0.0",
+    "jsonc-parser": "3.3.1",
+    "markdown-it": "15.0.1",
     "markdownlint-cli2": "0.23.3",
     "typescript": "^5.9.0",
     "vitest": "^4.1.11",

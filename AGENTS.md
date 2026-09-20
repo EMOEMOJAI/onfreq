@@ -10,6 +10,8 @@ TypeScript Discord bot on Cloudflare Workers. Read [README.md](README.md) and [s
 
 Use Node.js 24. Run `npm ci`; copy `.dev.vars.example` to `.dev.vars` only if absent. Run `npm run lint:docs`, `npm run typecheck`, `npm test` and `npx wrangler deploy --dry-run`. Script changes also need ShellCheck (POSIX files), actionlint, zsh syntax checks and macOS plist validation. Maintainer deployment uses `npm run deploy:local` with ignored `wrangler.local.jsonc` and requires task authorization. The public `deploy` script is for new installations and must refuse a checkout containing private deployment config.
 
+After staging changes, run `npm run check:repo` for privacy, deployment setup and local documentation links. These checks read the Git index and reachable HEAD history; they exclude ignored files. External links are checked weekly and on manual CI runs; HTTP 401/403/429 results are reported as unverified.
+
 ## Invariants
 
 - All HTTP and cron polling uses the same coordinator selected by `getCoordinator`; preserve existing deployment/storage identities through private configuration.
