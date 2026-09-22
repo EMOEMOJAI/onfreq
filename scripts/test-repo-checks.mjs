@@ -27,6 +27,7 @@ test('rejects operator IDs and variables without revealing their values', () => 
 test('checks both raw commit emails and redacts rejected identities', () => {
   const safe = 'a'.repeat(40) + '\t123+example@users.noreply.github.com\texample@users.noreply.github.com';
   assert.deepEqual(privateCommitEmails(safe), []);
+  assert.deepEqual(privateCommitEmails('b'.repeat(40) + '\t123+example@users.noreply.github.com\tnoreply@github.com'), []);
   for (const value of [safe.replace('123+example@users.noreply.github.com', 'person@example.test'),
     safe.replace('\texample@users.noreply.github.com', '\tperson@example.test')]) {
     const failures = privateCommitEmails(value);

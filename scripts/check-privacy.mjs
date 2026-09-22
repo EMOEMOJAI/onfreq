@@ -88,7 +88,10 @@ export function imagePrivacy(file, data) {
 export function privateCommitEmails(log) {
   return log.trim().split('\n').filter(Boolean).flatMap((row) => {
     const [hash, author, committer] = row.split('\t');
-    return [author, committer].every((email) => /^[^\s@]+@users\.noreply\.github\.com$/i.test(email ?? ''))
+    // GitHub creates merge commits with noreply@github.com as the committer;
+    // it is a public service identity, unlike a maintainer's private address.
+    const allowed = (email) => /^(?:[^\s@]+@users\.noreply\.github\.com|noreply@github\.com)$/i.test(email ?? '');
+    return [author, committer].every(allowed)
       ? [] : [`${hash.slice(0, 12)}: commit email must use GitHub noreply`];
   });
 }
