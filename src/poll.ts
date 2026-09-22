@@ -18,8 +18,8 @@ import {
   parsePrefixes,
 } from './ivao';
 import { diffState, newestCardedSession } from './state';
-import { enrichMemberCountries } from './member-country';
-import { sendGcaReminders } from './gca';
+import { countryCode, enrichMemberCountries } from './member-country';
+import { gcaMismatch, parseGcaPolicy, sendGcaReminders, type GcaPolicy } from './gca';
 import { syncRosterMessages, type RosterTarget } from './roster';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import type { PendingOffline, OnlineAtc, PostedMessage, RosterMessage, StateMap, TrackedAtc } from './types';
@@ -32,6 +32,13 @@ function parseGracePolls(raw: string | undefined): number {
 
 /** Extra polls an undeliverable offline update is retried for before it is dropped. */
 const OFFLINE_RETRY_POLLS = 10;
+
+function highlightMismatch(atc: OnlineAtc, policy: GcaPolicy | null): boolean {
+  if (!policy) return false;
+  const onlineCountry = countryCode(atc.airport?.countryId);
+  const memberCountry = countryCode(atc.memberCountry?.countryId);
+  return Boolean(onlineCountry && memberCountry && onlineCountry !== memberCountry && gcaMismatch(atc, policy));
+}
 
 function logFailure(event: string, callsign: string, channelId: string, err: unknown): void {
   console.error(JSON.stringify({ event, callsign, channelId, error: String(err) }));
@@ -49,10 +56,11 @@ async function announceOnline(
   mentionedChannels: Set<string>,
   current: OnlineAtc[],
   labels: FirLabel[],
+  gcaPolicy: GcaPolicy | null,
   limits: DiscordRateLimits,
   nowIso: string,
 ): Promise<PostedMessage[]> {
-  const embed = buildOnlineEmbed(atc, current, labels);
+  const embed = buildOnlineEmbed(atc, current, labels, highlightMismatch(atc, gcaPolicy));
   const posted: PostedMessage[] = [];
   for (const channelId of channelIds) {
     // At most one role ping per channel per poll, however many controllers
@@ -75,6 +83,7 @@ async function announceOnline(
 /** Reconcile displayed cards, retrying only messages whose last edit failed. */
 async function syncOnlineCards(
   env: Env, next: StateMap, current: OnlineAtc[], gracePolls: number, labels: FirLabel[],
+  gcaPolicy: GcaPolicy | null,
   limits: DiscordRateLimits,
 ): Promise<{ targets: RosterTarget[]; failed: boolean }> {
   const coverage = current.map((atc) => next[atc.callsign] ?? atc);
@@ -94,7 +103,9 @@ async function syncOnlineCards(
       for (const ref of [...(session.messages ?? [])]) {
         const isHolder = callsign === holders.get(ref.channelId);
         const others = isHolder ? coverage.filter((atc) => atc.callsign !== callsign) : [];
-        const [embed, ...continuations] = buildOnlineEmbeds(session, others, coverage, labels);
+        const [embed, ...continuations] = buildOnlineEmbeds(
+          session, others, coverage, labels, highlightMismatch(session, gcaPolicy),
+        );
         const rendered = JSON.stringify(embed);
         let updated = ref.onlineEmbed === rendered;
         if (!updated) {
@@ -231,6 +242,7 @@ export async function runPoll(
   }
 
   await enrichMemberCountries(current, prev, auth);
+  const gcaPolicy = parseGcaPolicy(env);
 
   if (storage) {
     try {
@@ -272,7 +284,9 @@ export async function runPoll(
     const targets = entry.pendingChannelIds.filter((id) => channelIds.includes(id) &&
       !entry.messages?.some((ref) => ref.channelId === id));
     attempted += targets.length;
-    const posted = await announceOnline(env, entry, targets, mentionedChannels, coverage, labels, limits, nowIso);
+    const posted = await announceOnline(
+      env, entry, targets, mentionedChannels, coverage, labels, gcaPolicy, limits, nowIso,
+    );
     delivered += posted.length;
     if (posted.length) {
       entry.messages = [...(entry.messages ?? []), ...posted];
@@ -299,7 +313,7 @@ export async function runPoll(
     if (job.messages.length || job.channelIds.length) pendingOffline.push(job);
   }
 
-  const cards = await syncOnlineCards(env, next, current, gracePolls, labels, limits);
+  const cards = await syncOnlineCards(env, next, current, gracePolls, labels, gcaPolicy, limits);
   const roster = await syncRosterMessages(env.DISCORD_BOT_TOKEN, previousRosterMessages, cards.targets, limits);
   const rosterMessages = roster.messages;
   const rosterFailed = cards.failed || roster.failed;

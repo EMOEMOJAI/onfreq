@@ -129,6 +129,15 @@ describe('embeds', () => {
     expect(embed.timestamp).toBe(sample.since);
   });
 
+  it('marks an unapproved GCA mismatch red, including the member country', () => {
+    const embed = buildOnlineEmbed(detailed, undefined, LABELS, true);
+    expect(embed.color).toBe(COLOR_OFFLINE);
+    expect(embed.title).toContain('🔴');
+    expect(embed.fields).toContainEqual({
+      name: 'Controller', value: 'VID 600003 · 🔴 Brazil', inline: true,
+    });
+  });
+
   it('marks the online embed with a client-side relative timestamp', () => {
     const embed = buildOnlineEmbed(sample, undefined, LABELS);
     expect(embed.description).toContain(`<t:${Date.parse(sample.since) / 1000}:R>`);
@@ -408,4 +417,3 @@ describe('REST calls', () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 });
-
