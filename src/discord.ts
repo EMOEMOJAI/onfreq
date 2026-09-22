@@ -68,10 +68,10 @@ function stationFlag(atc: OnlineAtc, labels: FirLabel[]): string {
   return String.fromCodePoint(...[...code].map((letter) => 0x1f1e6 + letter.charCodeAt(0) - 65));
 }
 
-function formatController(atc: OnlineAtc): string {
+function formatController(atc: OnlineAtc, gcaMismatch = false): string {
   const code = countryCode(atc.memberCountry?.countryId);
   const country = code ? regionNames.of(code) : undefined;
-  return `VID ${atc.userId}${country ? ` · ${country}` : ''}`;
+  return `VID ${atc.userId}${country ? ` · ${gcaMismatch ? '🔴 ' : ''}${country}` : ''}`;
 }
 
 /** Only explicitly associated airport positions; no inferred top-down coverage. */
@@ -167,28 +167,29 @@ export function rosterCount(others: OnlineAtc[]): number {
  */
 export function buildOnlineEmbed(
   atc: TrackedAtc, current: OnlineAtc[] = [atc], labels: FirLabel[] = [],
+  gcaMismatch = false,
 ): DiscordEmbed {
-  return buildOnlineEmbeds(atc, [], current, labels)[0];
+  return buildOnlineEmbeds(atc, [], current, labels, gcaMismatch)[0];
 }
 
 /** All pages of the card; each must be sent in a separate Discord message. */
 export function buildOnlineEmbeds(
   atc: TrackedAtc, others: OnlineAtc[] = [], current: OnlineAtc[] = [atc, ...others],
-  labels: FirLabel[] = [],
+  labels: FirLabel[] = [], gcaMismatch = false,
 ): [DiscordEmbed, ...DiscordEmbed[]] {
   const fields: NonNullable<DiscordEmbed['fields']> = [
     { name: 'Frequency', value: formatFrequency(atc.frequency), inline: true },
     { name: 'Position', value: atc.position, inline: true },
-    { name: 'Controller', value: formatController(atc), inline: true },
+    { name: 'Controller', value: formatController(atc, gcaMismatch), inline: true },
   ];
 
   const coverage = airportCoverage(atc, current);
   if (coverage) fields.push({ name: `Online at ${atc.airport!.icao}`, value: coverage, inline: false });
 
   const first: DiscordEmbed = {
-    title: `🟢 ${stationFlag(atc, labels)} ${atc.callsign} is now ONLINE`,
+    title: `${gcaMismatch ? '🔴' : '🟢'} ${stationFlag(atc, labels)} ${atc.callsign} is now ONLINE`,
     description: describe(atc, `Online since ${relativeTime(atc.since)}`),
-    color: COLOR_ONLINE,
+    color: gcaMismatch ? COLOR_OFFLINE : COLOR_ONLINE,
     fields,
     footer: { text: EMBED_FOOTER },
     timestamp: atc.since,
@@ -211,8 +212,8 @@ export function buildOnlineEmbeds(
       if (length + field.name.length + value.length > EMBED_TEXT_LIMIT ||
           page.fields!.length >= EMBED_FIELD_LIMIT) {
         page = {
-          title: `🟢 Also online now — ${atc.callsign} (continued)`,
-          color: COLOR_ONLINE,
+          title: `${gcaMismatch ? '🔴' : '🟢'} Also online now — ${atc.callsign} (continued)`,
+          color: gcaMismatch ? COLOR_OFFLINE : COLOR_ONLINE,
           fields: [],
           footer: { text: EMBED_FOOTER },
           timestamp: atc.since,
