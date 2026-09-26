@@ -85,23 +85,39 @@ export function normalizeAtc(entry: IvaoAtcSummaryEntry): OnlineAtc {
 const MAX_CALLSIGN_LENGTH = 32;
 const MAX_TEXT_LENGTH = 128;
 const MAX_ICAO_LENGTH = 8;
+/** Callsigns are plain identifiers; anything else is rejected, not rewritten. */
+const CALLSIGN_PATTERN = /^[A-Za-z0-9_-]{2,32}$/;
+/** A decimal MHz value such as `118.1` or `121.500`; no hex, exponent or sign. */
+const FREQUENCY_STRING_PATTERN = /^\d{2,3}(\.\d{1,3})?$/;
+/** The whole-network summary is large; everything else keeps the default cap. */
+const IVAO_ATC_SUMMARY_MAX_BYTES = 8 * 1024 * 1024;
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+/** Session and member identifiers are positive integers. */
+function isPositiveId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
 /** The feed occasionally reports frequency as a numeric string. */
 function coerceFrequency(value: unknown): number | null {
   if (isFiniteNumber(value)) return value;
-  if (typeof value === 'string' && value.trim()) {
-    const n = Number(value);
-    return Number.isFinite(n) ? n : null;
+  if (typeof value === 'string' && FREQUENCY_STRING_PATTERN.test(value.trim())) {
+    return Number(value.trim());
   }
   return null;
 }
 
+/**
+ * Control characters become spaces and invisible format characters (bidi
+ * overrides, zero-width joiners) are removed, so feed text cannot forge
+ * extra lines or reorder what Discord displays.
+ */
 function truncate(value: string, max: number): string {
-  return value.length > max ? value.slice(0, max) : value;
+  const clean = value.replace(/\p{Cc}/gu, ' ').replace(/\p{Cf}/gu, '');
+  return clean.length > max ? clean.slice(0, max) : clean;
 }
 
 function sanitizeAirport(raw: unknown): NonNullable<IvaoAtcSummaryEntry['atcPosition']>['airport'] {
@@ -144,8 +160,8 @@ function sanitizeSubcenter(raw: unknown): IvaoAtcSummaryEntry['subcenter'] {
 function sanitizeEntry(raw: unknown): IvaoAtcSummaryEntry | null {
   if (!raw || typeof raw !== 'object') return null;
   const entry = raw as Record<string, unknown>;
-  if (!isFiniteNumber(entry.id) || !isFiniteNumber(entry.userId)) return null;
-  if (typeof entry.callsign !== 'string' || !entry.callsign.trim()) return null;
+  if (!isPositiveId(entry.id) || !isPositiveId(entry.userId)) return null;
+  if (typeof entry.callsign !== 'string' || !CALLSIGN_PATTERN.test(entry.callsign.trim())) return null;
 
   const session = entry.atcSession;
   if (!session || typeof session !== 'object') return null;
@@ -266,7 +282,22 @@ export function resetTokenCache(): void {
 function isCachedToken(value: unknown): value is CachedToken {
   return !!value && typeof value === 'object' &&
     typeof (value as Partial<CachedToken>).token === 'string' &&
+    ACCESS_TOKEN_PATTERN.test((value as CachedToken).token) &&
     Number.isFinite((value as Partial<CachedToken>).expiresAt);
+}
+
+/**
+ * A corrupt cache entry is treated as a miss (and re-minted) rather than
+ * failing every call until it expires. Parse errors can quote the stored
+ * token, so only a fixed event is logged.
+ */
+async function readCachedToken(kv: KVNamespace): Promise<unknown> {
+  try {
+    return await kv.get<unknown>(TOKEN_KEY, 'json');
+  } catch {
+    console.warn(JSON.stringify({ event: 'ivao_token_cache_read_failed' }));
+    return null;
+  }
 }
 
 function clampTtlSeconds(value: unknown): number {
@@ -291,7 +322,7 @@ export async function getAccessToken(
   if (!opts.forceRefresh) {
     if (memoryToken && memoryToken.expiresAt > now) return memoryToken.token;
 
-    const stored = await auth.kv.get<CachedToken>(TOKEN_KEY, 'json');
+    const stored = await readCachedToken(auth.kv);
     if (isCachedToken(stored) && stored.expiresAt > now) {
       memoryToken = stored;
       return stored.token;
@@ -318,8 +349,14 @@ export async function getAccessToken(
     // Deliberately not echoing the body: it carries the token on success.
     if (!res.ok) throw new Error(`IVAO token request failed with ${res.status}`);
 
-    const body = (await res.json()) as { access_token?: unknown; expires_in?: number };
-    if (typeof body.access_token !== 'string' || !ACCESS_TOKEN_PATTERN.test(body.access_token)) {
+    // A JSON parse error message can quote the body, which carries the token.
+    let body: { access_token?: unknown; expires_in?: unknown } | null;
+    try {
+      body = (await res.json()) as typeof body;
+    } catch {
+      throw new Error('IVAO token response was not valid JSON');
+    }
+    if (typeof body?.access_token !== 'string' || !ACCESS_TOKEN_PATTERN.test(body.access_token)) {
       throw new Error('IVAO token response contained no usable access_token');
     }
 
@@ -383,7 +420,7 @@ export async function fetchDivisionAtc(
   auth?: IvaoAuth,
 ): Promise<OnlineAtc[]> {
   const headers = await authHeaders(auth);
-  let res = await fetchBuffered(IVAO_ATC_SUMMARY_URL, { headers });
+  let res = await fetchBuffered(IVAO_ATC_SUMMARY_URL, { headers }, { maxBytes: IVAO_ATC_SUMMARY_MAX_BYTES });
 
   // A token rejected before its stated expiry (revoked, rotated) is worth
   // exactly one retry with a freshly minted one — but only when we actually
@@ -402,7 +439,7 @@ export async function fetchDivisionAtc(
     }
     res = await fetchBuffered(IVAO_ATC_SUMMARY_URL, {
       headers: await authHeaders(auth, { forceRefresh: true }),
-    });
+    }, { maxBytes: IVAO_ATC_SUMMARY_MAX_BYTES });
   }
 
   if (!res.ok) {
