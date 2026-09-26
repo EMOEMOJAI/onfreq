@@ -559,6 +559,64 @@ describe('REST calls', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('does not reset the POST failure streak on a 5xx response', async () => {
+    const limits = new DiscordRateLimits();
+    stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+
+    // A second consecutive 5xx still declares an outage: the first 5xx must
+    // not have reset the streak.
+    const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // A third destination now fails fast, proving the outage was marked.
+    const err = await postMessage('token', '3', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
+    expect(err).toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
+  });
+
+  it('resets the POST failure streak on a non-5xx failure such as 400, so a later 5xx does not immediately declare an outage', async () => {
+    const limits = new DiscordRateLimits();
+    stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+
+    stubFetch(Response.json({ message: 'bad request' }, { status: 400 }));
+    await expect(
+      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+
+    const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '3', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('resets the POST failure streak on a non-5xx response from a different method (PATCH), so a later POST 5xx does not immediately declare an outage', async () => {
+    const limits = new DiscordRateLimits();
+    stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+
+    stubFetch(Response.json({ message: 'Unknown Message' }, { status: 404 }));
+    await expect(
+      editMessage('token', '123', '999', buildOnlineEmbed(sample, undefined, LABELS), limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+
+    const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('marks an outage before rethrowing a thrown fetch error (timeout/network) for PATCH/DELETE', async () => {
     const network = vi.fn().mockRejectedValueOnce(new TypeError('upstream request timed out'));
     vi.stubGlobal('fetch', network);

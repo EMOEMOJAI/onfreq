@@ -143,16 +143,30 @@ describe('member profile country enrichment', () => {
     expect(network).not.toHaveBeenCalled();
   });
 
-  it('does not reset the shared token on a profile 401 when the token was freshly minted this run', async () => {
-    values.delete(TOKEN_KEY);
+  it('rate-limits profile-401 token resets to at most once per ~30 minutes across many polls, even after an earlier mint', async () => {
+    let clock = NOW;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    // Every mint (the tracker feed's or a lookup's own) succeeds; every
+    // profile lookup is rejected with a 401 regardless of how fresh its
+    // token is — this must not reset the cache on every single poll.
     const tokenNetwork = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('token')) return Response.json({ access_token: 'brand-new', expires_in: 1800 });
       return new Response(null, { status: 401 });
     });
     vi.stubGlobal('fetch', tokenNetwork);
-    await enrichMemberCountries([controller()], {}, auth);
-    expect(auth.kv.delete).not.toHaveBeenCalledWith(TOKEN_KEY);
+
+    for (let i = 0; i < 20; i++) {
+      await enrichMemberCountries([controller(800 + i, `QCTT_${i}_RMP`)], {}, auth);
+      clock += 60_000; // one simulated poll per minute
+    }
+    expect(auth.kv.delete).toHaveBeenCalledTimes(1);
+
+    // Once the ~30-minute window has elapsed, the next 401 resets again.
+    clock += 29 * 60_000;
+    vi.mocked(auth.kv.delete).mockClear();
+    await enrichMemberCountries([controller(900, 'QCTT_RMP2')], {}, auth);
+    expect(auth.kv.delete).toHaveBeenCalledTimes(1);
   });
 
   it('stops the batch within an overall lookup deadline even if no request itself has failed', async () => {
