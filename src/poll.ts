@@ -172,7 +172,7 @@ async function syncOnlineCards(
   ctx: PollContext, next: StateMap, current: OnlineAtc[],
 ): Promise<{ targets: RosterTarget[]; failed: boolean }> {
   const { env, labels, highlightPolicy, limits, channelIds } = ctx;
-  const coverage = current.map((atc) => next[atc.callsign] ?? atc);
+  const coverage = current.map((atc) => (Object.hasOwn(next, atc.callsign) ? next[atc.callsign] : undefined) ?? atc);
   let targets: RosterTarget[];
   let failed = false;
   let removedMessage: boolean;
@@ -486,7 +486,7 @@ export async function runPoll(
   let attempted = 0;
   let delivered = 0;
   let deliveryFailed = false;
-  const coverage = current.map((atc) => next[atc.callsign] ?? atc);
+  const coverage = current.map((atc) => (Object.hasOwn(next, atc.callsign) ? next[atc.callsign] : undefined) ?? atc);
   const mentionedChannels = new Set<string>();
 
   // Close out sessions that ended before announcing any that just started,

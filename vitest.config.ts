@@ -9,7 +9,7 @@ export default defineConfig({
       bindings: {
         DISCORD_BOT_TOKEN: 'test-token',
         COORDINATOR_NAME: '',
-        DISCORD_CHANNEL_IDS: 'test-channel',
+        DISCORD_CHANNEL_IDS: '900000000000000001',
         MENTION_ROLE_ID: '',
         GCA_DM_ENABLED: 'false',
         GCA_DISCORD_GUILD_ID: '100000000000000001',

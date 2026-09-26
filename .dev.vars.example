@@ -8,6 +8,6 @@ DISCORD_BOT_TOKEN=""
 DISCORD_CHANNEL_IDS=""
 # Required ICAO callsign prefixes to watch (comma-separated, 1–4 letters each).
 FIR_PREFIXES=""
-# Generate a unique value with: openssl rand -hex 32
+# At least 32 characters. Generate a unique value with: openssl rand -hex 32
 # Save it privately for authenticated health checks and manual polling.
 POLL_SECRET=""

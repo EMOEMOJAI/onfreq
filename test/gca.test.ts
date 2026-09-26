@@ -664,7 +664,7 @@ describe('durable GCA delivery', () => {
       if (String(input).endsWith(`/channels/${CHANNEL}/messages`)) {
         return Response.json({ retry_after: 65, global: true }, { status: 429 });
       }
-      if (String(input).endsWith('/channels/public/messages')) return Response.json({ id: 'synthetic-public' });
+      if (String(input).endsWith('/channels/public/messages')) return Response.json({ id: '700000000000000001' });
       return original(input, init);
     });
     await check([atc()]);
@@ -678,7 +678,7 @@ describe('durable GCA delivery', () => {
     await expect(publicPost()).rejects.toMatchObject({ status: 429, requestMade: false });
     expect(network).toHaveBeenCalledTimes(calls);
     now += 5_000;
-    await expect(publicPost()).resolves.toBe('synthetic-public');
+    await expect(publicPost()).resolves.toBe('700000000000000001');
   });
 
   it('retries opening a DM on transient errors, but abandons closed DMs', async () => {
@@ -815,7 +815,7 @@ describe('durable GCA delivery', () => {
       }
       if (url.endsWith(`/channels/${OTHER_CHANNEL}/messages`)) {
         sent.push(JSON.parse(String(init?.body)));
-        return Response.json({ id: 'synthetic-other' });
+        return Response.json({ id: '700000000000000002' });
       }
       return original(input, init);
     });

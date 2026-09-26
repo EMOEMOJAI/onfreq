@@ -66,7 +66,7 @@
         "description": "Enter the ICAO callsign prefixes you want to monitor, separated by commas. Each prefix must contain 1–4 letters. Choose your own airspace; there is no default region."
       },
       "POLL_SECRET": {
-        "description": "Generate and save a random secret with your password manager or `openssl rand -hex 32`. It protects health checks and manual polling. Never reuse your Discord token or commit this value."
+        "description": "Generate and save a random secret of at least 32 characters with your password manager or `openssl rand -hex 32`. It protects health checks and manual polling. Never reuse your Discord token or commit this value."
       },
       "ATC_STATE": {
         "description": "Private cache for this installation. Cloudflare creates a KV namespace automatically."

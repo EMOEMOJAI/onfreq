@@ -36,7 +36,7 @@ function session(callsign: string, cardAt = START - 60_000): TrackedAtc {
     position: callsign.split('_').at(-1)!, station: 'Test Station', location: null,
     since: new Date(START - 3_600_000).toISOString(), missed: 0,
     cardAt: new Date(cardAt).toISOString(),
-    messages: [{ channelId: 'test-channel', messageId: callsign }],
+    messages: [{ channelId: '900000000000000001', messageId: callsign }],
   };
 }
 
@@ -145,10 +145,10 @@ beforeEach(() => {
       gcaMessages.push(payload.embeds[0]!);
       return Response.json({ id: '300000000000000002' });
     }
-    if (/^https:\/\/discord.com\/api\/v10\/channels\/test-channel(?:-b)?\/messages/.test(url)) {
+    if (/^https:\/\/discord.com\/api\/v10\/channels\/90000000000000000[12]\/messages/.test(url)) {
       const channelId = url.split('/')[6]!;
       const method = init?.method ?? 'GET';
-      const id = method === 'POST' ? `posted-${sent.length}` : url.split('/').at(-1)!;
+      const id = method === 'POST' ? `8000000000000${String(sent.length).padStart(5, "0")}` : url.split('/').at(-1)!;
       if (method === 'DELETE') {
         deleted.push(id);
         if (failures.has(id)) return new Response('test deletion failure', { status: failureStatus });
@@ -202,7 +202,7 @@ describe('polling through the Durable Object', () => {
     const minimal: Env = {
       ATC_STATE: env.ATC_STATE, POLL_COORDINATOR: env.POLL_COORDINATOR,
       OFFLINE_GRACE_POLLS: '2', DISCORD_BOT_TOKEN: env.DISCORD_BOT_TOKEN,
-      DISCORD_CHANNEL_IDS: 'test-channel', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
+      DISCORD_CHANNEL_IDS: '900000000000000001', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
     };
     const firstRunPoll = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, minimal).poll());
     feed = [entry(b)];
@@ -222,7 +222,7 @@ describe('polling through the Durable Object', () => {
     const minimal: Env = {
       ATC_STATE: env.ATC_STATE, POLL_COORDINATOR: env.POLL_COORDINATOR,
       OFFLINE_GRACE_POLLS: '2', DISCORD_BOT_TOKEN: env.DISCORD_BOT_TOKEN,
-      DISCORD_CHANNEL_IDS: 'test-channel', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
+      DISCORD_CHANNEL_IDS: '900000000000000001', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
     };
     const firstRunPoll = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, minimal).poll());
     feed = [entry(a)];
@@ -239,7 +239,7 @@ describe('polling through the Durable Object', () => {
 
   function configuredPoll(overrides: Partial<Env> = {}) {
     return runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
-      ...env, DISCORD_CHANNEL_IDS: 'test-channel,test-channel-b,test-channel', ...overrides,
+      ...env, DISCORD_CHANNEL_IDS: '900000000000000001,900000000000000002,900000000000000001', ...overrides,
     }).poll());
   }
 
@@ -254,7 +254,7 @@ describe('polling through the Durable Object', () => {
       if (url.includes('/channels/')) {
         const channel = url.split('/')[6]!;
         calls.push({ channel, at: now });
-        if (channel === 'test-channel' && !limited) {
+        if (channel === '900000000000000001' && !limited) {
           limited = true;
           return Response.json({ retry_after: 65, global }, { status: 429, headers: { 'retry-after': '65' } });
         }
@@ -262,8 +262,8 @@ describe('polling through the Durable Object', () => {
       return original(input, init);
     });
     await expect(configuredPoll()).rejects.toThrow('Discord notifications failed');
-    expect(calls.filter((call) => call.channel === 'test-channel')).toHaveLength(1);
-    expect(calls.filter((call) => call.channel === 'test-channel-b')).toHaveLength(global ? 0 : 1);
+    expect(calls.filter((call) => call.channel === '900000000000000001')).toHaveLength(1);
+    expect(calls.filter((call) => call.channel === '900000000000000002')).toHaveLength(global ? 0 : 1);
     const firstCalls = calls.length;
     await evictDurableObject(stub());
     now += 60_000;
@@ -274,7 +274,7 @@ describe('polling through the Durable Object', () => {
     await expect(configuredPoll()).resolves.toEqual({ skipped: false });
     // The retried POST at +120s is followed by one edit in the same poll: a
     // retry's nonce may have returned an older copy, so its content is refreshed.
-    expect(calls.filter((call) => call.channel === 'test-channel').map((call) => call.at))
+    expect(calls.filter((call) => call.channel === '900000000000000001').map((call) => call.at))
       .toEqual([START, START + 120_000, START + 120_000]);
     expect((await snapshot())?.state?.[a]?.messages).toHaveLength(2);
   });
@@ -290,30 +290,30 @@ describe('polling through the Durable Object', () => {
       return original(input, init);
     });
     for (let i = 0; i < 12; i++) {
-      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow('Discord notifications failed');
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).rejects.toThrow('Discord notifications failed');
       if (i === 0) await evictDurableObject(stub());
       now += 60_000;
     }
     expect(attempts).toBe(1);
-    expect((await snapshot())?.pendingOffline?.[0]?.attemptsByChannel).toEqual({ 'test-channel': 0 });
+    expect((await snapshot())?.pendingOffline?.[0]?.attemptsByChannel).toEqual({ '900000000000000001': 0 });
     now = START + 1_200_000;
-    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
     expect(attempts).toBe(2);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
   it.each(['edit', 'fallback', 'standalone'])('keeps a rate-limited %s closeout after another channel exhausts retries', async (kind) => {
     const old = { ...session(a), missed: 1 };
-    old.messages!.push({ channelId: 'test-channel-b', messageId: 'ended-b' });
+    old.messages!.push({ channelId: '900000000000000002', messageId: 'ended-b' });
     if (kind === 'standalone') delete old.messages;
     await seed({ [a]: old });
-    failures.add('test-channel-b');
+    failures.add('900000000000000002');
     failureStatus = kind === 'edit' ? 400 : 403;
     const original = network.getMockImplementation()!;
     let limited = false;
     let callsToA = 0;
     network.mockImplementation(async (input, init) => {
-      if (String(input).includes('/channels/test-channel/')) {
+      if (String(input).includes('/channels/900000000000000001/')) {
         callsToA++;
         if (kind === 'fallback' && init?.method === 'PATCH') return new Response(null, { status: 404 });
         if (!limited) {
@@ -330,33 +330,33 @@ describe('polling through the Durable Object', () => {
     }
     expect(callsToA).toBe(kind === 'fallback' ? 2 : 1);
     const job = (await snapshot())!.pendingOffline![0]!;
-    expect([...job.messages.map((ref) => ref.channelId), ...job.channelIds]).toEqual(['test-channel']);
-    expect(job.attemptsByChannel).toEqual({ 'test-channel': 0 });
+    expect([...job.messages.map((ref) => ref.channelId), ...job.channelIds]).toEqual(['900000000000000001']);
+    expect(job.attemptsByChannel).toEqual({ '900000000000000001': 0 });
     expect(job.attempts).toBe(0);
-    const callsToB = network.mock.calls.filter(([input]) => String(input).includes('/test-channel-b/')).length;
+    const callsToB = network.mock.calls.filter(([input]) => String(input).includes('/900000000000000002/')).length;
     now = START + 1_200_000;
     await expect(configuredPoll()).resolves.toEqual({ skipped: false });
     expect((await snapshot())?.pendingOffline).toBeUndefined();
-    expect(network.mock.calls.filter(([input]) => String(input).includes('/test-channel-b/'))).toHaveLength(callsToB);
-    expect(sent.some((item) => item.channelId === 'test-channel' && item.embed.title?.includes('OFFLINE'))).toBe(true);
+    expect(network.mock.calls.filter(([input]) => String(input).includes('/900000000000000002/'))).toHaveLength(callsToB);
+    expect(sent.some((item) => item.channelId === '900000000000000001' && item.embed.title?.includes('OFFLINE'))).toBe(true);
   });
 
   it('imports legacy retry counts and reports a destination abandoned alongside successful delivery', async () => {
     await runInDurableObject(stub(), async (_, ctx) => {
       await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
         event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
-        messages: [{ channelId: 'test-channel', messageId: a }, { channelId: 'test-channel-b', messageId: 'old-b' }],
+        messages: [{ channelId: '900000000000000001', messageId: a }, { channelId: '900000000000000002', messageId: 'old-b' }],
         channelIds: [], attempts: 9,
       }] } satisfies PollSnapshot);
     });
-    failures.add('test-channel');
-    failures.add('test-channel-b');
+    failures.add('900000000000000001');
+    failures.add('900000000000000002');
     await expect(configuredPoll()).rejects.toThrow('all Discord notifications failed');
     expect((await snapshot())?.pendingOffline?.[0]?.attemptsByChannel)
-      .toEqual({ 'test-channel': 10, 'test-channel-b': 10 });
+      .toEqual({ '900000000000000001': 10, '900000000000000002': 10 });
     await evictDurableObject(stub());
     now += 60_000;
-    failures.delete('test-channel');
+    failures.delete('900000000000000001');
     await expect(configuredPoll()).rejects.toThrow('some Discord notifications failed');
     expect((await snapshot())?.pendingOffline).toBeUndefined();
     expect((await snapshot())?.lastSuccessfulPollAt).toBeUndefined();
@@ -372,7 +372,7 @@ describe('polling through the Durable Object', () => {
         ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600, roster: true,
       } as PendingOffline['event'];
       await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
-        event, messages: [{ channelId: 'test-channel', messageId: a }], channelIds: [],
+        event, messages: [{ channelId: '900000000000000001', messageId: a }], channelIds: [],
       }] } satisfies PollSnapshot);
     });
     await expect(configuredPoll()).resolves.toEqual({ skipped: false });
@@ -383,7 +383,7 @@ describe('polling through the Durable Object', () => {
   it('closes out an ended session before announcing a new one in the same poll', async () => {
     await seed({ [a]: session(a) });
     feed = [entry(b)];
-    await expect(configuredPoll({ OFFLINE_GRACE_POLLS: '1', DISCORD_CHANNEL_IDS: 'test-channel' }))
+    await expect(configuredPoll({ OFFLINE_GRACE_POLLS: '1', DISCORD_CHANNEL_IDS: '900000000000000001' }))
       .resolves.toEqual({ skipped: false });
     expect(sent.map((message) => message.method)).toEqual(['PATCH', 'POST']);
     expect(cards.get(a)?.title).toContain('OFFLINE');
@@ -421,17 +421,17 @@ describe('polling through the Durable Object', () => {
         channelIds: ['removed-channel-2'], attempts: 3,
       }] } satisfies PollSnapshot);
     });
-    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
     expect(network.mock.calls.some(([input]) => String(input).includes('removed-channel'))).toBe(false);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
   it('never edits cards, roster pages or closeouts in a channel removed from configuration', async () => {
     const tracked = session(a);
-    tracked.messages!.push({ channelId: 'test-channel-b', messageId: 'a-in-b' });
-    const rosterInB = { channelId: 'test-channel-b', parentMessageId: 'a-in-b', page: 0, messageId: 'page-in-b' };
+    tracked.messages!.push({ channelId: '900000000000000002', messageId: 'a-in-b' });
+    const rosterInB = { channelId: '900000000000000002', parentMessageId: 'a-in-b', page: 0, messageId: 'page-in-b' };
     const markerInB = {
-      channelId: 'test-channel-b', parentMessageId: 'gone-parent', page: 0, attempts: 1,
+      channelId: '900000000000000002', parentMessageId: 'gone-parent', page: 0, attempts: 1,
       maybePostedFrom: START - 120_000, maybePostedTo: START - 60_000,
     };
     await runInDurableObject(stub(), async (_, ctx) => {
@@ -440,17 +440,17 @@ describe('polling through the Durable Object', () => {
       } satisfies PollSnapshot);
     });
     feed = [entry(a, 121.7)];
-    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
     expect(sent.map((item) => [item.method, item.id])).toEqual([['PATCH', a]]);
     // Kept untouched in case the channel is configured again.
     expect((await snapshot())?.rosterMessages).toEqual([rosterInB]);
     expect((await snapshot())?.rosterPostAttempts).toEqual([markerInB]);
     feed = [];
     now += 60_000;
-    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel', OFFLINE_GRACE_POLLS: '1' }))
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001', OFFLINE_GRACE_POLLS: '1' }))
       .resolves.toEqual({ skipped: false });
     expect(cards.get(a)?.title).toContain('OFFLINE');
-    expect(network.mock.calls.some(([input]) => String(input).includes('/test-channel-b/'))).toBe(false);
+    expect(network.mock.calls.some(([input]) => String(input).includes('/900000000000000002/'))).toBe(false);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
@@ -458,18 +458,18 @@ describe('polling through the Durable Object', () => {
     const error = vi.spyOn(console, 'error');
     await seed({});
     feed = [entry(a)];
-    failures.add('test-channel-b');
+    failures.add('900000000000000002');
     await expect(configuredPoll()).rejects.toThrow('some Discord notifications failed');
     const logs = error.mock.calls.map((call) => String(call[0]));
     expect(logs).toContainEqual(expect.stringContaining('"event":"online_post_failed","callsign":"QCTT_TWR","channelIndex":1'));
-    expect(logs.filter((line) => line.includes('test-channel'))).toEqual([]);
+    expect(logs.filter((line) => line.includes('900000000000000001'))).toEqual([]);
   });
 
   describe('role pings', () => {
     const ROLE = '100000000000000077';
     const pings = () => sent.filter((item) => item.content === `<@&${ROLE}>`).length;
     const rolePoll = (overrides: Partial<Env> = {}) => configuredPoll({
-      DISCORD_CHANNEL_IDS: 'test-channel', OFFLINE_GRACE_POLLS: '1', MENTION_ROLE_ID: ROLE, ...overrides,
+      DISCORD_CHANNEL_IDS: '900000000000000001', OFFLINE_GRACE_POLLS: '1', MENTION_ROLE_ID: ROLE, ...overrides,
     });
     /** Disconnect, then reconnect as a new session, one poll each. */
     async function reconnect(overrides: Partial<Env> = {}) {
@@ -525,15 +525,15 @@ describe('polling through the Durable Object', () => {
       const error = vi.spyOn(console, 'error');
       const tracked = session(a);
       tracked.messages = [{
-        channelId: 'test-channel', messageId: a, postedAt: new Date(START - 60_000).toISOString(), onlineEmbed: '{"large":true}',
+        channelId: '900000000000000001', messageId: a, postedAt: new Date(START - 60_000).toISOString(), onlineEmbed: '{"large":true}',
       }];
       await seed({ [a]: tracked });
       failures.add(a);
-      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel', OFFLINE_GRACE_POLLS: '1' })).rejects.toThrow();
-      expect((await snapshot())?.pendingOffline?.[0]?.messages).toEqual([{ channelId: 'test-channel', messageId: a }]);
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001', OFFLINE_GRACE_POLLS: '1' })).rejects.toThrow();
+      expect((await snapshot())?.pendingOffline?.[0]?.messages).toEqual([{ channelId: '900000000000000001', messageId: a }]);
       const attemptsBefore = sent.length;
       now += 24 * 3_600_000 + 60_000;
-      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
       expect(sent).toHaveLength(attemptsBefore);
       expect((await snapshot())?.pendingOffline).toBeUndefined();
       expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'expired', count: 1 }));
@@ -546,13 +546,13 @@ describe('polling through the Durable Object', () => {
           ...session(`QC${String(i).padStart(3, '0')}_TWR`), messages: undefined,
           endedAt: new Date(START - (201 - i) * 1000).toISOString(), durationSeconds: 60,
         },
-        messages: [{ channelId: 'test-channel', messageId: `m${i}` }], channelIds: [],
+        messages: [{ channelId: '900000000000000001', messageId: `m${i}` }], channelIds: [],
       }));
       await runInDurableObject(stub(), async (_, ctx) => {
         await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: jobs } satisfies PollSnapshot);
       });
-      failures.add('test-channel');
-      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow();
+      failures.add('900000000000000001');
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).rejects.toThrow();
       const kept = (await snapshot())?.pendingOffline ?? [];
       expect(kept).toHaveLength(200);
       expect(kept.map((job) => job.messages[0]!.messageId)).toEqual(jobs.slice(1).map((job) => job.messages[0]!.messageId));
@@ -562,7 +562,7 @@ describe('polling through the Durable Object', () => {
 
   it('shows the public mismatch marker only while reminders are enabled with a valid policy', async () => {
     const gcaConfig = (overrides: Partial<Env>) => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
-      ...env, IVAO_CLIENT_ID: 'test-client', IVAO_CLIENT_SECRET: 'test-secret', DISCORD_CHANNEL_IDS: 'test-channel',
+      ...env, IVAO_CLIENT_ID: 'test-client', IVAO_CLIENT_SECRET: 'test-secret', DISCORD_CHANNEL_IDS: '900000000000000001',
       FIR_PREFIXES: 'XD', GCA_REGIONS: JSON.stringify({ AD: { name: 'Example East', prefixes: ['XD'] } }), ...overrides,
     }).poll());
     await seed({});
@@ -584,20 +584,20 @@ describe('polling through the Durable Object', () => {
 
   it('keeps a roster in each channel during partial delivery and moves it after retry', async () => {
     const old = session(a);
-    old.messages!.push({ channelId: 'test-channel-b', messageId: 'older-b' });
+    old.messages!.push({ channelId: '900000000000000002', messageId: 'older-b' });
     await seed({ [a]: old });
     feed = [entry(a), entry(b)];
-    failures.add('test-channel-b');
+    failures.add('900000000000000002');
     // Only reject new cards in B; its existing card remains editable.
     const original = network.getMockImplementation()!;
     network.mockImplementation(async (input, init) => {
-      const blocked = failures.delete('test-channel-b');
+      const blocked = failures.delete('900000000000000002');
       try {
-        if (blocked && String(input).includes('/test-channel-b/') && init?.method === 'POST') {
+        if (blocked && String(input).includes('/900000000000000002/') && init?.method === 'POST') {
           return new Response(null, { status: 403 });
         }
         return await original(input, init);
-      } finally { if (blocked) failures.add('test-channel-b'); }
+      } finally { if (blocked) failures.add('900000000000000002'); }
     });
     await expect(configuredPoll()).rejects.toThrow();
     expect(roster('older-b')).toContain(b);
@@ -606,7 +606,7 @@ describe('polling through the Durable Object', () => {
     failures.clear();
     now += 60_000;
     await configuredPoll();
-    const hostB = (await snapshot())!.state![b]!.messages!.find((ref) => ref.channelId === 'test-channel-b')!.messageId;
+    const hostB = (await snapshot())!.state![b]!.messages!.find((ref) => ref.channelId === '900000000000000002')!.messageId;
     expect(roster(hostB)).toContain(a);
     expect(roster('older-b')).toBeUndefined();
     expect((await snapshot())!.state![b]!.messages!.map((ref) => ref.postedAt))
@@ -616,8 +616,8 @@ describe('polling through the Durable Object', () => {
   it('re-homes a deleted host only in the affected channel and survives eviction', async () => {
     const older = session(a);
     const newer = session(b, START - 30_000);
-    older.messages!.push({ channelId: 'test-channel-b', messageId: 'older-b' });
-    newer.messages!.push({ channelId: 'test-channel-b', messageId: 'newer-b' });
+    older.messages!.push({ channelId: '900000000000000002', messageId: 'older-b' });
+    newer.messages!.push({ channelId: '900000000000000002', messageId: 'newer-b' });
     await seed({ [a]: older, [b]: newer });
     feed = [entry(a), entry(b)];
     await configuredPoll();
@@ -650,7 +650,7 @@ describe('polling through the Durable Object', () => {
 
   it('uses private labels for live, ended and fallback cards and roster groups', async () => {
     const config = {
-      DISCORD_CHANNEL_IDS: 'test-channel',
+      DISCORD_CHANNEL_IDS: '900000000000000001',
       FIR_LABELS: JSON.stringify([{ prefixes: ['QC', 'QE'], flag: '🇦🇺', name: 'Example' }]),
     };
     await seed({});
@@ -676,16 +676,16 @@ describe('polling through the Durable Object', () => {
   it('retries only the failed online channel across eviction and preserves health and since', async () => {
     await seed({});
     feed = [entry(a)];
-    failures.add('test-channel-b');
+    failures.add('900000000000000002');
     await expect(configuredPoll()).rejects.toThrow('some Discord notifications failed');
     expect((await snapshot())?.lastSuccessfulPollAt).toBeUndefined();
-    expect((await snapshot())?.state?.[a]?.pendingChannelIds).toEqual(['test-channel-b']);
+    expect((await snapshot())?.state?.[a]?.pendingChannelIds).toEqual(['900000000000000002']);
     await abortAllDurableObjects();
     now += 60_000;
     failures.clear();
     await configuredPoll();
     const posts = sent.filter((item) => item.method === 'POST');
-    expect(posts.map((item) => item.channelId)).toEqual(['test-channel', 'test-channel-b', 'test-channel-b']);
+    expect(posts.map((item) => item.channelId)).toEqual(['900000000000000001', '900000000000000002', '900000000000000002']);
     expect((await snapshot())?.state?.[a]).toMatchObject({ since: new Date(START).toISOString() });
     expect((await snapshot())?.state?.[a]?.messages).toHaveLength(2);
     expect((await snapshot())?.state?.[a]?.pendingChannelIds).toBeUndefined();
@@ -694,12 +694,12 @@ describe('polling through the Durable Object', () => {
   it('retries only failed offline edits across eviction', async () => {
     const tracked = session(a);
     tracked.missed = 1;
-    tracked.messages!.push({ channelId: 'test-channel-b', messageId: 'old-b' });
+    tracked.messages!.push({ channelId: '900000000000000002', messageId: 'old-b' });
     await seed({ [a]: tracked });
-    failures.add('test-channel-b');
+    failures.add('900000000000000002');
     await expect(configuredPoll()).rejects.toThrow('some Discord notifications failed');
     expect((await snapshot())?.state).toEqual({});
-    expect((await snapshot())?.pendingOffline?.[0]?.messages).toEqual([{ channelId: 'test-channel-b', messageId: 'old-b' }]);
+    expect((await snapshot())?.pendingOffline?.[0]?.messages).toEqual([{ channelId: '900000000000000002', messageId: 'old-b' }]);
     await abortAllDurableObjects();
     failures.clear();
     now += 60_000;
@@ -714,12 +714,12 @@ describe('polling through the Durable Object', () => {
     tracked.missed = 1;
     delete tracked.messages;
     await seed({ [a]: tracked });
-    failures.add('test-channel-b');
+    failures.add('900000000000000002');
     await expect(configuredPoll()).rejects.toThrow();
     failures.clear();
     now += 60_000;
     await configuredPoll();
-    expect(sent.map((item) => item.channelId)).toEqual(['test-channel', 'test-channel-b', 'test-channel-b']);
+    expect(sent.map((item) => item.channelId)).toEqual(['900000000000000001', '900000000000000002', '900000000000000002']);
   });
 
   it('keeps a replacement controller separate from a failed prior closeout', async () => {
@@ -935,6 +935,16 @@ describe('polling through the Durable Object', () => {
     expect(coverage(groundId)).toBeUndefined();
     expect(cards.get(groundId)?.fields?.find((f) => f.name === 'Airport')).toBeUndefined();
     expect(sent.filter((s) => s.method === 'POST')).toHaveLength(2);
+  });
+
+  it('handles callsigns named like Object.prototype members without crashing the poll', async () => {
+    await seed({});
+    const valueOf = { ...entry('valueOf'), id: 2, userId: 101 };
+    feed = [entry(a), valueOf];
+    await expect(configuredPoll({ FIR_PREFIXES: 'XA,QC,QE,QF,QG,QH,VA' })).resolves.toMatchObject({ skipped: false });
+    feed = [entry(a)];
+    now += 60_000;
+    await expect(configuredPoll({ FIR_PREFIXES: 'XA,QC,QE,QF,QG,QH,VA' })).resolves.toMatchObject({ skipped: false });
   });
 
   it('silently seeds a fresh installation', async () => {
@@ -1215,7 +1225,7 @@ describe('polling through the Durable Object', () => {
     const original = network.getMockImplementation()!;
     network.mockImplementation(async (input, init) => {
       const url = String(input);
-      if ((init?.method ?? 'GET') === 'GET' && url.includes('/channels/test-channel/messages?after=')) {
+      if ((init?.method ?? 'GET') === 'GET' && url.includes('/channels/900000000000000001/messages?after=')) {
         const card = (id: string, title: string, at: number) =>
           ({ id, author: { id: botId }, embeds: [{ title, timestamp: new Date(at).toISOString() }] });
         return Response.json([
@@ -1230,7 +1240,7 @@ describe('polling through the Durable Object', () => {
       }
       if (init?.method === 'PATCH' && url.endsWith(`/messages/${hiddenId}`)) {
         const embed = (JSON.parse(String(init.body)) as { embeds: DiscordEmbed[] }).embeds[0]!;
-        sent.push({ channelId: 'test-channel', method: 'PATCH', id: hiddenId, embed });
+        sent.push({ channelId: '900000000000000001', method: 'PATCH', id: hiddenId, embed });
         return Response.json({ id: hiddenId });
       }
       return original(input, init);
@@ -1268,19 +1278,19 @@ describe('polling through the Durable Object', () => {
     network.mockImplementation(async (input, init) => {
       const url = String(input);
       const method = init?.method ?? 'GET';
-      if (method === 'GET' && url.includes('/channels/test-channel/messages?after=')) {
+      if (method === 'GET' && url.includes('/channels/900000000000000001/messages?after=')) {
         // The tracked card matches too, but must be left to the normal closeout.
         return Response.json([card(hiddenId), card(trackedId)]);
       }
-      if (method === 'POST' && url.endsWith('/channels/test-channel/messages') && !failures.has('POST')) {
+      if (method === 'POST' && url.endsWith('/channels/900000000000000001/messages') && !failures.has('POST')) {
         const embed = (JSON.parse(String(init!.body)) as { embeds: DiscordEmbed[] }).embeds[0]!;
-        sent.push({ channelId: 'test-channel', method, id: trackedId, embed });
+        sent.push({ channelId: '900000000000000001', method, id: trackedId, embed });
         cards.set(trackedId, embed);
         return Response.json({ id: trackedId });
       }
       if (method === 'PATCH' && url.endsWith(`/messages/${hiddenId}`)) {
         const embed = (JSON.parse(String(init!.body)) as { embeds: DiscordEmbed[] }).embeds[0]!;
-        sent.push({ channelId: 'test-channel', method, id: hiddenId, embed });
+        sent.push({ channelId: '900000000000000001', method, id: hiddenId, embed });
         return Response.json({ id: hiddenId });
       }
       return original(input, init);
@@ -1320,7 +1330,7 @@ describe('polling through the Durable Object', () => {
         event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
         // The tracked card was already closed on an earlier poll.
         messages: [], channelIds: [],
-        recoverPosts: { 'test-channel': { from: START - 120_000, to: START - 60_000, closeOnly: true } },
+        recoverPosts: { '900000000000000001': { from: START - 120_000, to: START - 60_000, closeOnly: true } },
       }] } satisfies PollSnapshot);
     });
     const original = network.getMockImplementation()!;
@@ -1365,7 +1375,7 @@ describe('polling through the Durable Object', () => {
     await runInDurableObject(stub(), async (_, ctx) => {
       await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
         event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
-        messages: [], channelIds: ['test-channel'],
+        messages: [], channelIds: ['900000000000000001'],
       }] } satisfies PollSnapshot);
     });
     unconfirmed.add('POST');
@@ -1462,17 +1472,17 @@ describe('polling through the Durable Object', () => {
   it('abandons an online card destination after exhausting its retry budget', async () => {
     await seed({});
     feed = [entry(a)];
-    failures.add('test-channel');
+    failures.add('900000000000000001');
     failureStatus = 400;
     for (let i = 0; i < 11; i++) {
-      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow();
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).rejects.toThrow();
       now += 60_000;
     }
     expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual([]);
     expect(cards.has(a)).toBe(false);
     const attemptsBefore = sent.length;
     failures.clear();
-    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
     // Abandoned: no further attempt is made even once delivery would succeed.
     expect(sent).toHaveLength(attemptsBefore);
     expect(cards.has(a)).toBe(false);
@@ -1481,20 +1491,20 @@ describe('polling through the Durable Object', () => {
   it('never abandons a first online card during a long 5xx outage, but still abandons after repeated 4xx rejections', async () => {
     await seed({});
     feed = [entry(a)];
-    failures.add('test-channel');
+    failures.add('900000000000000001');
     failureStatus = 503;
     for (let i = 0; i < 12; i++) {
-      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow();
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).rejects.toThrow();
       now += 60_000;
     }
     // A prolonged 5xx outage never counts against the online first-card
     // budget: still pending after more polls than the retry budget allows.
-    expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual(['test-channel']);
+    expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual(['900000000000000001']);
     expect(cards.has(a)).toBe(false);
 
     failureStatus = 400;
     for (let i = 0; i < 11; i++) {
-      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow();
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).rejects.toThrow();
       now += 60_000;
     }
     // A genuine (non-429) 4xx rejection counts, and the card is abandoned
@@ -1566,13 +1576,13 @@ describe('polling through the Durable Object', () => {
     it('moves continuation pages only in the channel whose host was deleted', async () => {
       await prepare(400);
       const state = (await snapshot())!.state!;
-      state[a]!.messages!.push({ channelId: 'test-channel-b', messageId: 'host-b' });
-      state[b]!.messages!.push({ channelId: 'test-channel-b', messageId: 'fallback-b' });
+      state[a]!.messages!.push({ channelId: '900000000000000002', messageId: 'host-b' });
+      state[b]!.messages!.push({ channelId: '900000000000000002', messageId: 'fallback-b' });
       await seed(state);
       await configuredPoll();
       const original = (await snapshot())!.rosterMessages!;
-      const pagesA = original.filter((page) => page.channelId === 'test-channel');
-      const pagesB = original.filter((page) => page.channelId === 'test-channel-b');
+      const pagesA = original.filter((page) => page.channelId === '900000000000000001');
+      const pagesB = original.filter((page) => page.channelId === '900000000000000002');
       expect(pagesA.length).toBeGreaterThan(1);
       expect(pagesB).toHaveLength(pagesA.length);
       cards.delete('host-b');
@@ -1582,8 +1592,8 @@ describe('polling through the Durable Object', () => {
       now += 60_000;
       await configuredPoll();
       const current = (await snapshot())!.rosterMessages!;
-      expect(current.filter((page) => page.channelId === 'test-channel')).toEqual(pagesA);
-      const replacement = current.filter((page) => page.channelId === 'test-channel-b');
+      expect(current.filter((page) => page.channelId === '900000000000000001')).toEqual(pagesA);
+      const replacement = current.filter((page) => page.channelId === '900000000000000002');
       expect(replacement).toHaveLength(pagesB.length);
       expect(replacement.every((page) => page.parentMessageId === 'fallback-b')).toBe(true);
       expect(deleted.sort()).toEqual(pagesB.map((page) => page.messageId).sort());
@@ -1906,7 +1916,7 @@ describe('polling through the Durable Object', () => {
     failures.add('POST');
     expect((await poll()).status).toBe(500);
     expect((await stub().getState())?.[a]).toMatchObject({
-      since: new Date(START).toISOString(), pendingChannelIds: ['test-channel'],
+      since: new Date(START).toISOString(), pendingChannelIds: ['900000000000000001'],
     });
     await abortAllDurableObjects();
     expect((await poll()).status).toBe(500);
