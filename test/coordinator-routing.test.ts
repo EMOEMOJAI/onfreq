@@ -3,7 +3,7 @@ import { createExecutionContext, createScheduledController, reset, runInDurableO
 import { afterEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { COORDINATOR_NAME, POLL_SNAPSHOT_KEY } from '../src/config';
-import { AUTH_HEADERS } from './helpers';
+import { AUTH_HEADERS, HISTORY_AUTH_HEADERS } from './helpers';
 
 afterEach(async () => { vi.restoreAllMocks(); await reset(); });
 
@@ -24,7 +24,7 @@ it.each([
   const configured = { ...env, COORDINATOR_NAME: ' preserved-state ',
     POLL_COORDINATOR: { getByName } as unknown as Env['POLL_COORDINATOR'] };
   const response = await worker.fetch(new Request(`https://example.test${path}`, {
-    method, headers: { ...AUTH_HEADERS, 'x-onfreq-confirm': 'delete-old-copies' },
+    method, headers: { ...(path.startsWith('/gca-history') ? HISTORY_AUTH_HEADERS : AUTH_HEADERS), 'x-onfreq-confirm': 'delete-old-copies' },
   }), configured, createExecutionContext());
   expect(response.status).toBe(200);
   expect(getByName).toHaveBeenCalledExactlyOnceWith('preserved-state');

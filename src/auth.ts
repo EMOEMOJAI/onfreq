@@ -10,15 +10,34 @@
 export const MIN_SECRET_LENGTH = 32;
 
 /**
+ * Reasons already logged in this isolate. Invalid configuration is checked on
+ * every request, so unauthenticated traffic must not be able to multiply the
+ * `config_invalid` log lines; one line per reason per isolate is enough.
+ */
+const loggedConfigInvalid = new Set<string>();
+
+/** Log a `config_invalid` reason at most once per isolate. Never pass values. */
+export function logConfigInvalidOnce(reason: string): void {
+  if (loggedConfigInvalid.has(reason)) return;
+  loggedConfigInvalid.add(reason);
+  console.error(JSON.stringify({ event: 'config_invalid', reason }));
+}
+
+/** Test-only: forget which `config_invalid` reasons were logged. */
+export function resetConfigInvalidLogForTests(): void {
+  loggedConfigInvalid.clear();
+}
+
+/**
  * Return the configured secret, or '' when it is unset or too short.
  *
  * A too-short secret disables its endpoints (fail closed) and logs the
- * variable name only, never the value.
+ * variable name only, never the value, once per isolate.
  */
 export function configuredSecret(value: string | undefined, name: string): string {
   const secret = value?.trim() ?? '';
   if (secret && secret.length < MIN_SECRET_LENGTH) {
-    console.error(JSON.stringify({ event: 'config_invalid', reason: `${name}_too_short` }));
+    logConfigInvalidOnce(`${name}_too_short`);
     return '';
   }
   return secret;

@@ -1,11 +1,13 @@
 import { env } from 'cloudflare:workers';
 import { SELF, reset, runInDurableObject } from 'cloudflare:test';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { COORDINATOR_NAME } from '../src/config';
-import { AUTH_HEADERS } from './helpers';
+import { resetConfigInvalidLogForTests } from '../src/auth';
+import { AUTH_HEADERS, HISTORY_AUTH_HEADERS } from './helpers';
 
-const headers = AUTH_HEADERS;
+const headers = HISTORY_AUTH_HEADERS;
+beforeEach(resetConfigInvalidLogForTests);
 afterEach(async () => { vi.restoreAllMocks(); await reset(); });
 
 async function seed(count = 1) {
@@ -37,7 +39,7 @@ it('is disabled without the secret', async () => {
   expect(response.status).toBe(503);
 });
 
-// Synthetic, distinct secrets: the fixture shares one value, so separation is proven here.
+// Synthetic, distinct secrets with explicit overrides so separation does not depend on the fixture.
 const POLL_ONLY = 'synthetic-poll-only-secret-0123456789';
 const HISTORY_ONLY = 'synthetic-history-only-secret-01234567';
 const historyRoutes = [['/gca-history', 'GET'], ['/gca-history/cleanup', 'GET'], ['/gca-history/cleanup', 'POST']] as const;
@@ -67,13 +69,44 @@ it.each(historyRoutes)('S2-1/S14-1: %s %s fails closed with a generic body when 
 it.each(historyRoutes)('S1-1: a short HISTORY_SECRET disables %s %s even when the token matches', async (path, method) => {
   await seed();
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-  const weak = 'a';
+  // S1-4: distinctive 31-character value, so the non-leak assertions below are meaningful.
+  const weak = 'short-history-secret-thirty-one';
+  expect(weak).toHaveLength(31);
   const response = await call(path, method, weak, { HISTORY_SECRET: weak });
   expect(response.status).toBe(503);
   const body = await response.text();
   expect(body).not.toMatch(/SECRET|600001/);
-  expect(log.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual({ event: 'config_invalid', reason: 'HISTORY_SECRET_too_short' });
-  expect(JSON.stringify(log.mock.calls)).not.toContain(`"${weak}"`);
+  expect(body).not.toContain(weak);
+  expect(log.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([{ event: 'config_invalid', reason: 'HISTORY_SECRET_too_short' }]);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(weak);
+});
+
+it.each(historyRoutes)('S2-3: %s %s fails closed when HISTORY_SECRET reuses POLL_SECRET', async (path, method) => {
+  await seed();
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  // Surrounding whitespace is trimmed before comparison, like the secrets themselves.
+  for (const reused of [POLL_ONLY, ` ${POLL_ONLY}\n`]) {
+    const response = await call(path, method, POLL_ONLY, { POLL_SECRET: POLL_ONLY, HISTORY_SECRET: reused });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const body = await response.text();
+    expect(body).not.toMatch(/SECRET|600001/);
+    expect(body).not.toContain(POLL_ONLY);
+  }
+  expect(log.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+    { event: 'config_invalid', reason: 'HISTORY_SECRET_reuses_POLL_SECRET' },
+  ]);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(POLL_ONLY);
+  // The poll token keeps working on its own routes.
+  const health = await call('/health', 'GET', POLL_ONLY, { POLL_SECRET: POLL_ONLY, HISTORY_SECRET: POLL_ONLY });
+  expect(health.status).not.toBe(401);
+  expect(await health.json()).toMatchObject({ maxAgeSeconds: 300 });
+});
+
+it('S2-3: the shared test fixture uses distinct poll and history secrets', async () => {
+  expect(headers.authorization).not.toBe(AUTH_HEADERS.authorization);
+  expect((await SELF.fetch('https://example.com/gca-history', { headers: AUTH_HEADERS })).status).toBe(401);
+  expect((await SELF.fetch('https://example.com/gca-history', { headers })).status).toBe(200);
 });
 
 it('S1-1: a HISTORY_SECRET of exactly 32 characters is accepted', async () => {

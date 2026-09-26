@@ -1,4 +1,4 @@
-import { configuredSecret, extractBearer, secretsMatch } from './auth';
+import { configuredSecret, extractBearer, logConfigInvalidOnce, secretsMatch } from './auth';
 import { getCoordinator } from './config';
 
 export { PollCoordinator } from './coordinator';
@@ -10,7 +10,8 @@ export { PollCoordinator } from './coordinator';
  * Returns a disabled/unauthorized Response to short-circuit the caller, or
  * `null` when the request is authenticated and handling should continue.
  * Unset or too-short secrets disable the endpoint; bodies never name the
- * variable.
+ * variable. A HISTORY_SECRET equal to POLL_SECRET also disables the history
+ * routes, since the poll token is held by monitors and the Mac helper.
  */
 async function requireSecret(
   request: Request,
@@ -20,7 +21,12 @@ async function requireSecret(
   unauthorizedBody: Record<string, unknown>,
   headers: Record<string, string> = {},
 ): Promise<Response | null> {
-  const expected = configuredSecret(env[name], name);
+  let expected = configuredSecret(env[name], name);
+  if (expected && name === 'HISTORY_SECRET' && expected === env.POLL_SECRET?.trim()) {
+    // Reusing the poll token would silently undo the privilege split: fail closed.
+    logConfigInvalidOnce('HISTORY_SECRET_reuses_POLL_SECRET');
+    expected = '';
+  }
   if (!expected) return Response.json(disabledBody, { status: 503, headers });
   const provided = extractBearer(request.headers.get('authorization'));
   if (!(await secretsMatch(provided, expected))) {
