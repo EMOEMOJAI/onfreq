@@ -7,7 +7,7 @@ import { DiscordApiError } from './discord';
  * (neither is a `DiscordApiError`), or a rate-limit deferral is transient and
  * retried indefinitely instead. Shared by the online first-card budget,
  * the offline closeout budget, and the roster page budgets so they agree on
- * what "permanent" means (X-P3-2).
+ * what "permanent" means.
  */
 export function countsAgainstBudget(err: unknown): boolean {
   return err instanceof DiscordApiError && err.status >= 400 && err.status <= 499;
@@ -110,7 +110,7 @@ export interface RosterMessage extends PostedMessage {
   /**
    * Permanently gave up on this page (its budget above was exhausted): frozen
    * in place, never edited or re-posted, while its parent target still lives
-   * (X-P3-3). An absent entry reads as "never posted" and would otherwise be
+   *. An absent entry reads as "never posted" and would otherwise be
    * re-created as a duplicate the next poll.
    */
   abandoned?: true;
@@ -119,7 +119,7 @@ export interface RosterMessage extends PostedMessage {
 /**
  * Tracks failed continuation-post attempts for a page that has never once
  * posted successfully, so it has no `RosterMessage` of its own to hold a
- * counter on (P3-R3b). Keyed by destination + page since there is no message
+ * counter on. Keyed by destination + page since there is no message
  * id yet; dropped once the page is no longer targeted.
  */
 export interface RosterPostAttempt {

@@ -28,7 +28,7 @@ export async function syncRosterMessages(
     console.error(JSON.stringify({ event: 'roster_continuation_failed', operation, channelId, parentMessageId, error: String(error) }));
   };
   // A page that has never once posted successfully has no RosterMessage of
-  // its own to hold a retry counter on (P3-R3b); track those separately,
+  // its own to hold a retry counter on; track those separately,
   // keyed by destination + page.
   const postAttemptsByKey = new Map(
     previousPostAttempts.map((entry) => [attemptKey(entry.channelId, entry.parentMessageId, entry.page), entry]),
@@ -50,7 +50,7 @@ export async function syncRosterMessages(
     } catch (err) {
       // A permanently forbidden channel (403) must not be retried every poll
       // forever: cap it the same way every other roster/offline budget is,
-      // via the shared 4xx-only predicate (X-P3-3).
+      // via the shared 4xx-only predicate.
       const counts = countsAgainstBudget(err);
       const used = (ref.deleteAttempts ?? 0) + (counts ? 1 : 0);
       logFailure('delete', ref.channelId, ref.parentMessageId, err);
@@ -71,7 +71,7 @@ export async function syncRosterMessages(
       let index = messages.findIndex((ref) => ref.channelId === target.channelId &&
         ref.parentMessageId === target.parentMessageId && ref.page === page);
       const ref = messages[index];
-      // X-P3-3: a page already given up on (whether it once posted or never
+      // A page already given up on (whether it once posted or never
       // did) stays frozen — no further edit or post attempt — while this
       // parent target lives. An absent entry reads as "never posted", which
       // would otherwise re-create it as a duplicate this same poll.
@@ -99,7 +99,7 @@ export async function syncRosterMessages(
           messages[index] = { ...rest, abandoned: true };
           return;
         }
-        // This page has never once posted successfully (P3-R3b): give it the
+        // This page has never once posted successfully: give it the
         // same budget via the sibling attempt map instead.
         const used = (postAttemptsByKey.get(key)?.attempts ?? 0) + (counts ? 1 : 0);
         if (!counts || used <= DELETE_RETRY_POLLS) {
@@ -113,7 +113,7 @@ export async function syncRosterMessages(
           channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: used, abandoned: true,
         });
       };
-      // X-P3-4: a re-post after the previous copy of this page was found gone
+      // A re-post after the previous copy of this page was found gone
       // must use a different nonce key than the original post, or Discord
       // could hand back the deleted message instead of creating a new one.
       let goneMessageId: string | undefined;

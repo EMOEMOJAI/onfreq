@@ -9,7 +9,7 @@ export const HEALTH_MAX_AGE_MS = 5 * 60_000;
 export interface PollSnapshot {
   state: StateMap | null;
   rosterMessages?: RosterMessage[];
-  /** P3-R3b: budget for continuation pages that have never once posted successfully. */
+  /** Budget for continuation pages that have never once posted successfully. */
   rosterPostAttempts?: RosterPostAttempt[];
   pendingOffline?: PendingOffline[];
   lastPollStartedAt?: number;

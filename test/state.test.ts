@@ -86,7 +86,7 @@ describe('diffState', () => {
     expect(result.next['QESS_APP']).not.toHaveProperty('roster');
   });
 
-  // V2-A4: a legacy `roster` field must not survive on a session that only
+  // A legacy `roster` field must not survive on a session that only
   // ever stays missing (never resumes), or on the offline event a closed-out
   // session is copied into — not just on one that resumes.
   it('strips a legacy roster field from a session that stays missing during the grace window', () => {

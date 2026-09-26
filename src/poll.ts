@@ -5,6 +5,7 @@ import {
   buildOnlineEmbeds,
   buildSessionEndedEmbed,
   DiscordApiError,
+  DiscordUnconfirmedPostError,
   editMessage,
   messageNonce,
   parseChannelIds,
@@ -79,7 +80,7 @@ async function announceOnline(
   )[0];
   const posted: PostedMessage[] = [];
   const failed = new Map<string, unknown>();
-  // V2-A6: a 2xx POST with no usable id (Discord accepted it, but the
+  // A 2xx POST with no usable id (Discord accepted it, but the
   // response can't be tied to a message) is never retried.
   const unconfirmed = new Set<string>();
   for (const channelId of channelIds) {
@@ -94,14 +95,14 @@ async function announceOnline(
       // A POST whose 5xx hid a success is re-sent next poll; a nonce keyed to
       // this tracked session (`since`, not the IVAO-issued `sessionId`, which
       // changes across a grace-window resume) lets Discord return the
-      // original message instead of a duplicate card (X-P3-1).
+      // original message instead of a duplicate card.
       const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits,
         messageNonce(`online:${atc.userId}:${atc.since}`, channelId));
       posted.push({ channelId, messageId, postedAt: nowIso, onlineEmbed: JSON.stringify(embed) });
       if (content) mentionedChannels.add(channelId);
     } catch (err) {
-      // V2-A6: `postMessage` throws this specific, bodyless `Error` (rather
-      // than a `DiscordApiError`) only for a 2xx response with no `id` field.
+      // `postMessage` throws DiscordUnconfirmedPostError only for a 2xx
+      // response without a usable message id.
       // Retrying would either accept a literal duplicate or spin forever with
       // nothing to dedupe against on our side, so this destination is
       // abandoned outright instead of joining the bounded 4xx retry budget
@@ -109,7 +110,7 @@ async function announceOnline(
       // the existing "no card ever sent" invariant still suppresses a
       // spurious fallback OFFLINE if the session ends before a retry would
       // have succeeded — matching a destination that never had a card.
-      if (err instanceof Error && err.message === 'Discord API returned a message without an id') {
+      if (err instanceof DiscordUnconfirmedPostError) {
         console.error(JSON.stringify({ event: 'online_post_unconfirmed', callsign: atc.callsign, channelId }));
         unconfirmed.add(channelId);
         continue;
@@ -194,7 +195,7 @@ async function announceOffline(
   let delivered = 0;
   let failed = false;
   const attempts = job.attemptsByChannel ??= {};
-  // X-P3-2: only a definite Discord-side rejection (4xx, excluding the 429
+  // Only a definite Discord-side rejection (4xx, excluding the 429
   // rate-limit deferral) counts towards this budget, via the same predicate
   // the online first-card and roster page budgets use; a 5xx outage or a
   // timeout/network error is transient and retried indefinitely instead —
@@ -212,7 +213,7 @@ async function announceOffline(
     console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign, channelId }));
     return false;
   };
-  // X-P3-1: keyed on the tracked session's stable `since`, not the
+  // Keyed on the tracked session's stable `since`, not the
   // IVAO-issued `sessionId`, so a genuinely new session at the same callsign
   // never collides with this one's nonce.
   const offlineKey = `offline:${job.event.userId}:${job.event.since}`;
@@ -261,7 +262,7 @@ async function announceOffline(
 export interface PollOutcome {
   state: StateMap;
   rosterMessages: RosterMessage[];
-  /** P3-R3b: budget for continuation pages that have never once posted successfully. */
+  /** Budget for continuation pages that have never once posted successfully. */
   rosterPostAttempts: RosterPostAttempt[];
   pendingOffline: PendingOffline[];
   error?: string;
@@ -310,7 +311,7 @@ export async function runPoll(
   const excludedClosures: OfflineEvent[] = [];
   for (const callsign of Object.keys(prev)) {
     if (isExcludedCallsign(callsign, excluded)) {
-      // V2-A4: strip a legacy `roster` field here too — this session comes
+      // Strip a legacy `roster` field here too — this session comes
       // straight from storage, not through `diffState`'s own stripping.
       const tracked = stripLegacyRoster(prev[callsign]!);
       if (!tracked.pending && tracked.messages?.length) {
@@ -391,7 +392,7 @@ export async function runPoll(
       const { attemptsByChannel: _oldAttempts, ...rest } = job;
       return {
         ...rest,
-        // V2-A4: this event was loaded from storage across a poll boundary,
+        // This event was loaded from storage across a poll boundary,
         // never through `diffState`'s own stripping — strip it here too.
         event: stripLegacyRoster(rest.event),
         messages,
@@ -455,7 +456,7 @@ export async function runPoll(
     const kept: string[] = [];
     for (const id of targets) {
       if (posted.some((ref) => ref.channelId === id)) continue;
-      // V2-A6: a 2xx-but-unconfirmed destination is dropped outright, same as
+      // A 2xx-but-unconfirmed destination is dropped outright, same as
       // one that just exhausted its budget below — never retried, and never
       // given a counter.
       if (unconfirmed.has(id)) continue;

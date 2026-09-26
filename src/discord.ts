@@ -311,6 +311,14 @@ export function parseChannelIds(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/** A 2xx message POST whose response carried no usable message id. */
+export class DiscordUnconfirmedPostError extends Error {
+  constructor() {
+    super('Discord API accepted a message without returning its id');
+    this.name = 'DiscordUnconfirmedPostError';
+  }
+}
+
 export class DiscordApiError extends Error {
   /** Discord's own numeric error code, when the body carried one. */
   readonly code?: number;
@@ -450,8 +458,8 @@ export async function postMessage(
     ...(replyTo ? { message_reference: { message_id: replyTo, fail_if_not_exists: false } } : {}),
     ...(nonce ? { nonce, enforce_nonce: true } : {}),
   }, limits);
-  const message = (await res.json()) as { id?: string };
-  if (!message.id) throw new Error('Discord API returned a message without an id');
+  const message = await res.json().catch(() => null) as { id?: unknown } | null;
+  if (typeof message?.id !== 'string' || !message.id) throw new DiscordUnconfirmedPostError();
   return message.id;
 }
 

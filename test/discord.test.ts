@@ -6,6 +6,7 @@ import {
   buildOnlineEmbeds,
   buildSessionEndedEmbed,
   DiscordApiError,
+  DiscordUnconfirmedPostError,
   deleteMessage,
   escapeMarkdown,
   formatRoster,
@@ -403,6 +404,17 @@ describe('REST calls', () => {
     vi.stubGlobal('fetch', fetchMock);
     return fetchMock;
   }
+
+  it.each([
+    new Response(null, { status: 200 }),
+    new Response('not json', { status: 200 }),
+    Response.json({}),
+  ])('reports a 2xx POST without a usable id as unconfirmed', async (response) => {
+    const fetchMock = stubFetch(response);
+    await expect(postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, new DiscordRateLimits()))
+      .rejects.toBeInstanceOf(DiscordUnconfirmedPostError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 
   it('returns the id of the posted message', async () => {
     const fetchMock = stubFetch(Response.json({ id: '999' }));

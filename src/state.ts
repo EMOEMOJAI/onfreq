@@ -8,7 +8,7 @@ import type { DiffResult, OfflineEvent, OnlineAtc, StateMap, TrackedAtc } from '
  * just-closed session) and by callers that load a session or offline event
  * from storage outside `diffState` (excluded-callsign closeouts, imported
  * `PendingOffline` jobs) — a legacy field must not survive on any of those
- * paths either (V2-A4).
+ * paths either.
  */
 export function stripLegacyRoster<T extends TrackedAtc>(session: T): T {
   const { roster: _legacyRoster, ...kept } = session as T & { roster?: boolean };
@@ -41,7 +41,7 @@ export function diffState(
   nowIso: string,
   gracePolls: number,
 ): DiffResult {
-  // V2-A4: strip a legacy `roster` field from every loaded session up front,
+  // Strip a legacy `roster` field from every loaded session up front,
   // not just ones that resume below — it must not survive on a session that
   // stays missing, or on the offline event `close()` copies out.
   prev = Object.fromEntries(Object.entries(prev).map(([callsign, session]) => [callsign, stripLegacyRoster(session)]));

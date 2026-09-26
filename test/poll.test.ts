@@ -341,7 +341,7 @@ describe('polling through the Durable Object', () => {
   });
 
   it('strips a legacy roster field from an imported pending-offline event', async () => {
-    // V2-A4: this event comes straight from a stored `PendingOffline` job,
+    // This event comes straight from a stored `PendingOffline` job,
     // never through `diffState`'s own stripping.
     await runInDurableObject(stub(), async (_, ctx) => {
       const event = {
@@ -1255,7 +1255,7 @@ describe('polling through the Durable Object', () => {
       expect(replacement.messageId).not.toBe(page.messageId);
       expect(cards.get(replacement.messageId)?.fields?.some((field) => field.value.includes('122.800'))).toBe(true);
       expect(visibleCallsigns()).toHaveLength(121);
-      // X-P3-4: the re-post after the previous copy was found gone must use a
+      // The re-post after the previous copy was found gone must use a
       // different nonce, so Discord never hands back the deleted message.
       const replacementPost = sent.find((message) => message.method === 'POST' && message.id === replacement.messageId)!;
       expect(replacementPost.nonce).toBeTruthy();
@@ -1273,7 +1273,7 @@ describe('polling through the Durable Object', () => {
       for (let i = 0; i < 11; i++) {
         expect((await nextPoll()).status).toBe(500);
       }
-      // X-P3-3: frozen in place, not removed — an absent entry would read as
+      // Frozen in place, not removed — an absent entry would read as
       // "never posted" and get re-created as a duplicate next poll.
       const frozen = (await snapshot())!.rosterMessages!;
       expect(frozen).toHaveLength(1);
@@ -1296,7 +1296,7 @@ describe('polling through the Durable Object', () => {
       // Drop tracking for the last page, as if its very first POST had
       // already failed and left nothing behind: there is no way to tell that
       // apart from "never posted" without a dedicated attempt counter
-      // (P3-R3b), so its next attempt goes through the exact same path.
+      //, so its next attempt goes through the exact same path.
       await runInDurableObject(stub(), async (_instance, ctx) => {
         const existing = (await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY))!;
         await ctx.storage.put(POLL_SNAPSHOT_KEY, {
