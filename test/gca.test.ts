@@ -201,6 +201,9 @@ describe('GCA policy configuration', () => {
     '{"AA":{"name":"One","prefixes":["XA"]},"AB":{"name":"Two","prefixes":["X"]}}',
     '{"AA":{"name":"One","prefixes":["X"]},"AB":{"name":"Two","prefixes":["XA"]}}',
     '{"AA":{"name":"One","prefixes":["XA"],"homeCountries":["AA","AB"]},"AB":{"name":"Two","prefixes":["XB"]}}',
+    ' {"AA":{"name":"Example","prefixes":["XA"]}}', // NBSP is not JSON whitespace
+    '{"AA":{"name":"Example","prefixes":["XA"]}} ',
+    '﻿{"AA":{"name":"Example","prefixes":["XA"]}}', // a BOM is not JSON whitespace either
   ])('disables reminders for missing, malformed or ambiguous coverage: %s', (coverage) => {
     expect(parseGcaPolicy({ ...settings(), GCA_REGIONS: coverage })).toBeNull();
   });
@@ -674,6 +677,30 @@ describe('durable GCA delivery', () => {
     expect(network).toHaveBeenCalledTimes(calls); // still backed off, no repeated member-list lookup
   });
 
+  it('does not back off the member-list lookup merely because it ran out of the poll deadline', async () => {
+    await check([]);
+    // A full page (1000 entries) keeps fetchMembers paginating; the mock
+    // pushes the clock past the poll deadline before the next page's check.
+    const fullPage: GuildMember[] = Array.from({ length: 1000 }, (_, i) =>
+      member(700000 + i, String(400000000000000000n + BigInt(i))));
+    const original = network.getMockImplementation()!;
+    let memberListCalls = 0;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).includes('/members?')) {
+        memberListCalls++;
+        now += 30_000; // exceeds the 25s poll deadline before the loop rechecks it
+        return Response.json(fullPage);
+      }
+      return original(input, init);
+    });
+    await expect(check([atc()])).rejects.toThrow('Discord member lookup exceeded poll budget');
+    expect(memberListCalls).toBe(1);
+    // Not backed off: the very next poll retries the lookup immediately
+    // instead of waiting out a multi-minute Discord-failure cooldown.
+    await expect(check([atc({ sessionId: 2 })])).rejects.toThrow('Discord member lookup exceeded poll budget');
+    expect(memberListCalls).toBe(2);
+  });
+
   it('re-baselines sessions discovered after a long gap instead of warning them immediately', async () => {
     await check([]);
     await check([atc()]);
@@ -875,6 +902,21 @@ describe('staff copies', () => {
     expect(copies).toHaveLength(1);
   });
 
+  it('does not let a route-scoped member-list 429 block a same-poll pending staff copy', async () => {
+    await check([], config());
+    copyStatus = 429; // route-scoped: the mocked body carries no `global` flag
+    await check([atc()], config());
+    expect(sent).toHaveLength(1);
+    expect(copies).toHaveLength(1); // attempted, but rejected — stays pending
+    now += 200_000; // past the copy's own retry_at
+    copyStatus = 200;
+    listStatus = 429; // also route-scoped: no `global` flag on the member-list response
+    await expect(check([atc({ sessionId: 2 })], config())).rejects.toThrow('Discord API 429');
+    // A route-scoped member-list failure must not widen the shared backoff
+    // that gates unrelated staff copies: the pending copy still flushes.
+    expect(copies).toHaveLength(2);
+  });
+
   it('records a 2xx response with a missing id as sent, not failed, and still queues a copy', async () => {
     await check([], config());
     const original = network.getMockImplementation()!;
@@ -890,5 +932,22 @@ describe('staff copies', () => {
     expect((await statuses())[0]).toMatchObject({ status: 'sent', attempts: 1 });
     await check([], config());
     expect(copies).toHaveLength(1);
+  });
+
+  it('records a 2xx response with an empty, non-JSON body as sent, not failed, and still queues a copy', async () => {
+    await check([], config());
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).endsWith(`/channels/${CHANNEL}/messages`)) {
+        sent.push(JSON.parse(String(init?.body)));
+        return new Response('', { status: 200 }); // 2xx, empty body: response.json() would throw
+      }
+      return original(input, init);
+    });
+    await check([atc()], config());
+    expect(sent).toHaveLength(1);
+    expect((await statuses())[0]).toMatchObject({ status: 'sent', attempts: 1 });
+    await check([], config());
+    expect(copies).toHaveLength(1); // staff copy still queued, not skipped as a failure
   });
 });
