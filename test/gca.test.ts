@@ -180,6 +180,18 @@ describe('GCA coverage', () => {
     expect(embed.description).not.toContain('TEST');
     expect(embed.color).toBe(0xfee75c);
   });
+
+  it('truncates a station name to 100 code points without splitting a surrogate pair', () => {
+    // An emoji is one code point but two UTF-16 code units: a naive
+    // String.prototype.slice(0, 100) would cut it in half, leaving an
+    // unpaired surrogate that corrupts the rest of the embed.
+    const station = `${'A'.repeat(99)}😀 trailing`;
+    const controller = atc({ station });
+    const embed = buildGcaEmbed(controller, gcaMismatch(controller, policy())!);
+    const expected = Array.from(station).slice(0, 100).join('');
+    expect(embed.description).toContain(expected);
+    expect(embed.description).not.toContain('�');
+  });
 });
 
 describe('GCA policy configuration', () => {
@@ -272,6 +284,13 @@ describe('GCA policy configuration', () => {
     'refuses to run on malformed overrides: %s', (overrides) => {
       expect(parseGcaPolicy({ ...settings(), GCA_HOME_OVERRIDES: String(overrides) })).toBeNull();
     });
+
+  it('treats NBSP-only overrides as non-empty, unparseable JSON, disabling reminders', () => {
+    // A lone NBSP is not JSON whitespace: it must not be silently trimmed away
+    // into the "absent" empty-record case, the way String.prototype.trim()
+    // would trim it.
+    expect(parseGcaPolicy({ ...settings(), GCA_HOME_OVERRIDES: ' ' })).toBeNull();
+  });
 
   it.each([
     'http://example.test/gca', 'javascript:alert(1)', 'https://example.test/a(b)', 'nonsense',
@@ -637,6 +656,22 @@ describe('durable GCA delivery', () => {
     returnedRecipient = '111111111111111111';
     await check([atc()]);
     expect(sent).toHaveLength(0);
+  });
+
+  it('retries a 2xx DM-channel open with an unparseable body instead of dropping the reminder', async () => {
+    await check([]);
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/users/@me/channels')) return new Response('not json', { status: 200 });
+      return original(input, init);
+    });
+    await check([atc()]);
+    expect(sent).toHaveLength(0);
+    expect((await statuses())[0]).toMatchObject({ status: 'pending', attempts: 1 });
+    network.mockImplementation(original);
+    now += 60_000;
+    await check([atc()]);
+    expect(sent).toHaveLength(1);
   });
 
   it('caps DM attempts per poll and retries deferred connections', async () => {

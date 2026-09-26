@@ -207,7 +207,7 @@ function parseApprovals(raw: string | undefined, regionNames: Record<Region, str
 
 /** `{"123456":"AA"}`; absent is fine, malformed is not. */
 function parseHomeOverrides(raw: string | undefined): Record<number, string> | null {
-  if (!raw?.trim()) return {};
+  if (raw === undefined || !trimJsonWhitespace(raw)) return {};
   const object = parseJsonObject(raw);
   if (!object) return null;
   const result: Record<number, string> = {};
@@ -286,7 +286,7 @@ export function buildGcaEmbed(
 ): DiscordEmbed {
   const regionName = mismatch.regionName;
   // IVAO text is external input: escape Discord formatting and cap its size.
-  const station = escapeMarkdown((atc.station ?? '').slice(0, 100));
+  const station = escapeMarkdown(Array.from(atc.station ?? '').slice(0, 100).join(''));
   const label = `${atc.callsign}${station ? ` — ${station}` : ''}, ${regionName}`;
   const lastTwo = occurrence % 100;
   const suffix = lastTwo >= 11 && lastTwo <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[occurrence % 10] ?? 'th');
@@ -341,6 +341,9 @@ class GcaDiscordError extends Error {
   }
 }
 
+/** Running out of the poll deadline, not a Discord failure: never counts toward backoff. */
+class GcaDeadlineError extends Error {}
+
 /** No inline retries: a slow Discord service must not hold the poll indefinitely. */
 async function discordJson(limits: DiscordRateLimits, token: string, path: string, payload?: unknown): Promise<unknown> {
   const response = await limits.fetch(path, {
@@ -362,7 +365,13 @@ async function openDm(limits: DiscordRateLimits, token: string, recipient: strin
   const channel = await discordJson(limits, token, '/users/@me/channels', { recipient_id: recipient }) as {
     id?: string; type?: number; recipients?: { id: string }[];
   } | null;
-  if (!channel || typeof channel.id !== 'string' || !/^\d{17,20}$/.test(channel.id) ||
+  if (!channel) {
+    // A 2xx with no parseable body is not proof of the wrong recipient: it may
+    // just be a transient malformed reply, so it must stay retryable rather
+    // than permanently drop the reminder.
+    throw new Error('Unparseable DM channel response');
+  }
+  if (typeof channel.id !== 'string' || !/^\d{17,20}$/.test(channel.id) ||
       channel.type !== 1 || !Array.isArray(channel.recipients) ||
       channel.recipients.length !== 1 || channel.recipients[0]?.id !== recipient) {
     // Deterministic for this VID/channel: retrying wastes a round trip every poll.
@@ -385,7 +394,7 @@ async function fetchMembers(limits: DiscordRateLimits, token: string, guildId: s
   let after = '0';
   // Never use a partial list: a duplicate VID could occur on a later page.
   for (let page = 0; page < 10; page++) {
-    if (Date.now() >= deadline) throw new Error('Discord member lookup exceeded poll budget');
+    if (Date.now() >= deadline) throw new GcaDeadlineError('Discord member lookup exceeded poll budget');
     const body = await discordJson(limits, token, `/guilds/${guildId}/members?limit=1000&after=${after}`);
     if (!Array.isArray(body) || !body.every(isMember)) throw new Error('Invalid Discord member list');
     members.push(...body);
@@ -539,7 +548,7 @@ async function sendMemberReminders(
   const members = await fetchMembers(limits, env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
     // Running out of the poll deadline is not a Discord failure: the same
     // lookup should simply be retried next poll, with no backoff recorded.
-    if (err instanceof Error && err.message === 'Discord member lookup exceeded poll budget') throw err;
+    if (err instanceof GcaDeadlineError) throw err;
     // Any other member-list failure — HTTP or a malformed/incomplete page —
     // must back off, but only the member-list lookup itself; otherwise the
     // same lookup is retried on every poll indefinitely instead of roughly
@@ -605,9 +614,9 @@ async function sendMemberReminders(
       sql.exec('UPDATE gca_reminders SET status = ?, attempts = ?, retry_at = ? WHERE session_key = ?',
         outcome.status, outcome.attempts, outcome.retryAt, key);
       console.warn(JSON.stringify({ event: 'gca_dm_failed', status: outcome.statusCode, retry: outcome.status === 'pending' }));
-      // Only a genuinely global (or member-list) limit should widen the
-      // shared backoff: one recipient's DM-channel cooldown must not block
-      // unrelated members' reminders.
+      // Only a genuinely global limit should widen the shared backoff: one
+      // recipient's DM-channel cooldown must not block unrelated members'
+      // reminders.
       if (outcome.rateLimited) {
         if ((err as DiscordRateLimitError).global) {
           await storage.put(BACKOFF_KEY, outcome.retryAt);
