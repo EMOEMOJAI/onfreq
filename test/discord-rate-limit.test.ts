@@ -155,3 +155,11 @@ it('reports requestMade: false and reason: outage on a fail-fast request after a
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
     .rejects.toMatchObject({ requestMade: false, reason: 'outage', global: false });
 });
+
+it('noteDiscordResponded resets the POST failure streak, so a lone failure afterward does not immediately declare an outage', () => {
+  const limits = new DiscordRateLimits();
+  expect(limits.notePostFailure()).toBe(false);
+  limits.noteDiscordResponded();
+  expect(limits.notePostFailure()).toBe(false);
+  expect(limits.notePostFailure()).toBe(true);
+});

@@ -390,10 +390,12 @@ async function discordRequest(
       throw err;
     });
     if (!res) continue;
-    if (res.ok) {
-      if (method === 'POST') limits.notePostSuccess();
-      return res;
-    }
+    // Any non-5xx response — regardless of method — proves Discord is
+    // reachable, so it resets the POST failure streak even when this call
+    // was itself a PATCH/DELETE, or a POST that came back with a non-5xx
+    // failure such as 404.
+    if (res.status < 500) limits.noteDiscordResponded();
+    if (res.ok) return res;
 
     const body = await res.text();
     const retryable = method !== 'POST' && res.status >= 500;

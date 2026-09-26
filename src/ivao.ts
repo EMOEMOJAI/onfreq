@@ -218,24 +218,45 @@ let memoryToken: CachedToken | null = null;
 let tokenFailedUntil = 0;
 
 /**
- * Epoch ms of the most recently completed mint (a real IVAO_TOKEN_URL round
- * trip, not a cache hit). Lets callers such as member-country lookups tell
- * whether the token currently in hand was freshly minted during their own
- * run, so a downstream 401 against a brand-new token isn't treated as "this
- * cached token is stale" and reset again.
+ * Minimum time between production cache invalidations triggered by
+ * `invalidateCachedToken`, regardless of which caller most recently minted
+ * the token. Without this, a downstream endpoint (e.g. member-country
+ * profile lookups) that keeps rejecting even freshly minted tokens would
+ * force a fresh mint on every single call in a poll.
  */
-let lastMintedAt = 0;
+const TOKEN_INVALIDATE_BACKOFF_MS = 30 * 60 * 1000;
 
-/** True when a token was minted (not just cache-served) at or after `timestamp`. */
-export function tokenMintedAfter(timestamp: number): boolean {
-  return lastMintedAt >= timestamp;
+/** Epoch ms of the most recent production invalidation via `invalidateCachedToken`. */
+let lastInvalidatedAt = 0;
+
+/**
+ * Drop the in-memory cached token so the next call mints a fresh one.
+ * Safe for production use by any caller whose request was rejected with a
+ * token that should no longer be trusted (e.g. member-country profile
+ * lookups). Rate-limited to at most one invalidation per ~30 minutes,
+ * independent of which caller most recently minted the token, so a
+ * downstream endpoint that rejects even freshly minted tokens cannot force a
+ * fresh mint on every call. Returns whether it actually invalidated the
+ * cache (`false` when skipped by the rate limit).
+ */
+export function invalidateCachedToken(): boolean {
+  const now = Date.now();
+  if (now - lastInvalidatedAt < TOKEN_INVALIDATE_BACKOFF_MS) return false;
+  lastInvalidatedAt = now;
+  memoryToken = null;
+  return true;
 }
 
-/** Exposed for tests; production code never needs to reach for this. */
+/**
+ * Test-only: clear every module-level token cache state (in-memory token,
+ * mint failure backoff, invalidation rate limit) between test cases.
+ * Production code must never call this — use `invalidateCachedToken()`
+ * instead.
+ */
 export function resetTokenCache(): void {
   memoryToken = null;
   tokenFailedUntil = 0;
-  lastMintedAt = 0;
+  lastInvalidatedAt = 0;
 }
 
 function isCachedToken(value: unknown): value is CachedToken {
@@ -305,7 +326,6 @@ export async function getAccessToken(
     };
     memoryToken = entry;
     tokenFailedUntil = 0;
-    lastMintedAt = now;
     try {
       await auth.kv.put(TOKEN_KEY, JSON.stringify(entry), {
         expirationTtl: Math.floor(ttlSeconds),

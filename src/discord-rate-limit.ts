@@ -78,8 +78,13 @@ export class DiscordRateLimits {
     return this.postFailureStreak >= 2;
   }
 
-  /** A successful POST breaks any failure streak. */
-  notePostSuccess(): void {
+  /**
+   * Any non-5xx HTTP response — a 2xx, 3xx, or 4xx, on any method — proves
+   * Discord itself is reachable and breaks the POST failure streak. A 4xx
+   * (e.g. an unknown-message 404) is not an outage signal, so it must reset
+   * the streak just as readily as a 2xx does.
+   */
+  noteDiscordResponded(): void {
     this.postFailureStreak = 0;
   }
 

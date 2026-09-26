@@ -5,6 +5,7 @@ import {
   isDivisionCallsign,
   isExcludedCallsign,
   hasFrequency,
+  invalidateCachedToken,
   ivaoAuthFromEnv,
   normalizeAtc,
   parseExcludedCallsigns,
@@ -186,13 +187,19 @@ describe('getAccessToken', () => {
   });
 
   it('clamps an out-of-range expires_in to the safe window instead of trusting it verbatim', async () => {
+    // Mock Date.now so the expected expiresAt is deterministic: comparing
+    // against a second, independent Date.now() call after the await was
+    // flaky under real timers whenever the clock ticked between them.
+    const now = Date.now();
+    const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(tokenResponse('tok', 10)));
     const kv = fakeKv();
     await getAccessToken(auth(kv));
     const cached = JSON.parse(kv.store.get('ivao-token-v1') ?? '{}');
     // Minimum TTL sits above the safety margin, so the cached expiry always
     // lands in the future relative to when the token was minted.
-    expect(cached.expiresAt).toBe(Date.now() + 180_000 - 120_000);
+    expect(cached.expiresAt).toBe(now + 180_000 - 120_000);
+    dateNowSpy.mockRestore();
   });
 
   it.each([
@@ -247,6 +254,24 @@ describe('getAccessToken', () => {
 
     await expect(getAccessToken(auth(kv))).resolves.toBe('tok-1');
     await expect(getAccessToken(auth(kv))).resolves.toBe('tok-1');
+  });
+});
+
+describe('invalidateCachedToken', () => {
+  beforeEach(() => resetTokenCache());
+  afterEach(() => vi.restoreAllMocks());
+
+  it('rate-limits invalidation to at most once per ~30 minutes, regardless of caller', () => {
+    let clock = 1_800_000_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+
+    expect(invalidateCachedToken()).toBe(true);
+    clock += 60_000; // 1 minute later, well within the backoff
+    expect(invalidateCachedToken()).toBe(false);
+    clock += 28 * 60_000; // still short of 30 minutes total
+    expect(invalidateCachedToken()).toBe(false);
+    clock += 60_000; // now past the 30-minute window
+    expect(invalidateCachedToken()).toBe(true);
   });
 });
 

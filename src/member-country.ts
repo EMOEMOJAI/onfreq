@@ -1,6 +1,6 @@
 import { TOKEN_KEY } from './config';
 import { fetchBuffered } from './http';
-import { getAccessToken, hasFrequency, resetTokenCache, tokenMintedAfter } from './ivao';
+import { getAccessToken, hasFrequency, invalidateCachedToken } from './ivao';
 import type { IvaoAuth, MemberCountry, OnlineAtc, StateMap } from './types';
 
 const COUNTRY_TTL_MS = 24 * 60 * 60 * 1000;
@@ -11,8 +11,8 @@ const RETRY_MS = 15 * 60 * 1000;
 const SKIP_BACKOFF_MS = 60 * 1000;
 // Bound optional enrichment work even when many controllers connect at once.
 const MAX_LOOKUPS_PER_POLL = 5;
-/** Never let this batch's profile lookups run past this wall-clock budget,
- * even if every individual request is within its own timeout. */
+/** No new lookup starts after this wall-clock budget elapses, even if every
+ * individual request is within its own timeout. */
 const LOOKUP_DEADLINE_MS = 10_000;
 /** A profile request failing with one of these means the whole batch is
  * currently blocked (bad/rejected auth, or already rate-limited) — further
@@ -77,13 +77,12 @@ export async function enrichMemberCountries(
         throw err;
       }
       if (!res.ok) {
-        if (res.status === 401 && !tokenMintedAfter(now)) {
-          // The cached token was rejected; reset it like the tracker feed
-          // does, so the next lookup or poll mints a fresh one instead of
-          // failing the same way for up to ~28 more minutes. Skip this when
-          // the token in hand was minted during this very run — a brand new
-          // token being rejected is not "this cached token is stale".
-          resetTokenCache();
+        if (res.status === 401 && invalidateCachedToken()) {
+          // The cached token was rejected; drop it so the next lookup or
+          // poll mints a fresh one instead of failing the same way for up to
+          // ~28 more minutes. Rate-limited internally: if the profile
+          // endpoint rejects even freshly minted tokens, this must not churn
+          // through a fresh mint on every single lookup.
           try {
             await auth.kv.delete(TOKEN_KEY);
           } catch (err) {
