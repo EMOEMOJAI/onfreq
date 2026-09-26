@@ -413,7 +413,8 @@ describe('polling through the Durable Object', () => {
     expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
-  it('drops a retried offline job once its channels are removed from configuration', async () => {
+  it('keeps a retried offline job\'s removed-channel destinations untouched until the job expires', async () => {
+    const error = vi.spyOn(console, 'error');
     await runInDurableObject(stub(), async (_, ctx) => {
       await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
         event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
@@ -421,9 +422,18 @@ describe('polling through the Durable Object', () => {
         channelIds: ['removed-channel-2'], attempts: 3,
       }] } satisfies PollSnapshot);
     });
+    const removedCalls = () => network.mock.calls.filter(([input]) => String(input).includes('removed-channel'));
     await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
-    expect(network.mock.calls.some(([input]) => String(input).includes('removed-channel'))).toBe(false);
+    expect(removedCalls()).toHaveLength(0);
+    expect((await snapshot())?.pendingOffline).toMatchObject([{
+      messages: [{ channelId: 'removed-channel', messageId: a }], channelIds: ['removed-channel-2'],
+      attemptsByChannel: { 'removed-channel': 3, 'removed-channel-2': 3 },
+    }]);
+    now += 24 * 3_600_000 + 60_000;
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
+    expect(removedCalls()).toHaveLength(0);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'expired', count: 1 }));
   });
 
   it('never edits cards, roster pages or closeouts in a channel removed from configuration', async () => {
@@ -451,6 +461,14 @@ describe('polling through the Durable Object', () => {
       .resolves.toEqual({ skipped: false });
     expect(cards.get(a)?.title).toContain('OFFLINE');
     expect(network.mock.calls.some(([input]) => String(input).includes('/900000000000000002/'))).toBe(false);
+    // The card in the removed channel is kept, untouched, with its closeout.
+    expect((await snapshot())?.pendingOffline).toMatchObject([{
+      messages: [{ channelId: '900000000000000002', messageId: 'a-in-b' }], channelIds: [],
+    }]);
+    // Configuring the channel again closes that card.
+    now += 60_000;
+    await expect(configuredPoll()).resolves.toEqual({ skipped: false });
+    expect(sent.find((item) => item.method === 'PATCH' && item.id === 'a-in-b')?.embed.title).toContain('OFFLINE');
     expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
@@ -521,7 +539,7 @@ describe('polling through the Durable Object', () => {
   });
 
   describe('pending closeout bounds', () => {
-    it('keeps only what a closeout needs and gives up on it after a day', async () => {
+    it('keeps only what a closeout needs and gives up after a day, following one final attempt', async () => {
       const error = vi.spyOn(console, 'error');
       const tracked = session(a);
       tracked.messages = [{
@@ -533,10 +551,26 @@ describe('polling through the Durable Object', () => {
       expect((await snapshot())?.pendingOffline?.[0]?.messages).toEqual([{ channelId: '900000000000000001', messageId: a }]);
       const attemptsBefore = sent.length;
       now += 24 * 3_600_000 + 60_000;
-      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
-      expect(sent).toHaveLength(attemptsBefore);
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).rejects.toThrow();
+      // One more attempt, then dropped only because it is still undelivered.
+      expect(sent).toHaveLength(attemptsBefore + 1);
+      expect(sent.at(-1)).toMatchObject({ method: 'PATCH', id: a });
       expect((await snapshot())?.pendingOffline).toBeUndefined();
       expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'expired', count: 1 }));
+    });
+
+    it('still closes a card whose closeout expired during a polling outage of over a day', async () => {
+      const error = vi.spyOn(console, 'error');
+      await seed({ [a]: session(a) });
+      failures.add(a);
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001', OFFLINE_GRACE_POLLS: '1' })).rejects.toThrow();
+      expect((await snapshot())?.pendingOffline).toHaveLength(1);
+      failures.clear();
+      now += 25 * 3_600_000;
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
+      expect(cards.get(a)?.title).toContain('OFFLINE');
+      expect((await snapshot())?.pendingOffline).toBeUndefined();
+      expect(error).not.toHaveBeenCalledWith(expect.stringContaining('offline_jobs_dropped'));
     });
 
     it('keeps at most 200 pending closeouts, dropping the oldest', async () => {
@@ -576,10 +610,19 @@ describe('polling through the Durable Object', () => {
     now += 60_000;
     await gcaConfig({ GCA_DM_ENABLED: 'true' });
     expect(sent.at(-1)?.embed.title).toMatch(/^🔴 /);
+    // Invalid guild or member-role IDs disable reminders, so the marker too.
+    for (const invalid of [{ GCA_DISCORD_GUILD_ID: 'guild' }, { GCA_MEMBER_ROLE_ID: '' }]) {
+      now += 60_000;
+      await gcaConfig({ GCA_DM_ENABLED: 'true', ...invalid });
+      expect(sent.at(-1)?.embed.title).toMatch(/^🟢 /);
+      now += 60_000;
+      await gcaConfig({ GCA_DM_ENABLED: 'true' });
+      expect(sent.at(-1)?.embed.title).toMatch(/^🔴 /);
+    }
     now += 60_000;
     await gcaConfig({ GCA_DM_ENABLED: 'true', GCA_POLICY_URL: 'http://example.test/gca' });
     expect(sent.at(-1)?.embed.title).toMatch(/^🟢 /);
-    expect(sent.map((item) => item.method)).toEqual(['POST', 'PATCH', 'PATCH']);
+    expect(sent.map((item) => item.method)).toEqual(['POST', 'PATCH', 'PATCH', 'PATCH', 'PATCH', 'PATCH', 'PATCH']);
   });
 
   it('keeps a roster in each channel during partial delivery and moves it after retry', async () => {
@@ -1157,6 +1200,93 @@ describe('polling through the Durable Object', () => {
     expect(posts).toHaveLength(2);
     expect(posts[0]!.nonce).toBeTruthy();
     expect(posts[1]!.nonce).toBe(posts[0]!.nonce);
+  });
+
+  it('reuses the first-card nonce after a poll whose state was never saved, so no duplicate card', async () => {
+    await seed({});
+    feed = [entry(a)];
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      const put = ctx.storage.put.bind(ctx.storage) as (key: string, value: unknown) => Promise<void>;
+      const spy = vi.spyOn(ctx.storage, 'put').mockImplementation((async (key: string, value: unknown) => {
+        if (key === POLL_SNAPSHOT_KEY) throw new Error('synthetic snapshot write failure');
+        return put(key, value);
+      }) as never);
+      try {
+        await expect(new PollCoordinator(ctx, env).poll()).rejects.toThrow('synthetic snapshot write failure');
+      } finally {
+        spy.mockRestore();
+      }
+    });
+    expect((await snapshot())?.state).toEqual({});
+    await evictDurableObject(stub());
+    await nextPoll();
+    const posts = sent.filter((message) => message.method === 'POST');
+    expect(posts).toHaveLength(2);
+    expect(posts[1]!.nonce).toBe(posts[0]!.nonce);
+    // Discord returned the first card, so only one ONLINE card exists and it is tracked.
+    expect([...cards.values()].filter((embed) => embed.title?.includes('is now ONLINE'))).toHaveLength(1);
+    expect((await snapshot())?.state?.[a]?.messages?.map((ref) => ref.messageId)).toEqual([posts[0]!.id]);
+  });
+
+  it('keeps the first-card nonce across a grace-window reconnect with a new IVAO session id', async () => {
+    await seed({});
+    feed = [entry(a)];
+    failureStatus = 503;
+    failures.add('POST');
+    await poll();
+    failures.clear();
+    feed = [];
+    await nextPoll();
+    feed = [{ ...entry(a), id: 2 }];
+    await nextPoll();
+    const posts = sent.filter((message) => message.method === 'POST');
+    expect(posts).toHaveLength(2);
+    expect(posts[1]!.nonce).toBe(posts[0]!.nonce);
+    // A session that really ended and reconnects later gets a new card and nonce.
+    feed = [];
+    await nextPoll();
+    await nextPoll();
+    feed = [{ ...entry(a), id: 3 }];
+    await nextPoll();
+    const next = sent.filter((message) => message.method === 'POST').at(-1)!;
+    expect(next.nonce).not.toBe(posts[0]!.nonce);
+    expect(cards.get(next.id!)?.title).toContain('is now ONLINE');
+  });
+
+  it('refreshes a first card when Discord returns an earlier message for its nonce', async () => {
+    await seed({});
+    feed = [entry(a)];
+    const earlier = ((BigInt(START - 60_000 - 1_420_070_400_000) << 22n) + 1n).toString();
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const response = await original(input, init);
+      return init?.method === 'POST' && String(input).includes('/channels/900000000000000001/messages')
+        ? Response.json({ id: earlier }) : response;
+    });
+    await poll();
+    expect(sent.map((message) => message.method)).toEqual(['POST', 'PATCH']);
+    expect(sent[1]!.id).toBe(earlier);
+  });
+
+  it('tracks an implausible burst of new sessions silently instead of carding them', async () => {
+    const error = vi.spyOn(console, 'error');
+    await seed({});
+    const burst = Array.from({ length: 51 }, (_, i) =>
+      ({ ...entry(`QC${String(i).padStart(2, '0')}_TWR`), id: 1000 + i, userId: 1000 + i }));
+    feed = burst;
+    await poll();
+    expect(sent).toHaveLength(0);
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'feed_anomaly', count: 51 }));
+    expect(Object.keys((await snapshot())?.state ?? {})).toHaveLength(51);
+    // A later, ordinary connection is announced as usual; the burst stays silent.
+    feed = [...burst, entry(b)];
+    await nextPoll();
+    expect(sent.filter((message) => message.method === 'POST').map((message) => message.embed.title))
+      .toEqual([expect.stringContaining(b)]);
+    feed = [entry(b)];
+    await nextPoll();
+    await nextPoll();
+    expect([...cards.values()].some((embed) => embed.title?.includes('OFFLINE'))).toBe(false);
   });
 
   it('gives each callsign of one controller its own card nonce', async () => {

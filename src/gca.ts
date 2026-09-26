@@ -28,6 +28,12 @@ const OCCURRENCE_MIGRATION = 'gca-occurrences-migrated-v1';
 // discovered on that first poll back are baselined rather than immediately
 // warned, the same as on first-ever startup.
 const REBASELINE_GAP_MS = 15 * 60_000;
+/**
+ * No Discord-reported delay, however large, may pause reminders or staff
+ * copies longer than this (the same one-hour cap as public rate limits); a
+ * stored backoff further out can only be corrupt or pre-cap, and is ignored.
+ */
+const GCA_MAX_BACKOFF_MS = 60 * 60_000;
 
 export interface GcaApproval {
   region: Region;
@@ -324,13 +330,16 @@ export interface GuildMember {
 }
 
 /**
- * Include all accounts in ambiguity detection before checking the member role.
- * Nicknames are self-editable: with a verified role configured, only a member
- * staff also gave that role is trusted with the VID in their nickname.
+ * Without a verified role, every account counts in ambiguity detection before
+ * the member role is checked. Nicknames are self-editable: with a verified
+ * role configured, only members staff gave both roles are trusted with the
+ * VID in their nickname, and only they count, so an unverified account
+ * copying a verified member's VID cannot block that member's reminders.
  */
 export function indexMemberVids(members: GuildMember[], roleId: string, verifiedRoleId?: string): Map<number, string> {
   const matches = new Map<number, GuildMember[]>();
   for (const member of members) {
+    if (verifiedRoleId && !(member.roles.includes(roleId) && member.roles.includes(verifiedRoleId))) continue;
     const numbers = member.nick?.match(/\d+/g) ?? [];
     for (const vid of new Set(numbers.filter(isVid).map(Number))) {
       const list = matches.get(vid) ?? [];
@@ -370,7 +379,8 @@ async function discordJson(limits: DiscordRateLimits, token: string, path: strin
   });
   if (!response.ok) {
     const seconds = Number(response.headers.get('retry-after'));
-    throw new GcaDiscordError(response.status, Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 60_000);
+    throw new GcaDiscordError(response.status,
+      Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, GCA_MAX_BACKOFF_MS) : 60_000);
   }
   // A 2xx response with an empty or non-JSON body (e.g. a 204-style empty
   // reply) is still a success: treat it as "no body" rather than a failure,
@@ -423,6 +433,12 @@ async function fetchMembers(limits: DiscordRateLimits, token: string, guildId: s
   throw new Error('Discord member list exceeded page limit');
 }
 
+/** A stored backoff deadline, or 0 when absent, invalid, or beyond the cap. */
+async function readBackoff(storage: DurableObjectStorage, key: string, now: number): Promise<number> {
+  const until = await storage.get<number>(key);
+  return typeof until === 'number' && Number.isFinite(until) && until <= now + GCA_MAX_BACKOFF_MS ? until : 0;
+}
+
 type ReminderRow = { status: string; attempts: number; retry_at: number };
 
 interface DeliveryOutcome {
@@ -445,7 +461,7 @@ function classifyDeliveryFailure(err: unknown, attempts: number, messageAttempte
   // Timeouts/5xx after the message POST may have delivered: do not retry those.
   const used = attempts + (rateLimited && !err.requestMade ? 0 : 1);
   const retry = !permanent && (!messageAttempted || rateLimited) && used < MAX_ATTEMPTS;
-  const delay = err instanceof GcaDiscordError || rateLimited ? err.retryMs : 60_000;
+  const delay = Math.min(err instanceof GcaDiscordError || rateLimited ? err.retryMs : 60_000, GCA_MAX_BACKOFF_MS);
   return {
     status: retry ? 'pending' : 'failed',
     attempts: used,
@@ -504,7 +520,9 @@ function updateSessionsAndCollectCandidates(
   for (const atc of current) {
     if (!Number.isSafeInteger(atc.userId) || atc.userId <= 0 ||
         !Number.isSafeInteger(atc.sessionId) || atc.sessionId <= 0 ||
-        !/^[A-Z0-9_]{3,40}$/.test(atc.callsign.toUpperCase())) continue;
+        // Accepts every feed callsign shape (hyphens, two characters) that can
+        // show the public marker. The callsign is never part of the key.
+        !/^[A-Z0-9_-]{2,40}$/.test(atc.callsign.toUpperCase())) continue;
     const key = `${atc.userId}:${atc.sessionId}`;
     const row = sql.exec<ReminderRow>(`INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)
       ON CONFLICT(session_key) DO UPDATE SET last_seen = excluded.last_seen
@@ -520,6 +538,18 @@ function updateSessionsAndCollectCandidates(
   return candidates;
 }
 
+function validGuildAndRole(env: Env): boolean {
+  return /^\d{17,20}$/.test(env.GCA_DISCORD_GUILD_ID ?? '') && /^\d{17,20}$/.test(env.GCA_MEMBER_ROLE_ID ?? '');
+}
+
+/**
+ * Reminders are switched on and their guild/member-role IDs are usable. With
+ * a valid policy (checked separately), member reminders can actually run.
+ */
+export function gcaRemindersEnabled(env: Env): boolean {
+  return env.GCA_DM_ENABLED === 'true' && validGuildAndRole(env);
+}
+
 /** Called inside the coordinator's serialized poll, before channel notifications. */
 async function sendMemberReminders(
   env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number, limits: DiscordRateLimits,
@@ -529,7 +559,7 @@ async function sendMemberReminders(
   // must never throw, or one bad setting would stop the online cards too.
   const guildId = env.GCA_DISCORD_GUILD_ID ?? '';
   const memberRoleId = env.GCA_MEMBER_ROLE_ID ?? '';
-  if (!/^\d{17,20}$/.test(guildId) || !/^\d{17,20}$/.test(memberRoleId)) {
+  if (!validGuildAndRole(env)) {
     console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'guild_or_role' }));
     return;
   }
@@ -559,8 +589,8 @@ async function sendMemberReminders(
   }
   if (stale) console.log(JSON.stringify({ event: 'gca_rebaselined', sessions: current.length }));
   if (!candidates.size) return;
-  const globalBackoff = await storage.get<number>(BACKOFF_KEY) ?? 0;
-  const memberListBackoff = await storage.get<number>(MEMBER_LIST_BACKOFF_KEY) ?? 0;
+  const globalBackoff = await readBackoff(storage, BACKOFF_KEY, now);
+  const memberListBackoff = await readBackoff(storage, MEMBER_LIST_BACKOFF_KEY, now);
   if (Math.max(globalBackoff, memberListBackoff) > now) return;
   const members = await fetchMembers(limits, env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
     // Running out of the poll deadline is not a Discord failure: the same
@@ -571,7 +601,8 @@ async function sendMemberReminders(
     // same lookup is retried on every poll indefinitely instead of roughly
     // every few minutes. Only a genuinely global rate limit also widens the
     // shared BACKOFF_KEY that gates unrelated staff copies.
-    const retryMs = err instanceof GcaDiscordError || err instanceof DiscordRateLimitError ? err.retryMs : 5 * 60_000;
+    const retryMs = Math.min(
+      err instanceof GcaDiscordError || err instanceof DiscordRateLimitError ? err.retryMs : 5 * 60_000, GCA_MAX_BACKOFF_MS);
     await storage.put(MEMBER_LIST_BACKOFF_KEY, Date.now() + retryMs);
     if (err instanceof DiscordRateLimitError && err.global) {
       await storage.put(BACKOFF_KEY, Date.now() + retryMs);
@@ -632,8 +663,19 @@ async function sendMemberReminders(
       console.log(JSON.stringify({ event: message?.id ? 'gca_dm_sent' : 'gca_dm_sent_unconfirmed' }));
     } catch (err) {
       const outcome = classifyDeliveryFailure(err, fresh.attempts, messageAttempted, Date.now());
-      sql.exec('UPDATE gca_reminders SET status = ?, attempts = ?, retry_at = ? WHERE session_key = ?',
-        outcome.status, outcome.attempts, outcome.retryAt, key);
+      // Discord definitely did not deliver this DM (the message POST was
+      // rejected with a non-429 4xx, or a final rate-limit deferral made no
+      // request): the reserved occurrence is released, so the member's next
+      // received warning is not numbered past one they never got. Only this
+      // connection's row is removed; the reminder row keeps deduplicating it.
+      const undelivered = messageAttempted && (
+        (err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && err.status !== 429) ||
+        (err instanceof DiscordRateLimitError && !err.requestMade && outcome.status === 'failed'));
+      storage.transactionSync(() => {
+        sql.exec('UPDATE gca_reminders SET status = ?, attempts = ?, retry_at = ? WHERE session_key = ?',
+          outcome.status, outcome.attempts, outcome.retryAt, key);
+        if (undelivered) sql.exec('DELETE FROM gca_occurrences WHERE session_key = ?', key);
+      });
       console.warn(JSON.stringify({ event: 'gca_dm_failed', status: outcome.statusCode, retry: outcome.status === 'pending' }));
       // Only a genuinely global limit should widen the shared backoff: one
       // recipient's DM-channel cooldown must not block unrelated members'
@@ -652,7 +694,7 @@ type CopyRow = ReminderRow & { session_key: string; recipient_id: string; payloa
 
 async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits, deadline: number): Promise<void> {
   if (!/^\d{17,20}$/.test(env.GCA_COPY_USER_ID ?? '') ||
-      (await storage.get<number>(BACKOFF_KEY) ?? 0) > Date.now()) return;
+      await readBackoff(storage, BACKOFF_KEY, Date.now()) > Date.now()) return;
   const sql = storage.sql;
   ensureGcaSchema(sql);
   const pending = sql.exec<CopyRow>(`SELECT * FROM gca_copies

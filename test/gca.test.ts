@@ -377,10 +377,24 @@ describe('Discord VID mapping', () => {
     const VERIFIED = '100000000000000003';
     expect(indexMemberVids([member()], QDLE, VERIFIED).size).toBe(0);
     expect(indexMemberVids([member(600001, USER, [QDLE, VERIFIED])], QDLE, VERIFIED).get(600001)).toBe(USER);
-    // An impostor copying a verified member's VID still makes it ambiguous.
+    // An unverified account copying a verified member's VID cannot block them.
     expect(indexMemberVids([
       member(600001, USER, [QDLE, VERIFIED]), member(600001, '111111111111111111', [QDLE]),
+      member(600001, '111111111111111112', [VERIFIED]), member(600001, '111111111111111113', []),
+    ], QDLE, VERIFIED).get(600001)).toBe(USER);
+    // Two verified members claiming one VID are still ambiguous.
+    expect(indexMemberVids([
+      member(600001, USER, [QDLE, VERIFIED]), member(600001, '111111111111111111', [QDLE, VERIFIED]),
     ], QDLE, VERIFIED).size).toBe(0);
+  });
+
+  it('DMs a verified member whose VID an unverified account copied', async () => {
+    const VERIFIED = '100000000000000003';
+    const config = { ...settings(), GCA_VERIFIED_ROLE_ID: VERIFIED };
+    members = [member(600001, USER, [QDLE, VERIFIED]), member(600001, '111111111111111111', [QDLE])];
+    await check([], config);
+    await check([atc()], config);
+    expect(sent).toHaveLength(1);
   });
 
   it('does not DM a member without the verified role, and disables reminders for an invalid one', async () => {
@@ -447,6 +461,75 @@ describe('durable GCA delivery', () => {
   it('checks lowercase callsigns the same way as the public marker', async () => {
     await check([]);
     await check([atc({ callsign: 'xdaa_arr_app' })]);
+    expect(sent).toHaveLength(1);
+  });
+
+  it.each([['XD-AA_APP', 1], ['XD', 1], ['XD.AA_APP', 0]])(
+    'accepts the same callsign shapes as the feed and public marker: %s', async (callsign, expected) => {
+      await check([]);
+      await check([atc({ callsign: String(callsign) })]);
+      expect(sent).toHaveLength(Number(expected));
+    },
+  );
+
+  it('releases the occurrence of a DM Discord definitely rejected, keeping the others', async () => {
+    const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
+      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+    await check([]);
+    await check([atc({ sessionId: 1 })]);
+    messageStatus = 403;
+    await check([atc({ sessionId: 2 })]);
+    expect(titles()[1]).toContain('[2nd occurrence]');
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'failed' });
+    expect(await occurrences()).toEqual([{ session_key: '600001:1', occurrence: 1 }]);
+    messageStatus = 200;
+    await check([atc({ sessionId: 3 })]);
+    // The member never received the rejected warning, so it is not counted.
+    expect(titles()[2]).toContain('[2nd occurrence]');
+    // A timeout may have delivered: that occurrence stays counted.
+    timeoutMessage = true;
+    await check([atc({ sessionId: 4 })]);
+    expect(await occurrences()).toEqual([
+      { session_key: '600001:1', occurrence: 1 }, { session_key: '600001:3', occurrence: 2 },
+      { session_key: '600001:4', occurrence: 3 },
+    ]);
+    // The rejected connection is still deduplicated, never re-sent.
+    timeoutMessage = false;
+    now += 3_600_000;
+    await check([atc({ sessionId: 2 })]);
+    expect(sent).toHaveLength(4);
+  });
+
+  it('caps a huge Retry-After on the member-list lookup at one hour', async () => {
+    await check([]);
+    const original = network.getMockImplementation()!;
+    let lookups = 0;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).includes('/members?')) {
+        lookups++;
+        if (lookups === 1) return new Response('{}', { status: 503, headers: { 'retry-after': '1000000000' } });
+      }
+      return original(input, init);
+    });
+    await expect(check([atc()])).rejects.toThrow('Discord status 503');
+    const stored = await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.get<number>('gca-member-list-backoff-v1'));
+    expect(stored).toBe(now + 3_600_000);
+    now += 3_599_000;
+    await check([atc()]);
+    expect(lookups).toBe(1);
+    now += 1_000;
+    await check([atc()]);
+    expect(lookups).toBe(2);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('ignores a stored reminder backoff beyond the one-hour cap', async () => {
+    await check([]);
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      await ctx.storage.put('gca-discord-backoff-v1', now + 1e12);
+      await ctx.storage.put('gca-member-list-backoff-v1', now + 3_600_001);
+    });
+    await check([atc()]);
     expect(sent).toHaveLength(1);
   });
 
