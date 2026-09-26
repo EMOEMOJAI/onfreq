@@ -70,7 +70,9 @@ export function diffState(
 
   for (const atc of current) {
     seen.add(atc.callsign);
-    const existing = prev[atc.callsign];
+    // Own properties only: a callsign such as `valueOf` must never resolve
+    // to an inherited Object.prototype member.
+    const existing = Object.hasOwn(prev, atc.callsign) ? prev[atc.callsign] : undefined;
     const tuned = hasFrequency(atc);
 
     if (existing && existing.userId === atc.userId && existing.missed < gracePolls) {

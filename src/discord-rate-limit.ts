@@ -2,6 +2,14 @@ import { fetchBuffered } from './http';
 
 const KEY = 'discord-rate-limits-v1'; // gitleaks:allow — storage key name, not a credential
 const GLOBAL = '*';
+/** No Discord cooldown, however reported, may block delivery longer than this. */
+export const MAX_RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000;
+/**
+ * Discord responses (member-list pages of up to 1000 members, 100-message
+ * channel scans that include other users' messages) can approach the default
+ * 1 MiB buffer cap, so they get a larger bounded one.
+ */
+const DISCORD_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 /**
  * `rate_limit`: a real Discord 429. `soft`: an in-memory cooldown inferred
@@ -55,8 +63,11 @@ export class DiscordRateLimits {
 
   static async load(storage?: DurableObjectStorage): Promise<DiscordRateLimits> {
     const stored = await storage?.get<Record<string, number>>(KEY) ?? {};
+    // A deadline beyond the cap can only come from an older, unclamped write
+    // or corrupt storage; dropping it lets delivery resume.
+    const now = Date.now();
     return new DiscordRateLimits(storage, Object.fromEntries(Object.entries(stored)
-      .filter(([, until]) => Number.isFinite(until) && until > Date.now())));
+      .filter(([, until]) => Number.isFinite(until) && until > now && until <= now + MAX_RATE_LIMIT_COOLDOWN_MS)));
   }
 
   /**
@@ -101,7 +112,8 @@ export class DiscordRateLimits {
       throw new DiscordRateLimitError(blockedUntil, false, blockedUntil === globalDeadline, reason);
     }
 
-    const response = await fetchBuffered(`https://discord.com/api/v10${path}`, init);
+    const response = await fetchBuffered(`https://discord.com/api/v10${path}`, init,
+      { maxBytes: DISCORD_MAX_RESPONSE_BYTES });
     if (response.status !== 429) {
       // A 2xx that reports an exhausted bucket is worth a soft, in-memory-only
       // cooldown: nothing to persist (it will refill on its own), but later
@@ -121,8 +133,9 @@ export class DiscordRateLimits {
       .filter((seconds) => Number.isFinite(seconds) && seconds >= 0);
     // Keep the full server cooldown, including fractional seconds. An unusable
     // response gets a conservative fallback rather than an immediate retry.
+    // An absurd value is clamped so one bad 429 cannot silence delivery.
     const delay = Math.ceil((values.length ? Math.max(...values) : 60) * 1000);
-    const retryAt = Date.now() + (Number.isFinite(delay) ? delay : 60_000);
+    const retryAt = Date.now() + Math.min(MAX_RATE_LIMIT_COOLDOWN_MS, Number.isFinite(delay) ? delay : 60_000);
     const global = body?.global === true || response.headers.get('x-ratelimit-global') === 'true' ||
       response.headers.get('x-ratelimit-scope') === 'global';
     const key = global ? GLOBAL : route;

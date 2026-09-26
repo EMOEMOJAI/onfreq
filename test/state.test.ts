@@ -23,6 +23,22 @@ function tracked(callsign: string, overrides: Partial<TrackedAtc> = {}): Tracked
 }
 
 describe('diffState', () => {
+  it.each(['valueOf', 'constructor', 'toString', 'hasOwnProperty', 'isPrototypeOf'])(
+    'treats callsign %j as a new session, never as an inherited prototype member', (callsign) => {
+      const result = diffState({}, [atc(callsign)], NOW, 2);
+      expect(result.wentOnline.map((a) => a.callsign)).toEqual([callsign]);
+      expect(result.wentOffline).toEqual([]);
+      expect(Object.hasOwn(result.next, callsign)).toBe(true);
+      expect(result.next[callsign]).toMatchObject({ callsign, since: NOW, missed: 0 });
+
+      // A later poll resumes it quietly, and it closes normally once gone.
+      const again = diffState(result.next, [atc(callsign)], NOW, 2);
+      expect(again.wentOnline).toEqual([]);
+      expect(again.next[callsign]?.since).toBe(NOW);
+      const gone = diffState(diffState(again.next, [], NOW, 2).next, [], NOW, 2);
+      expect(gone.wentOffline.map((event) => event.callsign)).toEqual([callsign]);
+    });
+
   it('reports a new callsign as online', () => {
     const result = diffState({}, [atc('QCTT_TWR')], NOW, 2);
     expect(result.wentOnline.map((a) => a.callsign)).toEqual(['QCTT_TWR']);

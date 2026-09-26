@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { DiscordRateLimits } from '../src/discord-rate-limit';
+import { DiscordRateLimits, MAX_RATE_LIMIT_COOLDOWN_MS } from '../src/discord-rate-limit';
 import { postMessage } from '../src/discord';
 
 const START = 1_800_000_000_000;
@@ -162,4 +162,36 @@ it('noteDiscordResponded resets the POST failure streak, so a lone failure after
   limits.noteDiscordResponded();
   expect(limits.notePostFailure()).toBe(false);
   expect(limits.notePostFailure()).toBe(true);
+});
+
+it.each([
+  { body: { retry_after: 1e300 }, headers: new Headers() },
+  { body: { retry_after: 1e300, global: true }, headers: new Headers() },
+  { body: {}, headers: new Headers({ 'retry-after': '99999999' }) },
+])('clamps an absurd 429 cooldown %j to one hour, persisted and after restart', async ({ body, headers }) => {
+  const network = vi.fn()
+    .mockImplementationOnce(async () => Response.json(body, { status: 429, headers }))
+    .mockImplementation(async () => Response.json({ id: 'synthetic' }));
+  vi.stubGlobal('fetch', network);
+  await expect(request('/channels/a/messages')).rejects.toMatchObject({ retryAt: START + MAX_RATE_LIMIT_COOLDOWN_MS });
+  const stored = await runInDurableObject(stub(), (_, ctx) => ctx.storage.get<Record<string, number>>('discord-rate-limits-v1'));
+  expect(Math.max(...Object.values(stored ?? {}))).toBe(START + MAX_RATE_LIMIT_COOLDOWN_MS);
+  await evictDurableObject(stub());
+  now += MAX_RATE_LIMIT_COOLDOWN_MS;
+  await expect(request('/channels/a/messages')).resolves.toBe(200);
+  expect(network).toHaveBeenCalledTimes(2);
+});
+
+it('drops a stored cooldown beyond the one-hour cap on load, so delivery resumes', async () => {
+  await runInDurableObject(stub(), (_, ctx) => ctx.storage.put('discord-rate-limits-v1', {
+    '*': START + 1e15,
+    '/channels/a/messages': START + MAX_RATE_LIMIT_COOLDOWN_MS + 1,
+    '/channels/b/messages': START + MAX_RATE_LIMIT_COOLDOWN_MS,
+  }));
+  const network = vi.fn(async () => Response.json({ id: 'synthetic' }));
+  vi.stubGlobal('fetch', network);
+  await expect(request('/channels/a/messages')).resolves.toBe(200);
+  // A deadline within the cap is still honoured.
+  await expect(request('/channels/b/messages')).rejects.toMatchObject({ requestMade: false, reason: 'rate_limit' });
+  expect(network).toHaveBeenCalledTimes(1);
 });

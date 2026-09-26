@@ -43,11 +43,19 @@ export function formatDuration(totalSeconds: number): string {
  * CR/LF are collapsed to a single space so injected newlines can't fake extra
  * embed lines. An underscore between two letters or digits (as in `EGLL_TWR`)
  * cannot start or end emphasis, so it is left readable.
+ *
+ * Invisible format characters (bidi overrides, zero-width characters) are
+ * removed; a leading `#` or `-` is escaped so it cannot start a header or list
+ * item; `://` is written as `:\/\/`, which Discord displays as `://` without
+ * turning the text into a clickable link.
  */
 export function escapeMarkdown(text: string): string {
-  return text.replace(/[\r\n]+/g, ' ').replace(/[\\*_~`|[\]<>]/g, (char, index: number, whole: string) =>
-    char === '_' && /[A-Za-z0-9]/.test(whole[index - 1] ?? '') && /[A-Za-z0-9]/.test(whole[index + 1] ?? '')
-      ? char : `\\${char}`);
+  return text.replace(/\p{Cf}/gu, '').replace(/[\r\n]+/g, ' ')
+    .replace(/[\\*_~`|[\]<>]/g, (char, index: number, whole: string) =>
+      char === '_' && /[A-Za-z0-9]/.test(whole[index - 1] ?? '') && /[A-Za-z0-9]/.test(whole[index + 1] ?? '')
+        ? char : `\\${char}`)
+    .replace(/:\/\//g, ':\\/\\/')
+    .replace(/^(\s*)([#-])/, '$1\\$2');
 }
 
 function stationLine(atc: TrackedAtc): string | undefined {
@@ -105,6 +113,12 @@ const EMBED_FIELD_LIMIT = 25;
 const FIR_NAME_WIDTH = 12;
 /** A flag emoji occupies roughly two cells in Discord's monospace block. */
 const FIR_COL_WIDTH = 2 + 1 + FIR_NAME_WIDTH;
+/**
+ * Bound the continuation messages one card can need, whatever the feed
+ * reports; each one is a separate Discord request per channel. The first
+ * roster field still reports the full count.
+ */
+export const MAX_ROSTER_CONTINUATION_PAGES = 10;
 
 /** A backtick inside a roster cell would otherwise prematurely close the code block. */
 function stripBackticks(text: string): string {
@@ -222,7 +236,7 @@ export function buildOnlineEmbeds(
     const count = rosterCount(others);
     let page = first;
     let length = embedTextLength(page);
-    splitRoster(roster).forEach((value, i) => {
+    for (const [i, value] of splitRoster(roster).entries()) {
       const field = {
         name: i === 0 ? `Also online now (${count})` : 'Also online now (continued)',
         value,
@@ -230,6 +244,7 @@ export function buildOnlineEmbeds(
       };
       if (length + field.name.length + value.length > EMBED_TEXT_LIMIT ||
           page.fields!.length >= EMBED_FIELD_LIMIT) {
+        if (pages.length > MAX_ROSTER_CONTINUATION_PAGES) break;
         page = {
           title: `${gcaMismatch ? '🔴' : '🟢'} Also online now — ${escapeMarkdown(atc.callsign)} (continued)`,
           color: gcaMismatch ? COLOR_OFFLINE : COLOR_ONLINE,
@@ -242,7 +257,7 @@ export function buildOnlineEmbeds(
       }
       page.fields!.push(field);
       length += field.name.length + value.length;
-    });
+    }
   }
 
   return pages;
@@ -306,12 +321,36 @@ export function buildOfflineEmbed(event: OfflineEvent, labels: FirLabel[] = []):
 
 // --- REST --------------------------------------------------------------------
 
-/** Parse the comma-separated DISCORD_CHANNEL_IDS var. */
+/** A Discord snowflake id, safe to place in an API path. */
+const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
+
+/**
+ * Parse the comma-separated DISCORD_CHANNEL_IDS var. Entries that are not
+ * snowflakes are skipped and counted in a log line that omits their values.
+ */
 export function parseChannelIds(raw: string | undefined): string[] {
-  return (raw ?? '')
+  const ids = (raw ?? '')
     .split(',')
     .map((id) => id.trim())
     .filter(Boolean);
+  const valid = ids.filter((id) => SNOWFLAKE_PATTERN.test(id));
+  if (valid.length < ids.length) {
+    console.error(JSON.stringify({
+      event: 'config_invalid', reason: 'discord_channel_ids', count: ids.length - valid.length,
+    }));
+  }
+  return valid;
+}
+
+/**
+ * Only an exact `<@&id>` role mention may ping, and only that role; any other
+ * content pings nobody.
+ */
+function allowedMentions(content: string | undefined): { parse: []; roles?: string[]; replied_user: false } {
+  const role = /^<@&(\d+)>$/.exec(content ?? '')?.[1];
+  return role && SNOWFLAKE_PATTERN.test(role)
+    ? { parse: [], roles: [role], replied_user: false }
+    : { parse: [], replied_user: false };
 }
 
 /** A 2xx message POST whose response carried no usable message id. */
@@ -457,12 +496,12 @@ export async function postMessage(
   const res = await discordRequest(botToken, 'POST', `/channels/${channelId}/messages`, {
     content,
     embeds: [embed],
-    allowed_mentions: { parse: ['roles'], replied_user: false },
+    allowed_mentions: allowedMentions(content),
     ...(replyTo ? { message_reference: { message_id: replyTo, fail_if_not_exists: false } } : {}),
     ...(nonce ? { nonce, enforce_nonce: true } : {}),
   }, limits);
   const message = await res.json().catch(() => null) as { id?: unknown } | null;
-  if (typeof message?.id !== 'string' || !message.id) throw new DiscordUnconfirmedPostError();
+  if (typeof message?.id !== 'string' || !SNOWFLAKE_PATTERN.test(message.id)) throw new DiscordUnconfirmedPostError();
   return message.id;
 }
 
@@ -528,7 +567,7 @@ export async function findBotMessages(
     if (!Array.isArray(list)) throw new Error('Discord returned an invalid message list');
     let newest = after;
     for (const item of list as Partial<FetchedMessage>[]) {
-      if (typeof item?.id !== 'string' || !/^\d+$/.test(item.id)) continue;
+      if (typeof item?.id !== 'string' || !SNOWFLAKE_PATTERN.test(item.id)) continue;
       if (BigInt(item.id) > BigInt(newest)) newest = item.id;
       const at = snowflakeTime(item.id);
       if (at < window.from - 60_000 || at > window.to + 60_000) continue;
