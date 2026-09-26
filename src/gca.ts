@@ -44,6 +44,8 @@ export interface GcaPolicy {
   approvals: Record<number, GcaApproval[]>;
   homeOverrides: Record<number, string>;
   policyUrl?: string;
+  /** Staff-assigned role a member must also hold before their nickname VID is trusted. */
+  verifiedRoleId?: string;
 }
 
 /**
@@ -249,10 +251,19 @@ export function parseGcaPolicy(env: Env): GcaPolicy | null {
   const approvals = parseApprovals(env.GCA_APPROVALS, regions.regionNames);
   const homeOverrides = parseHomeOverrides(env.GCA_HOME_OVERRIDES);
   if (!approvals || !homeOverrides) return null;
-  if (env.GCA_POLICY_URL?.trim() && !parsePolicyUrl(env.GCA_POLICY_URL)) {
+  // A link or verified role that is set but unusable disables reminders: the
+  // operator configured it, so sending without it would not be what they asked.
+  const policyUrl = parsePolicyUrl(env.GCA_POLICY_URL);
+  if (env.GCA_POLICY_URL?.trim() && !policyUrl) {
     console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'policy_url' }));
+    return null;
   }
-  return { ...regions, approvals, homeOverrides, policyUrl: parsePolicyUrl(env.GCA_POLICY_URL) };
+  const verifiedRoleId = env.GCA_VERIFIED_ROLE_ID?.trim();
+  if (verifiedRoleId && !/^\d{17,20}$/.test(verifiedRoleId)) {
+    console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'verified_role' }));
+    return null;
+  }
+  return { ...regions, approvals, homeOverrides, policyUrl, ...(verifiedRoleId ? { verifiedRoleId } : {}) };
 }
 
 export interface GcaMismatch {
@@ -312,12 +323,16 @@ export interface GuildMember {
   roles: string[];
 }
 
-/** Include all accounts in ambiguity detection before checking the member role. */
-export function indexMemberVids(members: GuildMember[], roleId: string): Map<number, string> {
+/**
+ * Include all accounts in ambiguity detection before checking the member role.
+ * Nicknames are self-editable: with a verified role configured, only a member
+ * staff also gave that role is trusted with the VID in their nickname.
+ */
+export function indexMemberVids(members: GuildMember[], roleId: string, verifiedRoleId?: string): Map<number, string> {
   const matches = new Map<number, GuildMember[]>();
   for (const member of members) {
     const numbers = member.nick?.match(/\d+/g) ?? [];
-    for (const vid of new Set(numbers.filter((n) => /^[1-9]\d{5}$/.test(n)).map(Number))) {
+    for (const vid of new Set(numbers.filter(isVid).map(Number))) {
       const list = matches.get(vid) ?? [];
       list.push(member);
       matches.set(vid, list);
@@ -327,6 +342,7 @@ export function indexMemberVids(members: GuildMember[], roleId: string): Map<num
   for (const [vid, list] of matches) {
     const member = list[0]!;
     if (list.length === 1 && !member.user.bot && member.roles.includes(roleId) &&
+        (!verifiedRoleId || member.roles.includes(verifiedRoleId)) &&
         (member.nick?.match(/\d+/g) ?? []).length === 1) result.set(vid, member.user.id);
   }
   return result;
@@ -488,7 +504,7 @@ function updateSessionsAndCollectCandidates(
   for (const atc of current) {
     if (!Number.isSafeInteger(atc.userId) || atc.userId <= 0 ||
         !Number.isSafeInteger(atc.sessionId) || atc.sessionId <= 0 ||
-        !/^[A-Z0-9_]{3,40}$/.test(atc.callsign)) continue;
+        !/^[A-Z0-9_]{3,40}$/.test(atc.callsign.toUpperCase())) continue;
     const key = `${atc.userId}:${atc.sessionId}`;
     const row = sql.exec<ReminderRow>(`INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)
       ON CONFLICT(session_key) DO UPDATE SET last_seen = excluded.last_seen
@@ -563,7 +579,7 @@ async function sendMemberReminders(
     console.warn(JSON.stringify({ event: 'gca_member_list_failed' }));
     throw err;
   });
-  const index = indexMemberVids(members, memberRoleId);
+  const index = indexMemberVids(members, memberRoleId, policy.verifiedRoleId);
   let attemptsThisPoll = 0;
   for (const { atc, key, mismatch } of candidates.values()) {
     if (attemptsThisPoll >= MAX_SENDS_PER_POLL || Date.now() >= deadline) break;
@@ -578,24 +594,28 @@ async function sendMemberReminders(
       console.log(JSON.stringify({ event: 'gca_skipped_unmapped' }));
       continue;
     }
-    // One durable ordinal per VID/connection, shared across all target regions.
-    // Retrying a rejected request or reconnecting the Worker never increments it.
-    sql.exec(`INSERT OR IGNORE INTO gca_occurrences (session_key, user_id, occurrence)
-      SELECT ?, ?, COALESCE(MAX(occurrence), 0) + 1 FROM gca_occurrences WHERE user_id = ?`,
-    key, atc.userId, atc.userId);
-    const { occurrence } = sql.exec<{ occurrence: number }>(
-      'SELECT occurrence FROM gca_occurrences WHERE session_key = ?', key).one();
     attemptsThisPoll++;
-    const payload = { embeds: [buildGcaEmbed(atc, mismatch, occurrence, policy.policyUrl, labels)], allowed_mentions: { parse: [] } };
     let messageAttempted = false;
     try {
       const channelId = await openDm(limits, env.DISCORD_BOT_TOKEN, recipient);
       if (Date.now() >= deadline) break;
       // Persist reservation BEFORE the message POST. An ambiguous timeout or crash
       // must never generate repeated warning DMs on a later poll/redeployment.
-      sql.exec("UPDATE gca_reminders SET status = 'reserved', attempts = attempts + 1 WHERE session_key = ?", key);
+      // The durable ordinal (one per VID/connection, shared across all target
+      // regions) is assigned in the same step, so only a connection whose DM
+      // is actually attempted counts; retrying a rejected request or
+      // reconnecting the Worker never increments it.
+      storage.transactionSync(() => {
+        sql.exec(`INSERT OR IGNORE INTO gca_occurrences (session_key, user_id, occurrence)
+          SELECT ?, ?, COALESCE(MAX(occurrence), 0) + 1 FROM gca_occurrences WHERE user_id = ?`,
+        key, atc.userId, atc.userId);
+        sql.exec("UPDATE gca_reminders SET status = 'reserved', attempts = attempts + 1 WHERE session_key = ?", key);
+      });
+      const { occurrence } = sql.exec<{ occurrence: number }>(
+        'SELECT occurrence FROM gca_occurrences WHERE session_key = ?', key).one();
       await storage.sync();
       messageAttempted = true;
+      const payload = { embeds: [buildGcaEmbed(atc, mismatch, occurrence, policy.policyUrl, labels)], allowed_mentions: { parse: [] } };
       const message = await discordJson(limits, env.DISCORD_BOT_TOKEN, `/channels/${channelId}/messages`, payload) as { id?: string } | null;
       // The POST itself returned 2xx: the DM was delivered even if the
       // response body is unusable. Recording that as a retryable/failed

@@ -316,31 +316,30 @@ describe('GCA policy configuration', () => {
       .toContain('(https://example.test/gca)');
   });
 
-  it.each([2048, 2049, 5000])('keeps a %i-character policy URL within the embed budget', (length) => {
-    const url = 'https://example.test/gca?ref='.padEnd(length, 'x');
+  it('keeps a 2048-character policy URL within the embed budget', () => {
+    const url = 'https://example.test/gca?ref='.padEnd(2048, 'x');
     const parsed = parseGcaPolicy({ ...settings(), GCA_POLICY_URL: url })!;
-    expect(parsed.policyUrl).toBe(length <= 2048 ? url : undefined);
+    expect(parsed.policyUrl).toBe(url);
     const controller = atc({ callsign: 'XD' + 'A'.repeat(38), station: '*'.repeat(100) });
     const embed = buildGcaEmbed(controller, gcaMismatch(controller, parsed)!, 123, parsed.policyUrl);
     expect(embed.description!.length).toBeLessThanOrEqual(4096);
   });
 
-  it('still delivers reminders when a policy URL would exceed Discord limits', async () => {
-    const config = { ...settings(), GCA_POLICY_URL: 'https://example.test/' + 'x'.repeat(5000) };
-    const original = network.getMockImplementation()!;
-    network.mockImplementation(async (input, init) => {
-      if (String(input).endsWith(`/channels/${CHANNEL}/messages`)) {
-        const payload = JSON.parse(String(init?.body)) as { embeds: DiscordEmbed[] };
-        if (payload.embeds[0]!.description!.length > 4096) {
-          return Response.json({ message: 'Invalid Form Body' }, { status: 400 });
-        }
-      }
-      return original(input, init);
-    });
-    await check([], config);
+  it.each([2049, 5000])('disables reminders for a %i-character policy URL', (length) => {
+    const url = 'https://example.test/gca?ref='.padEnd(length, 'x');
+    expect(parseGcaPolicy({ ...settings(), GCA_POLICY_URL: url })).toBeNull();
+  });
+
+  it('sends nothing when a configured policy URL is unusable, and logs a fixed reason', async () => {
+    const error = vi.spyOn(console, 'error');
+    const config = { ...settings(), GCA_POLICY_URL: 'http://example.test/gca' };
+    await check([]);
     await check([atc()], config);
+    expect(sent).toHaveLength(0);
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'gca_config_invalid', reason: 'policy_url' }));
+    // Unset remains valid: the DM simply has no link.
+    await check([atc({ sessionId: 2 })], { ...settings(), GCA_POLICY_URL: ' ' });
     expect(sent).toHaveLength(1);
-    expect((await statuses())[0]?.status).toBe('sent');
   });
 
   it('sends nothing when approvals are missing or unusable', async () => {
@@ -364,8 +363,37 @@ describe('Discord VID mapping', () => {
     expect(indexMemberVids([member(), { ...member(), user: { id: '111111111111111111', bot: true } }], QDLE).size).toBe(0);
   });
 
-  it.each(['Member (6000010)', 'Member (600001) 123456', 'Member (staff)', '', null])('rejects ambiguous/missing VID: %s', (nick) => {
+  it.each([
+    'Member (0600001)', 'Member (1234)', 'Member (12345678901)', 'Member (600001) 123456', 'Member (staff)', '', null,
+  ])('rejects ambiguous/missing VID: %s', (nick) => {
     expect(indexMemberVids([{ ...member(), nick }], QDLE).size).toBe(0);
+  });
+
+  it.each([10001, 6000010, 1234567890])('accepts the same 5–10 digit VIDs as approval records: %i', (vid) => {
+    expect(indexMemberVids([member(vid)], QDLE).get(vid)).toBe(USER);
+  });
+
+  it('trusts a nickname VID only for holders of the configured verified role', () => {
+    const VERIFIED = '100000000000000003';
+    expect(indexMemberVids([member()], QDLE, VERIFIED).size).toBe(0);
+    expect(indexMemberVids([member(600001, USER, [QDLE, VERIFIED])], QDLE, VERIFIED).get(600001)).toBe(USER);
+    // An impostor copying a verified member's VID still makes it ambiguous.
+    expect(indexMemberVids([
+      member(600001, USER, [QDLE, VERIFIED]), member(600001, '111111111111111111', [QDLE]),
+    ], QDLE, VERIFIED).size).toBe(0);
+  });
+
+  it('does not DM a member without the verified role, and disables reminders for an invalid one', async () => {
+    const VERIFIED = '100000000000000003';
+    const error = vi.spyOn(console, 'error');
+    await check([], { ...settings(), GCA_VERIFIED_ROLE_ID: VERIFIED });
+    await check([atc()], { ...settings(), GCA_VERIFIED_ROLE_ID: VERIFIED });
+    expect(sent).toHaveLength(0);
+    expect(parseGcaPolicy({ ...settings(), GCA_VERIFIED_ROLE_ID: 'staff' })).toBeNull();
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'gca_config_invalid', reason: 'verified_role' }));
+    members = [member(600001, USER, [QDLE, VERIFIED])];
+    await check([atc({ sessionId: 2 })], { ...settings(), GCA_VERIFIED_ROLE_ID: VERIFIED });
+    expect(sent).toHaveLength(1);
   });
 });
 
@@ -401,7 +429,7 @@ describe('durable GCA delivery', () => {
     expect(titles()[4]).toContain('[4th occurrence]');
   });
 
-  it('counts a qualifying connection with a blocked DM, but not the retry polls', async () => {
+  it('does not count a connection whose DM was never attempted', async () => {
     await check([]);
     openStatus = 403;
     await check([atc()]);
@@ -409,7 +437,17 @@ describe('durable GCA delivery', () => {
     openStatus = 200;
     await check([atc({ sessionId: 2 })]);
     expect(titles()).toHaveLength(1);
-    expect(titles()[0]).toContain('[2nd occurrence]');
+    // The member's first received warning is never labelled a repeat.
+    expect(titles()[0]).not.toContain('occurrence');
+    const rows = await runInDurableObject(stub(), (_instance, ctx) =>
+      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences').toArray());
+    expect(rows).toEqual([{ session_key: '600001:2', occurrence: 1 }]);
+  });
+
+  it('checks lowercase callsigns the same way as the public marker', async () => {
+    await check([]);
+    await check([atc({ callsign: 'xdaa_arr_app' })]);
+    expect(sent).toHaveLength(1);
   });
 
   it('keeps counters separate for different VIDs', async () => {
@@ -944,6 +982,28 @@ describe('staff copies', () => {
     expect(copies).toHaveLength(0);
     await check([], config());
     expect(copies).toHaveLength(1);
+  });
+
+  it('lets cleanup remove an unsent copy left for a previous staff account, keeping the ledgers', async () => {
+    const NEXT_STAFF = '444444444444444444';
+    await check([], config());
+    copyOpenStatus = 500;
+    await check([atc()], config());
+    await runInDurableObject(stub(), (_, ctx) => {
+      // The configured account still receives its retry: nothing is stale.
+      expect(cleanupGcaCopies(ctx.storage, true, now, COPY_USER).deleted).toBe(0);
+      expect(cleanupGcaCopies(ctx.storage, false, now, NEXT_STAFF)).toMatchObject({ eligible: 1, deleted: 0 });
+      expect(cleanupGcaCopies(ctx.storage, true, now, NEXT_STAFF).deleted).toBe(1);
+      expect(ctx.storage.sql.exec('SELECT * FROM gca_copies').toArray()).toHaveLength(0);
+    });
+    copyOpenStatus = 200;
+    now += 300_000;
+    await check([atc()], config());
+    expect(copies).toHaveLength(0);
+    expect(sent).toHaveLength(1);
+    await check([atc({ sessionId: 123457 })], config());
+    expect(sent).toHaveLength(2);
+    expect(titles()[1]).toContain('[2nd occurrence]');
   });
 
   it('does not let a route-scoped member-list 429 block a same-poll pending staff copy', async () => {

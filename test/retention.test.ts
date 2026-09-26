@@ -2,6 +2,7 @@ import { env } from 'cloudflare:workers';
 import { SELF, reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it } from 'vitest';
 import { COORDINATOR_NAME } from '../src/config';
+import { PollCoordinator } from '../src/coordinator';
 import { cleanupGcaCopies } from '../src/retention';
 import { AUTH_HEADERS } from './helpers';
 
@@ -57,6 +58,33 @@ it('keeps recent copies, copies without known age, and nonterminal reminders', a
     sql.exec("INSERT INTO gca_copies VALUES ('600004:1', 'payload', 'recipient', 'reserved')");
     expect(cleanupGcaCopies(ctx.storage, true, now)).toMatchObject({ deleted: 1 });
     expect(sql.exec('SELECT * FROM gca_copies').toArray()).toHaveLength(3);
+  });
+});
+
+it('also removes recent unsent copies addressed to anyone but the current staff account', async () => {
+  const CURRENT = '100000000000000011';
+  const PREVIOUS = '100000000000000012';
+  await seed(0);
+  await runInDurableObject(stub(), (_instance, ctx) => {
+    const sql = ctx.storage.sql;
+    for (const [key, recipient, status] of [
+      ['600002:1', PREVIOUS, 'pending'], ['600002:2', PREVIOUS, 'reserved'], ['600002:3', PREVIOUS, 'sent'],
+      ['600002:4', CURRENT, 'pending'],
+    ] as const) {
+      sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, 1)', key, 'sent', now);
+      sql.exec('INSERT INTO gca_occurrences VALUES (?, 1)', key);
+      sql.exec("INSERT INTO gca_copies VALUES (?, 'payload', ?, ?)", key, recipient, status);
+    }
+    // Without a valid current account only the age rule applies.
+    expect(cleanupGcaCopies(ctx.storage, true, now, '')).toMatchObject({ deleted: 0 });
+    expect(cleanupGcaCopies(ctx.storage, true, now, 'not-an-id')).toMatchObject({ deleted: 0 });
+    // The coordinator passes its configured account.
+    const coordinator = new PollCoordinator(ctx, { ...env, GCA_COPY_USER_ID: CURRENT });
+    expect(coordinator.cleanupGcaHistory(true)).toMatchObject({ busy: false, deleted: 2 });
+    expect(sql.exec('SELECT session_key FROM gca_copies ORDER BY session_key').toArray().map((row) => row.session_key))
+      .toEqual(['600002:3', '600002:4']);
+    expect(sql.exec('SELECT * FROM gca_reminders').toArray()).toHaveLength(4);
+    expect(sql.exec('SELECT * FROM gca_occurrences').toArray()).toHaveLength(4);
   });
 });
 

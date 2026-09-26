@@ -12,6 +12,8 @@ export interface PollSnapshot {
   /** Budget for continuation pages that have never once posted successfully. */
   rosterPostAttempts?: RosterPostAttempt[];
   pendingOffline?: PendingOffline[];
+  /** Last role ping per channel (epoch ms), kept while its mention cooldown runs. */
+  rolePings?: Record<string, number>;
   lastPollStartedAt?: number;
   lastSuccessfulPollAt?: number;
   error?: string;
@@ -60,7 +62,7 @@ export class PollCoordinator extends DurableObject<Env> {
     // Never race a reminder POST/reservation or a staff-copy retry. The cleanup
     // itself is synchronous, so no poll can interleave with its transaction.
     if (this.inFlight) return { busy: true as const };
-    return { busy: false as const, ...cleanupGcaCopies(this.ctx.storage, apply, Date.now()) };
+    return { busy: false as const, ...cleanupGcaCopies(this.ctx.storage, apply, Date.now(), this.env.GCA_COPY_USER_ID) };
   }
 
   async getGcaHistory(after = '') {
@@ -109,6 +111,7 @@ export class PollCoordinator extends DurableObject<Env> {
         previousRosterMessages: snapshot.rosterMessages,
         previousRosterPostAttempts: snapshot.rosterPostAttempts,
         previousPendingOffline: snapshot.pendingOffline,
+        previousRolePings: snapshot.rolePings,
       });
     } catch (err) {
       // A config/precondition throw never reached the outcome object below,
@@ -122,6 +125,7 @@ export class PollCoordinator extends DurableObject<Env> {
           ...(snapshot.pendingOffline?.length ? { pendingOffline: snapshot.pendingOffline } : {}),
           ...(snapshot.rosterMessages?.length ? { rosterMessages: snapshot.rosterMessages } : {}),
           ...(snapshot.rosterPostAttempts?.length ? { rosterPostAttempts: snapshot.rosterPostAttempts } : {}),
+          ...(snapshot.rolePings && Object.keys(snapshot.rolePings).length ? { rolePings: snapshot.rolePings } : {}),
           lastPollStartedAt: startedAt,
           ...(snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt }),
           error: err instanceof Error ? err.message : String(err),
@@ -138,6 +142,7 @@ export class PollCoordinator extends DurableObject<Env> {
       ...(outcome.pendingOffline.length ? { pendingOffline: outcome.pendingOffline } : {}),
       ...(outcome.rosterMessages.length ? { rosterMessages: outcome.rosterMessages } : {}),
       ...(outcome.rosterPostAttempts.length ? { rosterPostAttempts: outcome.rosterPostAttempts } : {}),
+      ...(Object.keys(outcome.rolePings).length ? { rolePings: outcome.rolePings } : {}),
       lastPollStartedAt: startedAt,
       ...(outcome.error
         ? (snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt })

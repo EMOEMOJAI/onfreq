@@ -40,7 +40,9 @@ function session(callsign: string, cardAt = START - 60_000): TrackedAtc {
   };
 }
 
-type Sent = { channelId?: string; method: string; id?: string; embed: DiscordEmbed; replyTo?: string; nonce?: string };
+type Sent = {
+  channelId?: string; method: string; id?: string; embed: DiscordEmbed; replyTo?: string; nonce?: string; content?: string;
+};
 let now: number;
 let feed: IvaoAtcSummaryEntry[];
 let sent: Sent[];
@@ -155,10 +157,14 @@ beforeEach(() => {
       }
       const payload = JSON.parse(String(init?.body)) as {
         embeds: DiscordEmbed[]; message_reference?: { message_id: string }; nonce?: string; enforce_nonce?: boolean;
+        content?: string;
       };
       const embed = payload.embeds[0]!;
       if (payload.nonce && !payload.enforce_nonce) throw new Error('nonce sent without enforce_nonce');
-      sent.push({ channelId, method, id, embed, replyTo: payload.message_reference?.message_id, nonce: payload.nonce });
+      sent.push({
+        channelId, method, id, embed, replyTo: payload.message_reference?.message_id, nonce: payload.nonce,
+        ...(payload.content ? { content: payload.content } : {}),
+      });
       const text = payload.embeds.flatMap((item) => [item.title ?? '', item.description ?? '', item.footer?.text ?? '',
         ...(item.fields ?? []).flatMap((field) => [field.name, field.value])]).join('');
       if (text.length > 6000 || payload.embeds.some((item) => (item.fields?.length ?? 0) > 25 ||
@@ -418,6 +424,162 @@ describe('polling through the Durable Object', () => {
     await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
     expect(network.mock.calls.some(([input]) => String(input).includes('removed-channel'))).toBe(false);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('never edits cards, roster pages or closeouts in a channel removed from configuration', async () => {
+    const tracked = session(a);
+    tracked.messages!.push({ channelId: 'test-channel-b', messageId: 'a-in-b' });
+    const rosterInB = { channelId: 'test-channel-b', parentMessageId: 'a-in-b', page: 0, messageId: 'page-in-b' };
+    const markerInB = {
+      channelId: 'test-channel-b', parentMessageId: 'gone-parent', page: 0, attempts: 1,
+      maybePostedFrom: START - 120_000, maybePostedTo: START - 60_000,
+    };
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, {
+        state: { [a]: tracked }, rosterMessages: [rosterInB], rosterPostAttempts: [markerInB],
+      } satisfies PollSnapshot);
+    });
+    feed = [entry(a, 121.7)];
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+    expect(sent.map((item) => [item.method, item.id])).toEqual([['PATCH', a]]);
+    // Kept untouched in case the channel is configured again.
+    expect((await snapshot())?.rosterMessages).toEqual([rosterInB]);
+    expect((await snapshot())?.rosterPostAttempts).toEqual([markerInB]);
+    feed = [];
+    now += 60_000;
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel', OFFLINE_GRACE_POLLS: '1' }))
+      .resolves.toEqual({ skipped: false });
+    expect(cards.get(a)?.title).toContain('OFFLINE');
+    expect(network.mock.calls.some(([input]) => String(input).includes('/test-channel-b/'))).toBe(false);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('logs a failing destination by its configured index, never its channel ID', async () => {
+    const error = vi.spyOn(console, 'error');
+    await seed({});
+    feed = [entry(a)];
+    failures.add('test-channel-b');
+    await expect(configuredPoll()).rejects.toThrow('some Discord notifications failed');
+    const logs = error.mock.calls.map((call) => String(call[0]));
+    expect(logs).toContainEqual(expect.stringContaining('"event":"online_post_failed","callsign":"QCTT_TWR","channelIndex":1'));
+    expect(logs.filter((line) => line.includes('test-channel'))).toEqual([]);
+  });
+
+  describe('role pings', () => {
+    const ROLE = '100000000000000077';
+    const pings = () => sent.filter((item) => item.content === `<@&${ROLE}>`).length;
+    const rolePoll = (overrides: Partial<Env> = {}) => configuredPoll({
+      DISCORD_CHANNEL_IDS: 'test-channel', OFFLINE_GRACE_POLLS: '1', MENTION_ROLE_ID: ROLE, ...overrides,
+    });
+    /** Disconnect, then reconnect as a new session, one poll each. */
+    async function reconnect(overrides: Partial<Env> = {}) {
+      feed = [];
+      now += 60_000;
+      await rolePoll(overrides);
+      feed = [entry(a)];
+      now += 60_000;
+      await rolePoll(overrides);
+    }
+
+    it('pings a channel at most once per cooldown, however often a controller reconnects', async () => {
+      await seed({});
+      feed = [entry(a)];
+      await rolePoll();
+      expect(pings()).toBe(1);
+      await evictDurableObject(stub());
+      await reconnect();
+      await reconnect();
+      expect(sent.filter((item) => item.method === 'POST' && item.embed.title?.includes('ONLINE'))).toHaveLength(3);
+      expect(pings()).toBe(1);
+      now += 10 * 60_000;
+      await reconnect();
+      expect(pings()).toBe(2);
+    });
+
+    it('honours a configured cooldown, including 0 for one ping per poll', async () => {
+      await seed({});
+      feed = [entry(a)];
+      await rolePoll({ MENTION_COOLDOWN_MINUTES: '0' });
+      await reconnect({ MENTION_COOLDOWN_MINUTES: '0' });
+      expect(pings()).toBe(2);
+      expect((await snapshot())?.rolePings).toBeUndefined();
+      await reconnect({ MENTION_COOLDOWN_MINUTES: '30' });
+      now += 20 * 60_000;
+      await reconnect({ MENTION_COOLDOWN_MINUTES: '30' });
+      expect(pings()).toBe(3);
+    });
+
+    it('never pings with a role ID that is not a Discord snowflake', async () => {
+      const error = vi.spyOn(console, 'error');
+      await seed({});
+      feed = [entry(a)];
+      await rolePoll({ MENTION_ROLE_ID: 'everyone' });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.content).toBeUndefined();
+      expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'mention_config_invalid', reason: 'role' }));
+    });
+  });
+
+  describe('pending closeout bounds', () => {
+    it('keeps only what a closeout needs and gives up on it after a day', async () => {
+      const error = vi.spyOn(console, 'error');
+      const tracked = session(a);
+      tracked.messages = [{
+        channelId: 'test-channel', messageId: a, postedAt: new Date(START - 60_000).toISOString(), onlineEmbed: '{"large":true}',
+      }];
+      await seed({ [a]: tracked });
+      failures.add(a);
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel', OFFLINE_GRACE_POLLS: '1' })).rejects.toThrow();
+      expect((await snapshot())?.pendingOffline?.[0]?.messages).toEqual([{ channelId: 'test-channel', messageId: a }]);
+      const attemptsBefore = sent.length;
+      now += 24 * 3_600_000 + 60_000;
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+      expect(sent).toHaveLength(attemptsBefore);
+      expect((await snapshot())?.pendingOffline).toBeUndefined();
+      expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'expired', count: 1 }));
+    });
+
+    it('keeps at most 200 pending closeouts, dropping the oldest', async () => {
+      const error = vi.spyOn(console, 'error');
+      const jobs: PendingOffline[] = Array.from({ length: 201 }, (_, i) => ({
+        event: {
+          ...session(`QC${String(i).padStart(3, '0')}_TWR`), messages: undefined,
+          endedAt: new Date(START - (201 - i) * 1000).toISOString(), durationSeconds: 60,
+        },
+        messages: [{ channelId: 'test-channel', messageId: `m${i}` }], channelIds: [],
+      }));
+      await runInDurableObject(stub(), async (_, ctx) => {
+        await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: jobs } satisfies PollSnapshot);
+      });
+      failures.add('test-channel');
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow();
+      const kept = (await snapshot())?.pendingOffline ?? [];
+      expect(kept).toHaveLength(200);
+      expect(kept.map((job) => job.messages[0]!.messageId)).toEqual(jobs.slice(1).map((job) => job.messages[0]!.messageId));
+      expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'limit', count: 1 }));
+    });
+  });
+
+  it('shows the public mismatch marker only while reminders are enabled with a valid policy', async () => {
+    const gcaConfig = (overrides: Partial<Env>) => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
+      ...env, IVAO_CLIENT_ID: 'test-client', IVAO_CLIENT_SECRET: 'test-secret', DISCORD_CHANNEL_IDS: 'test-channel',
+      FIR_PREFIXES: 'XD', GCA_REGIONS: JSON.stringify({ AD: { name: 'Example East', prefixes: ['XD'] } }), ...overrides,
+    }).poll());
+    await seed({});
+    profileCountry = 'US';
+    feed = [{
+      ...entry('XDAA_APP'), userId: 600001, id: 999,
+      atcPosition: { atcCallsign: 'Test Station', airport: { icao: 'XDAA', countryId: 'AD' } },
+    }];
+    await gcaConfig({ GCA_DM_ENABLED: 'false' });
+    expect(sent.at(-1)?.embed.title).toMatch(/^🟢 /);
+    now += 60_000;
+    await gcaConfig({ GCA_DM_ENABLED: 'true' });
+    expect(sent.at(-1)?.embed.title).toMatch(/^🔴 /);
+    now += 60_000;
+    await gcaConfig({ GCA_DM_ENABLED: 'true', GCA_POLICY_URL: 'http://example.test/gca' });
+    expect(sent.at(-1)?.embed.title).toMatch(/^🟢 /);
+    expect(sent.map((item) => item.method)).toEqual(['POST', 'PATCH', 'PATCH']);
   });
 
   it('keeps a roster in each channel during partial delivery and moves it after retry', async () => {

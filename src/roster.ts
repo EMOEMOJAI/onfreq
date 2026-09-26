@@ -29,6 +29,15 @@ function markMaybePosted(entry: RosterPostAttempt, previous: RosterPostAttempt |
   return { ...entry, maybePostedFrom: previous?.maybePostedFrom ?? now, maybePostedTo: now };
 }
 
+/**
+ * Channel and message IDs are private configuration: logs identify a channel
+ * only by its position in the configured list (null when not configured).
+ */
+export function channelIndex(channelIds: string[], channelId: string): number | null {
+  const index = channelIds.indexOf(channelId);
+  return index < 0 ? null : index;
+}
+
 function attemptKey(channelId: string, parentMessageId: string, page: number): string {
   return `${channelId}:${parentMessageId}:${page}`;
 }
@@ -36,13 +45,14 @@ function attemptKey(channelId: string, parentMessageId: string, page: number): s
 /** Reconcile separately sent pages, retaining failed edits/deletions for later polls. */
 export async function syncRosterMessages(
   botToken: string, previous: RosterMessage[], targets: RosterTarget[],
-  limits: DiscordRateLimits, previousPostAttempts: RosterPostAttempt[] = [],
+  limits: DiscordRateLimits, previousPostAttempts: RosterPostAttempt[] = [], channelIds: string[] = [],
 ): Promise<{ messages: RosterMessage[]; postAttempts: RosterPostAttempt[]; failed: boolean }> {
   const messages: RosterMessage[] = [];
   let failed = false;
-  const logFailure = (operation: string, channelId: string, parentMessageId: string, error: unknown) => {
+  const logIndex = (channelId: string) => channelIndex(channelIds, channelId);
+  const logFailure = (operation: string, channelId: string, error: unknown) => {
     failed = true;
-    console.error(JSON.stringify({ event: 'roster_continuation_failed', operation, channelId, parentMessageId, error: String(error) }));
+    console.error(JSON.stringify({ event: 'roster_continuation_failed', operation, channelIndex: logIndex(channelId), error: String(error) }));
   };
   // A page that has never once posted successfully has no RosterMessage of
   // its own to hold a retry counter on; track those separately,
@@ -70,13 +80,11 @@ export async function syncRosterMessages(
       // via the shared 4xx-only predicate.
       const counts = countsAgainstBudget(err);
       const used = (ref.deleteAttempts ?? 0) + (counts ? 1 : 0);
-      logFailure('delete', ref.channelId, ref.parentMessageId, err);
+      logFailure('delete', ref.channelId, err);
       if (!counts || used <= DELETE_RETRY_POLLS) {
         messages.push({ ...ref, deleteAttempts: used });
       } else {
-        console.error(JSON.stringify({
-          event: 'roster_delete_abandoned', channelId: ref.channelId, parentMessageId: ref.parentMessageId,
-        }));
+        console.error(JSON.stringify({ event: 'roster_delete_abandoned', channelIndex: logIndex(ref.channelId) }));
       }
     }
   }
@@ -106,9 +114,7 @@ export async function syncRosterMessages(
             messages[index] = { ...messages[index]!, pageAttempts: used };
             return;
           }
-          console.error(JSON.stringify({
-            event: 'roster_page_abandoned', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
-          }));
+          console.error(JSON.stringify({ event: 'roster_page_abandoned', channelIndex: logIndex(target.channelId), page }));
           // Keep a frozen marker instead of splicing the entry away: an
           // absent entry reads as "never posted" and would otherwise be
           // re-created as a duplicate next poll.
@@ -128,9 +134,7 @@ export async function syncRosterMessages(
           postAttemptsByKey.set(key, entry);
           return;
         }
-        console.error(JSON.stringify({
-          event: 'roster_page_abandoned', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
-        }));
+        console.error(JSON.stringify({ event: 'roster_page_abandoned', channelIndex: logIndex(target.channelId), page }));
         postAttemptsByKey.set(key, { ...entry, abandoned: true });
       };
       // Every fresh post gets its own nonce key, kept across its retries: a
@@ -147,7 +151,7 @@ export async function syncRosterMessages(
           continue;
         } catch (err) {
           if (!(err instanceof DiscordApiError && err.isGone)) {
-            logFailure('edit', ref.channelId, ref.parentMessageId, err);
+            logFailure('edit', ref.channelId, err);
             giveUp(err);
             continue;
           }
@@ -176,15 +180,13 @@ export async function syncRosterMessages(
         if (err instanceof DiscordUnconfirmedPostError) {
           // Discord accepted the page but returned no id to track it by:
           // posting again could only duplicate it, so freeze this page.
-          console.error(JSON.stringify({
-            event: 'roster_post_unconfirmed', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
-          }));
+          console.error(JSON.stringify({ event: 'roster_post_unconfirmed', channelIndex: logIndex(target.channelId), page }));
           postAttemptsByKey.set(key, markMaybePosted({
             channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: 0, nonceKey, abandoned: true,
           }, postAttemptsByKey.get(key), err));
           continue;
         }
-        logFailure('post', target.channelId, target.parentMessageId, err);
+        logFailure('post', target.channelId, err);
         giveUp(err);
       }
     }
@@ -223,7 +225,7 @@ export async function syncRosterMessages(
         if (!tracked.has(id)) await deleteMessage(botToken, channelId, id, limits);
       }
     } catch (err) {
-      console.error(JSON.stringify({ event: 'roster_orphan_sweep_failed', channelId, parentMessageId, error: String(err) }));
+      console.error(JSON.stringify({ event: 'roster_orphan_sweep_failed', channelIndex: logIndex(channelId), error: String(err) }));
       // Keep only the time windows: should the parent be shown again, its
       // pages post fresh rather than stay frozen with stale content.
       if (!countsAgainstBudget(err)) {
