@@ -201,6 +201,8 @@ export interface OfflineEvent extends TrackedAtc {
 export interface PostWindow {
   from: number;
   to: number;
+  /** The channel also has a tracked card: recovery only closes stray copies. */
+  closeOnly?: true;
 }
 
 /** Ended sessions retry independently of any replacement at the same callsign. */

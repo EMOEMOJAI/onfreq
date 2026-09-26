@@ -253,9 +253,12 @@ async function announceOffline(
         // Without message history access, fall back to the re-post below.
         if (!countsAgainstBudget(err)) throw err;
       }
-      // A channel whose card is already tracked only needs stray copies closed.
-      const hasCard = job.messages.some((ref) => ref.channelId === channelId);
-      if (!found.length && !hasCard) {
+      if (!found.length && window.closeOnly) {
+        // No stray copy of a tracked card: nothing is left to close here.
+        delivered++;
+        continue;
+      }
+      if (!found.length) {
         found = [await postMessage(env.DISCORD_BOT_TOKEN, channelId,
           buildOnlineEmbed(job.event, undefined, labels), undefined, undefined, limits, onlineNonce(job.event, channelId))];
       }
@@ -472,7 +475,12 @@ export async function runPoll(
     } = offline;
     // A session with no card and no pending marker is legacy: announce the
     // end everywhere. Channels whose first card may exist unseen recover it.
-    const recoverPosts = Object.fromEntries(Object.entries(uncertainPosts).filter(([id]) => channelIds.includes(id)));
+    // A channel whose card is tracked only needs stray copies closed; the
+    // flag survives retries, after which that card may no longer be listed.
+    const recoverPosts = Object.fromEntries(Object.entries(uncertainPosts)
+      .filter(([id]) => channelIds.includes(id))
+      .map(([id, window]): [string, PostWindow] => messages.some((ref) => ref.channelId === id)
+        ? [id, { ...window, closeOnly: true }] : [id, window]));
     jobs.push({
       event, messages, channelIds: messages.length || pendingIds ? [] : [...channelIds],
       ...(Object.keys(recoverPosts).length ? { recoverPosts } : {}),
