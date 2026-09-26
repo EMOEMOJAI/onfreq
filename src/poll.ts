@@ -22,7 +22,7 @@ import { diffState, newestCardedSession, stripLegacyRoster } from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
 import { gcaMismatch, parseGcaPolicy, sendGcaReminders, type GcaPolicy } from './gca';
 import { syncRosterMessages, type RosterTarget } from './roster';
-import { DiscordRateLimits } from './discord-rate-limit';
+import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import { countsAgainstBudget } from './types';
 import type {
   OfflineEvent, PendingOffline, OnlineAtc, PostedMessage, RosterMessage, RosterPostAttempt, StateMap, TrackedAtc,
@@ -46,6 +46,15 @@ function highlightMismatch(atc: OnlineAtc, policy: GcaPolicy | null): boolean {
 
 function logFailure(event: string, callsign: string, channelId: string, err: unknown): void {
   console.error(JSON.stringify({ event, callsign, channelId, error: String(err) }));
+}
+
+/**
+ * Nonce of a session's first ONLINE card in a channel: keyed to the tracked
+ * session (callsign and `since`, not the IVAO-issued `sessionId`, which
+ * changes across a grace-window resume), so a re-send returns the original.
+ */
+function onlineNonce(atc: TrackedAtc, channelId: string): string {
+  return messageNonce(`online:${atc.userId}:${atc.callsign}:${atc.since}`, channelId);
 }
 
 /** Values constant across every card posted/edited within one poll. */
@@ -93,12 +102,10 @@ async function announceOnline(
         : undefined;
     const embed = holderChannels.has(channelId) ? holder : plain;
     try {
-      // A POST whose 5xx hid a success is re-sent next poll; a nonce keyed to
-      // this tracked session (callsign and `since`, not the IVAO-issued
-      // `sessionId`, which changes across a grace-window resume) lets Discord
-      // return the original message instead of a duplicate card.
+      // A POST whose 5xx hid a success is re-sent next poll; its nonce lets
+      // Discord return the original message instead of a duplicate card.
       const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits,
-        messageNonce(`online:${atc.userId}:${atc.callsign}:${atc.since}`, channelId));
+        onlineNonce(atc, channelId));
       // On a retry the nonce may have returned the earlier, possibly older
       // message: leave its content unknown so the next reconcile edits it.
       posted.push({ channelId, messageId, postedAt: nowIso, ...(retry ? {} : { onlineEmbed: JSON.stringify(embed) }) });
@@ -226,6 +233,25 @@ async function announceOffline(
   // IVAO-issued `sessionId`, so a genuinely new session never collides with
   // this one's nonce.
   const offlineKey = `offline:${job.event.userId}:${job.event.callsign}:${job.event.since}`;
+  // Recover first cards that may exist unseen, so they are closed below.
+  const recovering: string[] = [];
+  for (const channelId of job.recoverChannelIds ?? []) {
+    try {
+      const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId,
+        buildOnlineEmbed(job.event, undefined, labels), undefined, undefined, limits, onlineNonce(job.event, channelId));
+      job.messages.push({ channelId, messageId });
+    } catch (err) {
+      if (err instanceof DiscordUnconfirmedPostError) {
+        // The card exists but still cannot be edited: announce the end instead.
+        if (!job.channelIds.includes(channelId)) job.channelIds.push(channelId);
+        continue;
+      }
+      logFailure('offline_recover_failed', job.event.callsign, channelId, err);
+      if (keepForRetry(channelId, err)) recovering.push(channelId);
+    }
+  }
+  if (recovering.length) job.recoverChannelIds = recovering;
+  else delete job.recoverChannelIds;
   for (const ref of job.messages) {
     try {
       await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, endedEmbed, limits);
@@ -315,15 +341,15 @@ export async function runPoll(
   const prev: StateMap = { ...(stored ?? {}) };
   // A callsign carded before it was excluded must have its card closed out,
   // not silently abandoned: it disappears from `prev`/`next` below (so
-  // `diffState` cannot see it went offline), so queue an edit-only closeout
-  // here for any excluded session that had a live card.
+  // `diffState` cannot see it went offline), so queue a closeout here for
+  // any excluded session that had a live card or may have one unseen.
   const excludedClosures: OfflineEvent[] = [];
   for (const callsign of Object.keys(prev)) {
     if (isExcludedCallsign(callsign, excluded)) {
       // Strip a legacy `roster` field here too — this session comes
       // straight from storage, not through `diffState`'s own stripping.
       const tracked = stripLegacyRoster(prev[callsign]!);
-      if (!tracked.pending && tracked.messages?.length) {
+      if (!tracked.pending && (tracked.messages?.length || tracked.uncertainChannelIds?.length)) {
         // A session already missing (grace window) keeps the poll it went
         // missing as its end time, matching `diffState`'s `close()`, instead
         // of stretching the duration to this poll.
@@ -392,13 +418,14 @@ export async function runPoll(
     .map((job) => {
       const messages = job.messages.filter((ref) => channelIds.includes(ref.channelId));
       const jobChannelIds = job.channelIds.filter((id) => channelIds.includes(id));
-      // A retry counter for a destination no longer in either list (removed
+      const recoverChannelIds = (job.recoverChannelIds ?? []).filter((id) => channelIds.includes(id));
+      // A retry counter for a destination no longer in any list (removed
       // channel, or already resolved) is stale bookkeeping.
-      const remaining = new Set([...messages.map((ref) => ref.channelId), ...jobChannelIds]);
+      const remaining = new Set([...messages.map((ref) => ref.channelId), ...jobChannelIds, ...recoverChannelIds]);
       const prunedAttempts = job.attemptsByChannel && Object.fromEntries(
         Object.entries(job.attemptsByChannel).filter(([id]) => remaining.has(id)),
       );
-      const { attemptsByChannel: _oldAttempts, ...rest } = job;
+      const { attemptsByChannel: _oldAttempts, recoverChannelIds: _oldRecover, ...rest } = job;
       return {
         ...rest,
         // This event was loaded from storage across a poll boundary,
@@ -406,24 +433,35 @@ export async function runPoll(
         event: stripLegacyRoster(rest.event),
         messages,
         channelIds: jobChannelIds,
+        ...(recoverChannelIds.length ? { recoverChannelIds } : {}),
         ...(prunedAttempts && Object.keys(prunedAttempts).length ? { attemptsByChannel: prunedAttempts } : {}),
       };
     })
-    .filter((job) => job.messages.length || job.channelIds.length);
+    .filter((job) => job.messages.length || job.channelIds.length || job.recoverChannelIds?.length);
   for (const offline of [...wentOffline, ...excludedClosures]) {
     // Both fields only track retry state for the still-open ONLINE card and
     // are meaningless once a session has ended; strip them so a closed-out
     // session doesn't carry stale online-card bookkeeping.
-    const { messages = [], pendingChannelIds: _pending, onlineAttemptsByChannel: _onlineAttempts, ...event } = offline;
-    jobs.push({ event, messages, channelIds: messages.length ? [] : [...channelIds] });
+    const {
+      messages = [], pendingChannelIds: pendingIds, onlineAttemptsByChannel: _onlineAttempts,
+      uncertainChannelIds: uncertainIds = [], ...event
+    } = offline;
+    // A session with no card and no pending marker is legacy: announce the
+    // end everywhere. Channels whose first card may exist unseen recover it.
+    const recoverChannelIds = uncertainIds.filter((id) => channelIds.includes(id) &&
+      !messages.some((ref) => ref.channelId === id));
+    jobs.push({
+      event, messages, channelIds: messages.length || pendingIds ? [] : [...channelIds],
+      ...(recoverChannelIds.length ? { recoverChannelIds } : {}),
+    });
   }
   const pendingOffline: PendingOffline[] = [];
   for (const job of jobs) {
-    attempted += job.messages.length + job.channelIds.length;
+    attempted += job.messages.length + job.channelIds.length + (job.recoverChannelIds?.length ?? 0);
     const result = await announceOffline(env, job, labels, limits);
     delivered += result.delivered;
     deliveryFailed ||= result.failed;
-    if (job.messages.length || job.channelIds.length) pendingOffline.push(job);
+    if (job.messages.length || job.channelIds.length || job.recoverChannelIds?.length) pendingOffline.push(job);
   }
 
   const ctx: PollContext = { env, labels, gcaPolicy, limits, nowIso };
@@ -466,13 +504,16 @@ export async function runPoll(
     const previousAttempts = entry.onlineAttemptsByChannel ?? {};
     const attempts: Record<string, number> = {};
     const kept: string[] = [];
+    const uncertain = new Set(entry.uncertainChannelIds ?? []);
     for (const id of targets) {
-      if (posted.some((ref) => ref.channelId === id)) continue;
+      if (posted.some((ref) => ref.channelId === id)) { uncertain.delete(id); continue; }
       // A 2xx-but-unconfirmed destination is dropped outright, same as
       // one that just exhausted its budget below — never retried, and never
-      // given a counter.
-      if (unconfirmed.has(id)) continue;
+      // given a counter; its card exists, so it is closed out at the end.
+      if (unconfirmed.has(id)) { uncertain.add(id); continue; }
       const err = failed.get(id);
+      // A 5xx or thrown fetch error may hide a card Discord did create.
+      if (!(err instanceof DiscordRateLimitError) && !countsAgainstBudget(err)) uncertain.add(id);
       const counts = countsAgainstBudget(err);
       const used = (previousAttempts[id] ?? 0) + (counts ? 1 : 0);
       if (!counts || used <= OFFLINE_RETRY_POLLS) {
@@ -484,6 +525,9 @@ export async function runPoll(
     }
     if (Object.keys(attempts).length) entry.onlineAttemptsByChannel = attempts;
     else delete entry.onlineAttemptsByChannel;
+    for (const id of uncertain) if (!channelIds.includes(id)) uncertain.delete(id);
+    if (uncertain.size) entry.uncertainChannelIds = [...uncertain];
+    else delete entry.uncertainChannelIds;
     entry.pendingChannelIds = kept;
     if (entry.pendingChannelIds.length) deliveryFailed = true;
     else if (entry.messages?.length) delete entry.pendingChannelIds;

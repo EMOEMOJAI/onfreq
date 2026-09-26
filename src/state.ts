@@ -59,7 +59,9 @@ export function diffState(
     // failed announcement, or silently seeding first-run state) must set
     // `pendingChannelIds` for this to hold; a legacy session predating both
     // fields has neither, and is treated as already announced.
-    if (tracked.pending || (tracked.pendingChannelIds && !tracked.messages?.length)) return;
+    // A channel where a first card may have landed unseen still gets closed.
+    if (tracked.pending || (tracked.pendingChannelIds && !tracked.messages?.length &&
+      !tracked.uncertainChannelIds?.length)) return;
     const durationSeconds = Math.max(0, Math.round(
       (Date.parse(endedAt) - Date.parse(tracked.since)) / 1000,
     ));

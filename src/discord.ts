@@ -479,7 +479,6 @@ export async function editMessage(
   }, limits);
 }
 
-/** Remove an obsolete roster continuation; already-deleted messages are clean. */
 /** The bot's user id, which Discord encodes as base64 in the token's first segment. */
 function botUserId(botToken: string): string | undefined {
   try {
@@ -490,27 +489,48 @@ function botUserId(botToken: string): string | undefined {
   }
 }
 
+const DISCORD_EPOCH_MS = 1_420_070_400_000;
+
+function snowflakeAt(ms: number): string {
+  return (BigInt(Math.max(0, ms - DISCORD_EPOCH_MS)) << 22n).toString();
+}
+
+function snowflakeTime(id: string): number {
+  return Number(BigInt(id) >> 22n) + DISCORD_EPOCH_MS;
+}
+
 /**
- * Ids of this bot's replies to a message among the 50 messages after it, so
- * roster pages whose POST succeeded without the bot learning their id can be
- * found and removed. Returns nothing when the bot's own id is unknown.
+ * Ids of this bot's replies to a message, so roster pages whose POST
+ * succeeded without the bot learning their id can be found and removed.
+ * Scans up to 500 messages posted within the given time window (a minute of
+ * slack either side). Returns nothing when the bot's own id is unknown.
  */
 export async function findBotReplies(
-  botToken: string, channelId: string, parentMessageId: string, limits: DiscordRateLimits,
+  botToken: string, channelId: string, parentMessageId: string,
+  window: { from: number; to: number }, limits: DiscordRateLimits,
 ): Promise<string[]> {
   const botId = botUserId(botToken);
   if (!botId) return [];
-  const res = await discordRequest(botToken, 'GET',
-    `/channels/${channelId}/messages?after=${parentMessageId}&limit=50`, undefined, limits);
-  const list = await res.json().catch(() => null) as unknown;
-  if (!Array.isArray(list)) throw new Error('Discord returned an invalid message list');
-  return list.flatMap((item: unknown) => {
-    const message = item as { id?: unknown; author?: { id?: unknown }; message_reference?: { message_id?: unknown } };
-    return typeof message?.id === 'string' && message.author?.id === botId &&
-      message.message_reference?.message_id === parentMessageId ? [message.id] : [];
-  });
+  const found: string[] = [];
+  let after = snowflakeAt(window.from - 60_000);
+  for (let page = 0; page < 5; page++) {
+    const res = await discordRequest(botToken, 'GET',
+      `/channels/${channelId}/messages?after=${after}&limit=100`, undefined, limits);
+    const list = await res.json().catch(() => null) as unknown;
+    if (!Array.isArray(list)) throw new Error('Discord returned an invalid message list');
+    let newest = after;
+    for (const item of list as { id?: unknown; author?: { id?: unknown }; message_reference?: { message_id?: unknown } }[]) {
+      if (typeof item?.id !== 'string' || !/^\d+$/.test(item.id)) continue;
+      if (BigInt(item.id) > BigInt(newest)) newest = item.id;
+      if (item.author?.id === botId && item.message_reference?.message_id === parentMessageId) found.push(item.id);
+    }
+    if (list.length < 100 || newest === after || snowflakeTime(newest) > window.to + 60_000) break;
+    after = newest;
+  }
+  return found;
 }
 
+/** Remove an obsolete roster continuation; already-deleted messages are clean. */
 export async function deleteMessage(botToken: string, channelId: string, messageId: string, limits: DiscordRateLimits): Promise<void> {
   try {
     await discordRequest(botToken, 'DELETE', `/channels/${channelId}/messages/${messageId}`, undefined, limits);

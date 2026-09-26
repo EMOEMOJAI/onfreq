@@ -1,62 +1,124 @@
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { findBotReplies } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
 import { syncRosterMessages } from '../src/roster';
+import type { RosterPostAttempt } from '../src/types';
 
 // The first token segment is base64 of the bot's synthetic user id.
 const BOT_ID = '100000000000000009';
 const TOKEN = `${btoa(BOT_ID)}.synthetic.token`;
+const NOW = 1_800_000_000_000;
+const WINDOW = { from: NOW - 120_000, to: NOW - 60_000 };
 
+beforeEach(() => { vi.spyOn(Date, 'now').mockReturnValue(NOW); });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+/** A snowflake for a synthetic message created at the given time. */
+function idAt(ms: number, n = 0): string {
+  return ((BigInt(ms - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
+}
 
 function reply(id: string, parent: string, author = BOT_ID) {
   return { id, author: { id: author }, message_reference: { message_id: parent } };
 }
 
-it('finds only this bot’s replies to the given parent', async () => {
-  const fetchMock = vi.fn(async () => Response.json([
-    reply('m1', 'parent'), reply('m2', 'other'), reply('m3', 'parent', '100000000000000001'), { id: 'm4' },
+function dropped(overrides: Partial<RosterPostAttempt> = {}): RosterPostAttempt {
+  return {
+    channelId: 'chan', parentMessageId: 'old-parent', page: 0, attempts: 0, nonceKey: 'roster:old-parent:0:x',
+    maybePostedFrom: WINDOW.from, maybePostedTo: WINDOW.to, ...overrides,
+  };
+}
+
+function stubDiscord(handler: (method: string, path: string) => Response) {
+  const requests: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input).replace('https://discord.com/api/v10', '');
+    requests.push(`${init?.method} ${path}`);
+    return handler(init?.method ?? 'GET', path);
+  }));
+  return requests;
+}
+
+it('finds only this bot’s replies to the parent, scanning from the attempt window', async () => {
+  const requests = stubDiscord(() => Response.json([
+    reply(idAt(WINDOW.from, 1), 'parent'), reply(idAt(WINDOW.from, 2), 'other'),
+    reply(idAt(WINDOW.from, 3), 'parent', '100000000000000001'), { id: 'x' },
   ]));
-  vi.stubGlobal('fetch', fetchMock);
-  await expect(findBotReplies(TOKEN, 'chan', 'parent', new DiscordRateLimits())).resolves.toEqual(['m1']);
-  expect(String((fetchMock.mock.calls[0] as unknown[])[0])).toContain('/channels/chan/messages?after=parent&limit=50');
+  await expect(findBotReplies(TOKEN, 'chan', 'parent', WINDOW, new DiscordRateLimits()))
+    .resolves.toEqual([idAt(WINDOW.from, 1)]);
+  expect(requests).toEqual([`GET /channels/chan/messages?after=${idAt(WINDOW.from - 60_000)}&limit=100`]);
+});
+
+it('pages through a busy channel until it passes the attempt window', async () => {
+  const early = Array.from({ length: 100 }, (_, n) => reply(idAt(WINDOW.from, n), 'someone-else'));
+  const requests = stubDiscord((_method, path) =>
+    path.includes(`after=${idAt(WINDOW.from - 60_000)}`) ? Response.json(early)
+      : Response.json([reply(idAt(WINDOW.to), 'parent')]));
+  await expect(findBotReplies(TOKEN, 'chan', 'parent', WINDOW, new DiscordRateLimits()))
+    .resolves.toEqual([idAt(WINDOW.to)]);
+  expect(requests).toHaveLength(2);
 });
 
 it('finds nothing when the bot id cannot be read from the token', async () => {
-  const fetchMock = vi.fn();
-  vi.stubGlobal('fetch', fetchMock);
-  await expect(findBotReplies('not-a-token', 'chan', 'parent', new DiscordRateLimits())).resolves.toEqual([]);
-  expect(fetchMock).not.toHaveBeenCalled();
+  const requests = stubDiscord(() => Response.json([]));
+  await expect(findBotReplies('not-a-token', 'chan', 'parent', WINDOW, new DiscordRateLimits())).resolves.toEqual([]);
+  expect(requests).toEqual([]);
 });
 
-it('deletes an untracked page left behind when a retried page is dropped with its old parent', async () => {
-  const requests: string[] = [];
-  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    requests.push(`${init?.method} ${String(input).replace('https://discord.com/api/v10', '')}`);
-    if (init?.method === 'GET') return Response.json([reply('orphan', 'old-parent'), reply('kept', 'old-parent')]);
-    if (String(input).endsWith('/kept')) return Response.json({ code: 50013 }, { status: 403 });
+it('deletes an untracked page left behind when its parent is no longer shown', async () => {
+  const orphan = idAt(WINDOW.from, 1);
+  const kept = idAt(WINDOW.from, 2);
+  const requests = stubDiscord((method, path) => {
+    if (method === 'GET') return Response.json([reply(orphan, 'old-parent'), reply(kept, 'old-parent')]);
+    if (path.endsWith(`/${kept}`)) return Response.json({ code: 50013 }, { status: 403 });
     return new Response(null, { status: 204 });
-  }));
+  });
   const result = await syncRosterMessages(TOKEN, [
     // Still tracked (its delete keeps failing), so it must not be swept.
-    { channelId: 'chan', parentMessageId: 'old-parent', page: 1, messageId: 'kept', deleteAttempts: 1 },
-  ], [], new DiscordRateLimits(), [
-    { channelId: 'chan', parentMessageId: 'old-parent', page: 0, attempts: 0, nonceKey: 'roster:old-parent:0:x' },
-  ]);
+    { channelId: 'chan', parentMessageId: 'old-parent', page: 1, messageId: kept, deleteAttempts: 1 },
+  ], [], new DiscordRateLimits(), [dropped()]);
   expect(result.postAttempts).toEqual([]);
-  expect(result.messages.map((ref) => ref.messageId)).toEqual(['kept']);
-  expect(requests).toContain('GET /channels/chan/messages?after=old-parent&limit=50');
-  expect(requests).toContain('DELETE /channels/chan/messages/orphan');
+  expect(result.messages.map((ref) => ref.messageId)).toEqual([kept]);
   expect(requests.filter((request) => request.startsWith('DELETE'))).toEqual([
-    'DELETE /channels/chan/messages/kept', 'DELETE /channels/chan/messages/orphan',
+    `DELETE /channels/chan/messages/${kept}`, `DELETE /channels/chan/messages/${orphan}`,
   ]);
 });
 
-it('does not sweep for a dropped page that never reached Discord', async () => {
-  const fetchMock = vi.fn();
-  vi.stubGlobal('fetch', fetchMock);
-  await syncRosterMessages(TOKEN, [], [], new DiscordRateLimits(), [
-    { channelId: 'chan', parentMessageId: 'old-parent', page: 0, attempts: 1 },
+it('never sweeps a parent that is still shown, keeping the uncertain page marker', async () => {
+  const requests = stubDiscord(() => new Response(null, { status: 204 }));
+  const parentPage = { embeds: [{ title: 'Synthetic page 0' }] };
+  const result = await syncRosterMessages(TOKEN, [
+    { channelId: 'chan', parentMessageId: 'old-parent', page: 0, messageId: 'p0',
+      onlineEmbed: JSON.stringify(parentPage.embeds[0]) },
+  ], [{ channelId: 'chan', parentMessageId: 'old-parent', ...parentPage }], new DiscordRateLimits(), [dropped({ page: 1 })]);
+  expect(requests).toEqual([]);
+  expect(result.postAttempts).toEqual([dropped({ page: 1 })]);
+});
+
+it('does not sweep for a dropped page that certainly never reached Discord', async () => {
+  const requests = stubDiscord(() => Response.json([]));
+  const result = await syncRosterMessages(TOKEN, [], [], new DiscordRateLimits(), [
+    dropped({ maybePostedFrom: undefined, maybePostedTo: undefined, attempts: 1 }),
   ]);
-  expect(fetchMock).not.toHaveBeenCalled();
+  expect(requests).toEqual([]);
+  expect(result.postAttempts).toEqual([]);
+});
+
+it.each([
+  { status: 503, kept: true },
+  { status: 403, kept: false },
+])('keeps sweeping after a transient failure but gives up on a 4xx (%j)', async ({ status, kept }) => {
+  stubDiscord(() => Response.json({ code: 0 }, { status }));
+  const result = await syncRosterMessages(TOKEN, [], [], new DiscordRateLimits(), [dropped()]);
+  expect(result.postAttempts).toEqual(kept ? [dropped()] : []);
+});
+
+it('records when a post may have landed unseen, but not for a definite rejection', async () => {
+  const target = { channelId: 'chan', parentMessageId: 'parent', embeds: [{ title: 'Synthetic page 0' }] };
+  stubDiscord(() => Response.json({ code: 0 }, { status: 502 }));
+  let result = await syncRosterMessages(TOKEN, [], [target], new DiscordRateLimits());
+  expect(result.postAttempts[0]).toMatchObject({ maybePostedFrom: NOW, maybePostedTo: NOW });
+  stubDiscord(() => Response.json({ code: 50013 }, { status: 403 }));
+  result = await syncRosterMessages(TOKEN, [], [target], new DiscordRateLimits());
+  expect(result.postAttempts[0]?.maybePostedFrom).toBeUndefined();
 });

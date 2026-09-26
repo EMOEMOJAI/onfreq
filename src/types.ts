@@ -133,6 +133,13 @@ export interface RosterPostAttempt {
    */
   nonceKey?: string;
   /**
+   * Epoch ms of the first and latest post attempts that may have landed
+   * unseen (a 5xx, a timeout, or a 2xx without an id). Once the parent is no
+   * longer shown, its replies from that window are swept for an untracked copy.
+   */
+  maybePostedFrom?: number;
+  maybePostedTo?: number;
+  /**
    * Permanently gave up, or Discord accepted the post without returning its
    * id: never posted again while this parent target lives.
    */
@@ -158,8 +165,14 @@ export interface TrackedAtc extends OnlineAtc {
   messages?: PostedMessage[];
   /** Online destinations still awaiting their first successful card. */
   pendingChannelIds?: string[];
-  /** Failed initial-card attempts per pending destination; rate-limit deferrals don't count. */
+  /** Failed initial-card attempts per pending destination (4xx only, via `countsAgainstBudget`). */
   onlineAttemptsByChannel?: Record<string, number>;
+  /**
+   * Channels whose first-card POST may have landed without the bot learning
+   * its id (a 5xx, a timeout, or a 2xx without an id) and that have no
+   * tracked card yet. At close the card is recovered and closed out.
+   */
+  uncertainChannelIds?: string[];
   /**
    * Connected, but the feed has not published a frequency yet (0.000 MHz).
    * Tracked so the start time is right, but not announced and never given
@@ -188,6 +201,12 @@ export interface PendingOffline {
   event: OfflineEvent;
   messages: PostedMessage[];
   channelIds: string[];
+  /**
+   * Channels whose first ONLINE card may exist unseen. The card is re-posted
+   * with its original nonce, so Discord returns the hidden one, and then
+   * closed like any other card.
+   */
+  recoverChannelIds?: string[];
   /** Legacy shared counter, imported when a destination next needs retrying. */
   attempts?: number;
   /** Failed delivery polls per destination; cooldown waits do not count. */

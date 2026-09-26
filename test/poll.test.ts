@@ -49,6 +49,10 @@ let cards: Map<string, DiscordEmbed>;
 let failures: Set<string>;
 /** POSTs matching these channel ids (or 'POST') succeed without returning a message id. */
 let unconfirmed: Set<string>;
+/** POSTs matching these channel ids (or 'POST') create their message but report a 503. */
+let hidden: Set<string>;
+/** Discord returns the existing message for a repeated nonce in a channel. */
+let nonces: Map<string, string>;
 let failureStatus: number;
 let feedStatus: number;
 let profileStatus: number;
@@ -107,6 +111,8 @@ beforeEach(() => {
   cards = new Map();
   failures = new Set();
   unconfirmed = new Set();
+  hidden = new Set();
+  nonces = new Map();
   failureStatus = 400;
   feedStatus = 200;
   profileStatus = 200;
@@ -159,11 +165,17 @@ beforeEach(() => {
           item.fields?.some((field) => field.value.length > 1024))) {
         return Response.json({ message: 'Invalid Form Body: embed limits exceeded' }, { status: 400 });
       }
+      const nonceKey = payload.nonce && `${channelId}:${payload.nonce}`;
+      if (method === 'POST' && nonceKey && nonces.has(nonceKey)) return Response.json({ id: nonces.get(nonceKey) });
       if (failures.has(channelId) || failures.has(method === 'POST' ? 'POST' : id)) {
         return new Response('test delivery failure', { status: failureStatus });
       }
-      if (method === 'POST' && (unconfirmed.has('POST') || unconfirmed.has(channelId))) return Response.json({});
+      if (method === 'POST' && nonceKey) nonces.set(nonceKey, id);
       cards.set(id, embed);
+      if (method === 'POST' && (hidden.has('POST') || hidden.has(channelId))) {
+        return new Response('test hidden success', { status: 503 });
+      }
+      if (method === 'POST' && (unconfirmed.has('POST') || unconfirmed.has(channelId))) return Response.json({});
       return Response.json({ id });
     }
     throw new Error(`Unexpected network request: ${url}`);
@@ -1011,6 +1023,40 @@ describe('polling through the Durable Object', () => {
     expect(sent.map((message) => message.method)).toEqual(['POST', 'PATCH']);
     await nextPoll();
     expect(sent).toHaveLength(2);
+  });
+
+  it.each(['hidden', 'unconfirmed'] as const)(
+    'recovers and closes a first ONLINE card that landed unseen (%s) when the session ends before a retry',
+    async (kind) => {
+      await seed({});
+      feed = [entry(a)];
+      (kind === 'hidden' ? hidden : unconfirmed).add('POST');
+      await poll();
+      hidden.clear();
+      unconfirmed.clear();
+      const card = sent.find((message) => message.method === 'POST')!;
+      expect(cards.get(card.id!)?.title).toContain('is now ONLINE');
+      feed = [];
+      for (let i = 0; i < 3; i++) await nextPoll();
+      // Re-posted with the original nonce, Discord hands back the same card,
+      // which is then closed like any other.
+      expect(cards.get(card.id!)?.title).toContain('is OFFLINE');
+      expect([...cards.values()].some((embed) => embed.title?.includes('is now ONLINE'))).toBe(false);
+      expect((await snapshot())?.pendingOffline).toBeUndefined();
+    },
+  );
+
+  it('does not try to recover a first card that Discord definitely rejected', async () => {
+    await seed({});
+    feed = [entry(a)];
+    failures.add('POST');
+    failureStatus = 403;
+    await poll();
+    failures.clear();
+    feed = [];
+    const before = sent.length;
+    for (let i = 0; i < 3; i++) await nextPoll();
+    expect(sent.slice(before).filter((message) => message.method === 'POST')).toHaveLength(0);
   });
 
   it('does not retry an ONLINE card that Discord accepted without returning its id', async () => {

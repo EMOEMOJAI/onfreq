@@ -3,7 +3,7 @@ import {
   type DiscordEmbed,
 } from './discord';
 import { countsAgainstBudget, type RosterMessage, type RosterPostAttempt } from './types';
-import type { DiscordRateLimits } from './discord-rate-limit';
+import { DiscordRateLimitError, type DiscordRateLimits } from './discord-rate-limit';
 
 export interface RosterTarget {
   channelId: string;
@@ -14,6 +14,20 @@ export interface RosterTarget {
 
 /** Extra polls an undeletable or permanently failing roster page is retried for before it is given up on. */
 const DELETE_RETRY_POLLS = 10;
+
+/** A failed POST that may still have created its message (a 5xx, a timeout, or a 2xx without an id). */
+function mayHavePosted(err: unknown): boolean {
+  return err instanceof DiscordUnconfirmedPostError ||
+    (!(err instanceof DiscordRateLimitError) && !countsAgainstBudget(err));
+}
+
+function markMaybePosted(entry: RosterPostAttempt, previous: RosterPostAttempt | undefined, err: unknown): RosterPostAttempt {
+  const window = previous?.maybePostedFrom === undefined ? {} :
+    { maybePostedFrom: previous.maybePostedFrom, maybePostedTo: previous.maybePostedTo };
+  if (!mayHavePosted(err)) return { ...entry, ...window };
+  const now = Date.now();
+  return { ...entry, maybePostedFrom: previous?.maybePostedFrom ?? now, maybePostedTo: now };
+}
 
 function attemptKey(channelId: string, parentMessageId: string, page: number): string {
   return `${channelId}:${parentMessageId}:${page}`;
@@ -104,16 +118,20 @@ export async function syncRosterMessages(
         }
         // This page has never once posted successfully: give it the
         // same budget via the sibling attempt map instead.
-        const used = (postAttemptsByKey.get(key)?.attempts ?? 0) + (counts ? 1 : 0);
-        const entry = { channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: used };
+        const previousAttempt = postAttemptsByKey.get(key);
+        const used = (previousAttempt?.attempts ?? 0) + (counts ? 1 : 0);
+        const entry = markMaybePosted(
+          { channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: used, nonceKey },
+          previousAttempt, err,
+        );
         if (!counts || used <= DELETE_RETRY_POLLS) {
-          postAttemptsByKey.set(key, { ...entry, nonceKey });
+          postAttemptsByKey.set(key, entry);
           return;
         }
         console.error(JSON.stringify({
           event: 'roster_page_abandoned', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
         }));
-        postAttemptsByKey.set(key, { ...entry, nonceKey, abandoned: true });
+        postAttemptsByKey.set(key, { ...entry, abandoned: true });
       };
       // Every fresh post gets its own nonce key, kept across its retries: a
       // re-post after a gone copy, or after the roster shrank and grew again,
@@ -152,9 +170,9 @@ export async function syncRosterMessages(
           console.error(JSON.stringify({
             event: 'roster_post_unconfirmed', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
           }));
-          postAttemptsByKey.set(key, {
+          postAttemptsByKey.set(key, markMaybePosted({
             channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: 0, nonceKey, abandoned: true,
-          });
+          }, postAttemptsByKey.get(key), err));
           continue;
         }
         logFailure('post', target.channelId, target.parentMessageId, err);
@@ -163,31 +181,41 @@ export async function syncRosterMessages(
     }
   }
 
-  // Only keep counters/markers for pages still targeted this poll; if the
-  // roster shrank or the host moved/ended, there is nothing left to freeze
-  // or retry against.
-  // A target whose parent edit failed this poll has unknown pages: keep all
-  // of its entries, as its existing continuations are kept above.
+  // Keep counters and markers while their parent is still shown. A page
+  // beyond a shrunk roster is dropped unless it may exist unseen: that one
+  // waits for its parent to go, because a sweep cannot tell which page an
+  // untracked reply belongs to while the parent's other pages are live.
   const postAttempts: RosterPostAttempt[] = [];
-  const orphanParents = new Map<string, { channelId: string; parentMessageId: string }>();
+  const orphans = new Map<string, RosterPostAttempt[]>();
   for (const entry of postAttemptsByKey.values()) {
-    const live = targets.some((target) =>
-      target.channelId === entry.channelId && target.parentMessageId === entry.parentMessageId &&
-      (target.embeds === undefined || entry.page < target.embeds.length));
-    if (live) postAttempts.push(entry);
-    // A dropped page that was ever posted may exist without its id being
-    // known (a 5xx hid the success, or Discord omitted the id).
-    else if (entry.nonceKey) orphanParents.set(`${entry.channelId}:${entry.parentMessageId}`, entry);
+    const target = targets.find((item) =>
+      item.channelId === entry.channelId && item.parentMessageId === entry.parentMessageId);
+    if (target) {
+      if (target.embeds === undefined || entry.page < target.embeds.length || entry.maybePostedFrom !== undefined) {
+        postAttempts.push(entry);
+      }
+    } else if (entry.maybePostedFrom !== undefined) {
+      const group = `${entry.channelId}:${entry.parentMessageId}`;
+      orphans.set(group, [...(orphans.get(group) ?? []), entry]);
+    }
   }
-  // Best effort: remove this bot's untracked replies to those parents once.
+  // Remove this bot's untracked replies to parents no longer shown. A
+  // transient failure keeps the markers for the next poll; a 4xx (such as a
+  // missing Read Message History permission) gives up.
   const tracked = new Set(messages.map((ref) => ref.messageId));
-  for (const { channelId, parentMessageId } of orphanParents.values()) {
+  for (const entries of orphans.values()) {
+    const { channelId, parentMessageId } = entries[0]!;
+    const window = {
+      from: Math.min(...entries.map((entry) => entry.maybePostedFrom!)),
+      to: Math.max(...entries.map((entry) => entry.maybePostedTo ?? entry.maybePostedFrom!)),
+    };
     try {
-      for (const id of await findBotReplies(botToken, channelId, parentMessageId, limits)) {
+      for (const id of await findBotReplies(botToken, channelId, parentMessageId, window, limits)) {
         if (!tracked.has(id)) await deleteMessage(botToken, channelId, id, limits);
       }
     } catch (err) {
       console.error(JSON.stringify({ event: 'roster_orphan_sweep_failed', channelId, parentMessageId, error: String(err) }));
+      if (!countsAgainstBudget(err)) postAttempts.push(...entries);
     }
   }
   return { messages, postAttempts, failed };
