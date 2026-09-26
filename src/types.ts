@@ -169,9 +169,9 @@ export interface TrackedAtc extends OnlineAtc {
   onlineAttemptsByChannel?: Record<string, number>;
   /**
    * Channels whose first-card POST may have landed without the bot learning
-   * its id (a 5xx, a timeout, or a 2xx without an id) and that have no
-   * tracked card yet, with when those attempts happened. At close the card is
-   * looked up in that window and closed out.
+   * its id (a 5xx, a timeout, or a 2xx without an id), with when those
+   * attempts happened. Kept after a later card posts, since an earlier copy
+   * may exist too. At close, copies in that window are looked up and closed.
    */
   uncertainPosts?: Record<string, PostWindow>;
   /**
@@ -197,13 +197,13 @@ export interface OfflineEvent extends TrackedAtc {
   durationSeconds: number;
 }
 
-/** Ended sessions retry independently of any replacement at the same callsign. */
 /** Epoch ms of the first and latest attempts in a series of uncertain posts. */
 export interface PostWindow {
   from: number;
   to: number;
 }
 
+/** Ended sessions retry independently of any replacement at the same callsign. */
 export interface PendingOffline {
   event: OfflineEvent;
   messages: PostedMessage[];

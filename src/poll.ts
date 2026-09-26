@@ -194,7 +194,7 @@ async function syncOnlineCards(
 
 /** Close only unresolved destinations; successful deliveries are never repeated. */
 async function announceOffline(
-  env: Env, job: PendingOffline, labels: FirLabel[], limits: DiscordRateLimits,
+  env: Env, job: PendingOffline, labels: FirLabel[], limits: DiscordRateLimits, trackedIds: Set<string>,
 ): Promise<{ delivered: number; failed: boolean }> {
   const endedEmbed = buildSessionEndedEmbed(job.event, labels);
   const fallbackEmbed = buildOfflineEmbed(job.event, labels);
@@ -236,18 +236,26 @@ async function announceOffline(
   // only when none is found re-post with the original nonce (which returns
   // the hidden card within Discord's nonce window, or else a new one).
   const recovering: Record<string, PostWindow> = {};
-  const onlineTitle = `${escapeMarkdown(job.event.callsign)} is now ONLINE`;
+  // The exact title ending, so a card for XEGLL_TWR never matches EGLL_TWR;
+  // cards tracked for any session (such as a later one of this callsign)
+  // are never touched.
+  const onlineTitle = ` ${escapeMarkdown(job.event.callsign)} is now ONLINE`;
   for (const [channelId, window] of Object.entries(job.recoverPosts ?? {})) {
     try {
       let found: string[] = [];
       try {
         found = await findBotMessages(env.DISCORD_BOT_TOKEN, channelId, window, limits,
-          (message) => !message.message_reference && !!message.embeds?.[0]?.title?.includes(onlineTitle));
+          (message) => !message.message_reference && !trackedIds.has(message.id) &&
+            !!message.embeds?.[0]?.title?.endsWith(onlineTitle) &&
+            // Every first card carries its session's start time.
+            Date.parse(message.embeds[0].timestamp ?? '') === Date.parse(job.event.since));
       } catch (err) {
         // Without message history access, fall back to the re-post below.
         if (!countsAgainstBudget(err)) throw err;
       }
-      if (!found.length) {
+      // A channel whose card is already tracked only needs stray copies closed.
+      const hasCard = job.messages.some((ref) => ref.channelId === channelId);
+      if (!found.length && !hasCard) {
         found = [await postMessage(env.DISCORD_BOT_TOKEN, channelId,
           buildOnlineEmbed(job.event, undefined, labels), undefined, undefined, limits, onlineNonce(job.event, channelId))];
       }
@@ -464,17 +472,20 @@ export async function runPoll(
     } = offline;
     // A session with no card and no pending marker is legacy: announce the
     // end everywhere. Channels whose first card may exist unseen recover it.
-    const recoverPosts = Object.fromEntries(Object.entries(uncertainPosts).filter(([id]) =>
-      channelIds.includes(id) && !messages.some((ref) => ref.channelId === id)));
+    const recoverPosts = Object.fromEntries(Object.entries(uncertainPosts).filter(([id]) => channelIds.includes(id)));
     jobs.push({
       event, messages, channelIds: messages.length || pendingIds ? [] : [...channelIds],
       ...(Object.keys(recoverPosts).length ? { recoverPosts } : {}),
     });
   }
   const pendingOffline: PendingOffline[] = [];
+  const trackedIds = new Set([
+    ...Object.values(next).flatMap((session) => (session.messages ?? []).map((ref) => ref.messageId)),
+    ...jobs.flatMap((job) => job.messages.map((ref) => ref.messageId)),
+  ]);
   for (const job of jobs) {
     attempted += job.messages.length + job.channelIds.length + Object.keys(job.recoverPosts ?? {}).length;
-    const result = await announceOffline(env, job, labels, limits);
+    const result = await announceOffline(env, job, labels, limits, trackedIds);
     delivered += result.delivered;
     deliveryFailed ||= result.failed;
     if (job.messages.length || job.channelIds.length || Object.keys(job.recoverPosts ?? {}).length) pendingOffline.push(job);
@@ -526,7 +537,9 @@ export async function runPoll(
       uncertain[id] = { from: uncertain[id]?.from ?? now, to: now };
     };
     for (const id of targets) {
-      if (posted.some((ref) => ref.channelId === id)) { delete uncertain[id]; continue; }
+      // A card that finally posted keeps any uncertain window: an earlier
+      // copy outside Discord's nonce window is still found and closed at the end.
+      if (posted.some((ref) => ref.channelId === id)) continue;
       // A 2xx-but-unconfirmed destination is dropped outright, same as
       // one that just exhausted its budget below — never retried, and never
       // given a counter; its card exists, so it is closed out at the end.

@@ -504,7 +504,7 @@ export interface FetchedMessage {
   id: string;
   author?: { id?: unknown };
   message_reference?: { message_id?: unknown };
-  embeds?: { title?: string }[];
+  embeds?: { title?: string; timestamp?: string }[];
 }
 
 /**
@@ -530,6 +530,8 @@ export async function findBotMessages(
     for (const item of list as Partial<FetchedMessage>[]) {
       if (typeof item?.id !== 'string' || !/^\d+$/.test(item.id)) continue;
       if (BigInt(item.id) > BigInt(newest)) newest = item.id;
+      const at = snowflakeTime(item.id);
+      if (at < window.from - 60_000 || at > window.to + 60_000) continue;
       if (item.author?.id === botId && match(item as FetchedMessage)) found.push(item.id);
     }
     if (list.length < 100 || newest === after || snowflakeTime(newest) > window.to + 60_000) break;

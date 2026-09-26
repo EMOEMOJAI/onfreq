@@ -1048,12 +1048,23 @@ describe('polling through the Durable Object', () => {
 
   it('finds and closes an unseen first card from its post window instead of re-posting it', async () => {
     const botId = '100000000000000009';
-    const hiddenId = ((BigInt(START - 1_420_070_400_000) << 22n) + 1n).toString();
+    const snowflake = (ms: number) => ((BigInt(ms - 1_420_070_400_000) << 22n) + 1n).toString();
+    const hiddenId = snowflake(START);
     const original = network.getMockImplementation()!;
     network.mockImplementation(async (input, init) => {
       const url = String(input);
       if ((init?.method ?? 'GET') === 'GET' && url.includes('/channels/test-channel/messages?after=')) {
-        return Response.json([{ id: hiddenId, author: { id: botId }, embeds: [{ title: `🟢 ${a} is now ONLINE` }] }]);
+        const card = (id: string, title: string, at: number) =>
+          ({ id, author: { id: botId }, embeds: [{ title, timestamp: new Date(at).toISOString() }] });
+        return Response.json([
+          card(hiddenId, `🟢 ${a} is now ONLINE`, START),
+          // Another station whose callsign ends the same way, started at the same poll.
+          card(snowflake(START + 30_000), `🟢 X${a} is now ONLINE`, START),
+          // A later session of this callsign, inside the scan but not this session.
+          card(snowflake(START + 50_000), `🟢 ${a} is now ONLINE`, START + 50_000),
+          // This session's title and start, but created long after its attempts.
+          card(snowflake(START + 600_000), `🟢 ${a} is now ONLINE`, START),
+        ]);
       }
       if (init?.method === 'PATCH' && url.endsWith(`/messages/${hiddenId}`)) {
         const embed = (JSON.parse(String(init.body)) as { embeds: DiscordEmbed[] }).embeds[0]!;
@@ -1078,8 +1089,52 @@ describe('polling through the Durable Object', () => {
     }
     expect(sent.filter((message) => message.method === 'PATCH' && message.id === hiddenId).at(-1)?.embed.title)
       .toContain('is OFFLINE');
+    // Only this session's hidden card is touched.
+    expect(sent.filter((message) => message.method === 'PATCH').map((message) => message.id)).toEqual([hiddenId]);
     expect(sent.filter((message) => message.method === 'POST')).toHaveLength(1);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('still closes an earlier unseen copy when a later retry posted a second card', async () => {
+    const botId = '100000000000000009';
+    const hiddenId = ((BigInt(START - 1_420_070_400_000) << 22n) + 1n).toString();
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if ((init?.method ?? 'GET') === 'GET' && url.includes('/channels/test-channel/messages?after=')) {
+        return Response.json([{ id: hiddenId, author: { id: botId },
+          embeds: [{ title: `🟢 ${a} is now ONLINE`, timestamp: new Date(START).toISOString() }] }]);
+      }
+      if (init?.method === 'PATCH' && url.endsWith(`/messages/${hiddenId}`)) {
+        const embed = (JSON.parse(String(init.body)) as { embeds: DiscordEmbed[] }).embeds[0]!;
+        sent.push({ channelId: 'test-channel', method: 'PATCH', id: hiddenId, embed });
+        return Response.json({ id: hiddenId });
+      }
+      return original(input, init);
+    });
+    const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
+      ...env, DISCORD_BOT_TOKEN: `${btoa(botId)}.synthetic.token`,
+    }).poll().catch(() => undefined));
+    await seed({});
+    feed = [entry(a)];
+    failures.add('POST');
+    failureStatus = 503;
+    await run();
+    failures.clear();
+    now += 60_000;
+    await run();
+    const tracked = sent.filter((message) => message.method === 'POST').at(-1)!;
+    expect(cards.get(tracked.id!)?.title).toContain('is now ONLINE');
+    feed = [];
+    for (let i = 0; i < 3; i++) {
+      now += 60_000;
+      await run();
+    }
+    expect(cards.get(tracked.id!)?.title).toContain('is OFFLINE');
+    expect(sent.filter((message) => message.method === 'PATCH' && message.id === hiddenId).at(-1)?.embed.title)
+      .toContain('is OFFLINE');
+    // The tracked card is not re-posted by recovery.
+    expect(sent.filter((message) => message.method === 'POST')).toHaveLength(2);
   });
 
   it('does not try to recover a first card that Discord definitely rejected', async () => {
