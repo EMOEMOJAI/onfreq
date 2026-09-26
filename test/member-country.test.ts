@@ -97,8 +97,8 @@ describe('member profile country enrichment', () => {
     expect(network).toHaveBeenCalledTimes(2);
   });
 
-  it('stops the rest of the batch after a 401/403/429, but not after a 404/500', async () => {
-    for (const status of [401, 403, 429]) {
+  it('stops the rest of the batch after a 401/403/429/5xx, but not after a 404', async () => {
+    for (const status of [401, 403, 429, 500]) {
       values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
       network.mockClear();
       network.mockImplementation(async () => new Response(null, { status }));
@@ -106,7 +106,7 @@ describe('member profile country enrichment', () => {
       await enrichMemberCountries(current, {}, auth);
       expect(network).toHaveBeenCalledTimes(1);
     }
-    for (const status of [404, 500]) {
+    for (const status of [404]) {
       values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
       network.mockClear();
       network.mockImplementation(async () => new Response(null, { status }));
@@ -114,6 +114,59 @@ describe('member profile country enrichment', () => {
       await enrichMemberCountries(current, {}, auth);
       expect(network).toHaveBeenCalledTimes(3);
     }
+  });
+
+  it('stops the rest of the batch after a thrown fetch error (timeout/network)', async () => {
+    network.mockImplementation(async () => { throw new Error('upstream request timed out'); });
+    const current = Array.from({ length: 3 }, (_, i) => controller(500 + i, `QCTT_${i}_APP`));
+    await expect(enrichMemberCountries(current, {}, auth)).resolves.toBeUndefined();
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives ids skipped by a stopped run a short backoff instead of retrying them immediately', async () => {
+    network.mockImplementation(async () => new Response(null, { status: 401 }));
+    const current = Array.from({ length: 3 }, (_, i) => controller(600 + i, `QCTT_${i}_GND`));
+    await enrichMemberCountries(current, {}, auth);
+    expect(network).toHaveBeenCalledTimes(1);
+    const skipped = current.slice(1);
+    expect(skipped.every((atc) => (atc.memberCountry?.countryId ?? null) === null)).toBe(true);
+
+    // Immediately after, the skipped ids must not be retried again: their
+    // in-memory backoff keeps them out of the next lookup batch.
+    network.mockClear();
+    values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+    network.mockImplementation(async () => Response.json({ countryId: 'ca' }));
+    const state: StateMap = Object.fromEntries(current.map((atc) => [atc.callsign, {
+      ...atc, since: new Date(NOW).toISOString(), missed: 0,
+    }]));
+    await enrichMemberCountries(current, state, auth);
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it('does not reset the shared token on a profile 401 when the token was freshly minted this run', async () => {
+    values.delete(TOKEN_KEY);
+    const tokenNetwork = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('token')) return Response.json({ access_token: 'brand-new', expires_in: 1800 });
+      return new Response(null, { status: 401 });
+    });
+    vi.stubGlobal('fetch', tokenNetwork);
+    await enrichMemberCountries([controller()], {}, auth);
+    expect(auth.kv.delete).not.toHaveBeenCalledWith(TOKEN_KEY);
+  });
+
+  it('stops the batch within an overall lookup deadline even if no request itself has failed', async () => {
+    let clock = NOW;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    network.mockImplementation(async () => {
+      // Advance the clock past the deadline after the first lookup so the
+      // remaining ids are skipped without any of them individually failing.
+      clock += 11_000;
+      return Response.json({ countryId: 'ca' });
+    });
+    const current = Array.from({ length: 3 }, (_, i) => controller(700 + i, `QCTT_${i}_DEL`));
+    await enrichMemberCountries(current, {}, auth);
+    expect(network).toHaveBeenCalledTimes(1);
   });
 
   it('resets the cached IVAO token (memory and KV) on a profile 401, but not on other statuses', async () => {

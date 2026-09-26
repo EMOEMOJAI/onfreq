@@ -1,12 +1,19 @@
 import { TOKEN_KEY } from './config';
 import { fetchBuffered } from './http';
-import { getAccessToken, hasFrequency, resetTokenCache } from './ivao';
+import { getAccessToken, hasFrequency, resetTokenCache, tokenMintedAfter } from './ivao';
 import type { IvaoAuth, MemberCountry, OnlineAtc, StateMap } from './types';
 
 const COUNTRY_TTL_MS = 24 * 60 * 60 * 1000;
 const RETRY_MS = 15 * 60 * 1000;
+/** A short in-memory/snapshot-consistent backoff for ids that were skipped
+ * entirely (never attempted) because an earlier id in the same batch stopped
+ * the run — avoids hammering the same blocked-looking id every poll. */
+const SKIP_BACKOFF_MS = 60 * 1000;
 // Bound optional enrichment work even when many controllers connect at once.
 const MAX_LOOKUPS_PER_POLL = 5;
+/** Never let this batch's profile lookups run past this wall-clock budget,
+ * even if every individual request is within its own timeout. */
+const LOOKUP_DEADLINE_MS = 10_000;
 /** A profile request failing with one of these means the whole batch is
  * currently blocked (bad/rejected auth, or already rate-limited) — further
  * lookups in the same run would just fail the same way. */
@@ -38,11 +45,15 @@ export async function enrichMemberCountries(
     .sort((a, b) => (cached.get(a)?.expiresAt ?? 0) - (cached.get(b)?.expiresAt ?? 0))
     .slice(0, MAX_LOOKUPS_PER_POLL);
   let token: Promise<string> | undefined;
-  // Sequential, not Promise.all: a 401/403/429 means the rest of this batch
-  // would fail the same way, so later ids in the list are skipped entirely.
+  // Sequential, not Promise.all: a 401/403/429/5xx or a thrown fetch error
+  // means the rest of this batch would fail the same way, so later ids in
+  // the list are skipped entirely.
   let stopRun = false;
+  const attempted = new Set<number>();
+  const start = now;
   for (const id of ids) {
-    if (stopRun) break;
+    if (stopRun || Date.now() - start >= LOOKUP_DEADLINE_MS) break;
+    attempted.add(id);
     const key = `ivao-member-country-v1:${id}`;
     let value: MemberCountry;
     let persist = true;
@@ -53,14 +64,25 @@ export async function enrichMemberCountries(
         continue;
       }
       token ??= getAccessToken(auth);
-      const res = await fetchBuffered(`https://api.ivao.aero/v2/users/${id}`, {
-        headers: { accept: 'application/json', authorization: `Bearer ${await token}` },
-      });
+      let res: Response;
+      try {
+        res = await fetchBuffered(`https://api.ivao.aero/v2/users/${id}`, {
+          headers: { accept: 'application/json', authorization: `Bearer ${await token}` },
+        });
+      } catch (err) {
+        // A thrown fetch error (timeout, network failure) means this batch's
+        // auth/network path is currently broken; further ids would just fail
+        // the same way.
+        stopRun = true;
+        throw err;
+      }
       if (!res.ok) {
-        if (res.status === 401) {
+        if (res.status === 401 && !tokenMintedAfter(now)) {
           // The cached token was rejected; reset it like the tracker feed
           // does, so the next lookup or poll mints a fresh one instead of
-          // failing the same way for up to ~28 more minutes.
+          // failing the same way for up to ~28 more minutes. Skip this when
+          // the token in hand was minted during this very run — a brand new
+          // token being rejected is not "this cached token is stale".
           resetTokenCache();
           try {
             await auth.kv.delete(TOKEN_KEY);
@@ -68,7 +90,7 @@ export async function enrichMemberCountries(
             console.warn(JSON.stringify({ event: 'ivao_token_delete_failed', error: String(err) }));
           }
         }
-        if (STOP_RUN_STATUSES.has(res.status)) stopRun = true;
+        if (STOP_RUN_STATUSES.has(res.status) || res.status >= 500) stopRun = true;
         throw new Error(`IVAO profile request failed with ${res.status}`);
       }
       const body = await res.json() as { countryId?: unknown } | null;
@@ -94,6 +116,13 @@ export async function enrichMemberCountries(
         console.warn(JSON.stringify({ event: 'member_country_cache_failed', userId: id }));
       }
     }
+  }
+  // Ids that were never attempted (stopRun broke the loop before reaching
+  // them) get a short backoff instead of being retried again next poll.
+  for (const id of ids) {
+    if (attempted.has(id)) continue;
+    const prior = cached.get(id);
+    cached.set(id, { countryId: prior?.countryId ?? null, expiresAt: now + SKIP_BACKOFF_MS });
   }
   for (const atc of current) atc.memberCountry = cached.get(atc.userId) ?? null;
 }

@@ -190,7 +190,34 @@ describe('getAccessToken', () => {
     const kv = fakeKv();
     await getAccessToken(auth(kv));
     const cached = JSON.parse(kv.store.get('ivao-token-v1') ?? '{}');
-    expect(cached.expiresAt).toBe(Date.now() + 60_000 - 120_000);
+    // Minimum TTL sits above the safety margin, so the cached expiry always
+    // lands in the future relative to when the token was minted.
+    expect(cached.expiresAt).toBe(Date.now() + 180_000 - 120_000);
+  });
+
+  it.each([
+    { access_token: '' },
+    { access_token: 123 },
+    { access_token: 'has space' },
+    { access_token: 'has\ttab' },
+    {},
+  ])('rejects a malformed or missing access_token: %j', async (body) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ ...body, expires_in: 1800 })));
+    await expect(getAccessToken(auth(fakeKv()))).rejects.toThrow('no usable access_token');
+  });
+
+  it('accepts a well-formed access_token', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(tokenResponse('valid-token.123~ABC')));
+    await expect(getAccessToken(auth(fakeKv()))).resolves.toBe('valid-token.123~ABC');
+  });
+
+  it('always caches an expiry in the future relative to minting, even at the minimum TTL', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(tokenResponse('tok', 1)));
+    const kv = fakeKv();
+    const before = Date.now();
+    await getAccessToken(auth(kv));
+    const cached = JSON.parse(kv.store.get('ivao-token-v1') ?? '{}');
+    expect(cached.expiresAt).toBeGreaterThan(before);
   });
 
   it('ignores a malformed cached KV entry and mints a fresh token instead of trusting it', async () => {
@@ -344,6 +371,13 @@ describe('fetchDivisionAtc', () => {
 
   it('skips malformed entries and logs only a count, coercing a numeric frequency string', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Padded with well-formed entries outside the QC prefix so malformed
+    // entries stay a minority of the feed (otherwise this is a feed-outage,
+    // covered separately below).
+    const filler = Array.from({ length: 4 }, (_, i) => rawEntry({
+      id: 1000 + i, userId: 1000 + i, callsign: `XA${i}_TWR`,
+      atcPosition: null,
+    }));
     const entries = [
       rawEntry({ callsign: 'QCTT_TWR' }),
       null,
@@ -351,6 +385,7 @@ describe('fetchDivisionAtc', () => {
       { ...rawEntry({ callsign: 'QCTT_APP' }), id: 'not-a-number' },
       { ...rawEntry({ callsign: 'QCTT_GND' }), atcSession: { frequency: 'not-a-number', position: 'GND' } },
       { ...rawEntry({ callsign: 'QCTT_DEL' }), atcSession: { frequency: '121.500', position: 'DEL' } },
+      ...filler,
     ];
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
 
@@ -360,6 +395,23 @@ describe('fetchDivisionAtc', () => {
     expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'ivao_entry_skipped', count: 4 }));
     // No entry content (callsigns, ids) ever reaches the log.
     expect(warn.mock.calls.every(([line]) => !String(line).includes('QCTT'))).toBe(true);
+  });
+
+  it('treats an all-malformed feed as an outage instead of a mass false offline', async () => {
+    const entries = [null, 'not an object', { id: 'nope' }, { atcSession: null }];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
+    await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('feed outage');
+  });
+
+  it('treats a majority-malformed feed as an outage instead of a mass false offline', async () => {
+    const entries = [
+      rawEntry({ callsign: 'QCTT_TWR' }),
+      null,
+      'not an object',
+      { id: 'nope' },
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
+    await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('feed outage');
   });
 
   it('caps runaway string lengths from the feed', async () => {

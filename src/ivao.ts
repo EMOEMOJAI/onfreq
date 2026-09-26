@@ -194,12 +194,19 @@ function dedupeByCallsign(entries: OnlineAtc[]): OnlineAtc[] {
 /** Refresh this long before the token actually expires. */
 const TOKEN_SAFETY_MARGIN_MS = 120_000;
 
-/** Keep expires_in within a sane window regardless of what the API reports. */
-const MIN_TOKEN_TTL_SECONDS = 60;
+/**
+ * Keep expires_in within a sane window regardless of what the API reports.
+ * The minimum must stay above TOKEN_SAFETY_MARGIN_MS, or a short-lived token
+ * would expire (by our own cached expiresAt) before it was even minted.
+ */
+const MIN_TOKEN_TTL_SECONDS = 180;
 const MAX_TOKEN_TTL_SECONDS = 86_400;
 
 /** Skip re-minting for a while after a failure, instead of retrying every call. */
 const TOKEN_FAIL_BACKOFF_MS = 60_000;
+
+/** access_token must be a non-empty run of printable ASCII (RFC 6750 b64token-ish). */
+const ACCESS_TOKEN_PATTERN = /^[\x21-\x7e]+$/;
 
 /**
  * Per-isolate cache, so warm invocations skip the KV read entirely. KV is the
@@ -210,10 +217,25 @@ let memoryToken: CachedToken | null = null;
 /** Epoch ms until which a fresh mint attempt is skipped after a recent failure. */
 let tokenFailedUntil = 0;
 
+/**
+ * Epoch ms of the most recently completed mint (a real IVAO_TOKEN_URL round
+ * trip, not a cache hit). Lets callers such as member-country lookups tell
+ * whether the token currently in hand was freshly minted during their own
+ * run, so a downstream 401 against a brand-new token isn't treated as "this
+ * cached token is stale" and reset again.
+ */
+let lastMintedAt = 0;
+
+/** True when a token was minted (not just cache-served) at or after `timestamp`. */
+export function tokenMintedAfter(timestamp: number): boolean {
+  return lastMintedAt >= timestamp;
+}
+
 /** Exposed for tests; production code never needs to reach for this. */
 export function resetTokenCache(): void {
   memoryToken = null;
   tokenFailedUntil = 0;
+  lastMintedAt = 0;
 }
 
 function isCachedToken(value: unknown): value is CachedToken {
@@ -271,8 +293,10 @@ export async function getAccessToken(
     // Deliberately not echoing the body: it carries the token on success.
     if (!res.ok) throw new Error(`IVAO token request failed with ${res.status}`);
 
-    const body = (await res.json()) as { access_token?: string; expires_in?: number };
-    if (!body.access_token) throw new Error('IVAO token response contained no access_token');
+    const body = (await res.json()) as { access_token?: unknown; expires_in?: number };
+    if (typeof body.access_token !== 'string' || !ACCESS_TOKEN_PATTERN.test(body.access_token)) {
+      throw new Error('IVAO token response contained no usable access_token');
+    }
 
     const ttlSeconds = clampTtlSeconds(body.expires_in);
     const entry: CachedToken = {
@@ -281,6 +305,7 @@ export async function getAccessToken(
     };
     memoryToken = entry;
     tokenFailedUntil = 0;
+    lastMintedAt = now;
     try {
       await auth.kv.put(TOKEN_KEY, JSON.stringify(entry), {
         expirationTtl: Math.floor(ttlSeconds),
@@ -372,6 +397,14 @@ export async function fetchDivisionAtc(
   }
   if (skipped > 0) {
     console.warn(JSON.stringify({ event: 'ivao_entry_skipped', count: skipped }));
+  }
+  // A feed format change can make every (or nearly every) entry fail
+  // validation instead of the request itself failing. Treat that the same as
+  // the zero-ATC check above: an outage, not a mass real disconnect.
+  if (sanitized.length === 0 || skipped > entries.length / 2) {
+    throw new Error(
+      `IVAO API entries mostly failed validation (${skipped}/${entries.length} skipped); treating as feed outage`,
+    );
   }
 
   return dedupeByCallsign(
