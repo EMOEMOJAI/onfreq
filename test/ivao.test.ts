@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  fetchDivisionAtc,
   getAccessToken,
   isDivisionCallsign,
   isExcludedCallsign,
@@ -183,6 +184,43 @@ describe('getAccessToken', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('nope', { status: 401 })));
     await expect(getAccessToken(auth(fakeKv()))).rejects.toThrow('IVAO token request failed');
   });
+
+  it('clamps an out-of-range expires_in to the safe window instead of trusting it verbatim', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(tokenResponse('tok', 10)));
+    const kv = fakeKv();
+    await getAccessToken(auth(kv));
+    const cached = JSON.parse(kv.store.get('ivao-token-v1') ?? '{}');
+    expect(cached.expiresAt).toBe(Date.now() + 60_000 - 120_000);
+  });
+
+  it('ignores a malformed cached KV entry and mints a fresh token instead of trusting it', async () => {
+    const kv = fakeKv();
+    kv.store.set('ivao-token-v1', JSON.stringify({ token: 42, expiresAt: 'soon' }));
+    const fetchMock = vi.fn().mockResolvedValue(tokenResponse('fresh'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(getAccessToken(auth(kv))).resolves.toBe('fresh');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('backs off from re-minting for a while after a failure, instead of retrying every call', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('nope', { status: 500 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const kv = fakeKv();
+
+    await expect(getAccessToken(auth(kv))).rejects.toThrow();
+    await expect(getAccessToken(auth(kv))).rejects.toThrow('backoff');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the minted token even if writing it to KV fails', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(tokenResponse('tok-1')));
+    const kv = fakeKv();
+    kv.put.mockRejectedValueOnce(new Error('KV unavailable'));
+
+    await expect(getAccessToken(auth(kv))).resolves.toBe('tok-1');
+    await expect(getAccessToken(auth(kv))).resolves.toBe('tok-1');
+  });
 });
 
 describe('ivaoAuthFromEnv', () => {
@@ -267,5 +305,153 @@ describe('normalizeAtc', () => {
     const normalized = normalizeAtc(entry);
     expect(normalized.station).toBeNull();
     expect(normalized.location).toBeNull();
+  });
+});
+
+describe('fetchDivisionAtc', () => {
+  function fakeKv(initial: Record<string, unknown> = {}) {
+    const store = new Map<string, string>(Object.entries(initial).map(([k, v]) => [k, JSON.stringify(v)]));
+    return {
+      store,
+      get: vi.fn(async (key: string) => {
+        const raw = store.get(key);
+        return raw ? JSON.parse(raw) : null;
+      }),
+      put: vi.fn(async (key: string, value: string) => void store.set(key, value)),
+      delete: vi.fn(async (key: string) => void store.delete(key)),
+    };
+  }
+
+  function auth(kv: ReturnType<typeof fakeKv>) {
+    return { clientId: 'id', clientSecret: 'secret', kv: kv as unknown as KVNamespace };
+  }
+
+  function rawEntry(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id: 1,
+      userId: 100,
+      callsign: 'QCTT_TWR',
+      connectionType: 'ATC',
+      atcSession: { frequency: 118.1, position: 'TWR' },
+      atcPosition: { atcCallsign: 'Example Tower', airport: { icao: 'QCTT', name: 'Example Airport', countryId: 'BR' } },
+      subcenter: null,
+      ...over,
+    };
+  }
+
+  beforeEach(() => resetTokenCache());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('skips malformed entries and logs only a count, coercing a numeric frequency string', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const entries = [
+      rawEntry({ callsign: 'QCTT_TWR' }),
+      null,
+      'not an object',
+      { ...rawEntry({ callsign: 'QCTT_APP' }), id: 'not-a-number' },
+      { ...rawEntry({ callsign: 'QCTT_GND' }), atcSession: { frequency: 'not-a-number', position: 'GND' } },
+      { ...rawEntry({ callsign: 'QCTT_DEL' }), atcSession: { frequency: '121.500', position: 'DEL' } },
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
+
+    const result = await fetchDivisionAtc(['QC']);
+    expect(result.map((atc) => atc.callsign).sort()).toEqual(['QCTT_DEL', 'QCTT_TWR']);
+    expect(result.find((atc) => atc.callsign === 'QCTT_DEL')?.frequency).toBe(121.5);
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'ivao_entry_skipped', count: 4 }));
+    // No entry content (callsigns, ids) ever reaches the log.
+    expect(warn.mock.calls.every(([line]) => !String(line).includes('QCTT'))).toBe(true);
+  });
+
+  it('caps runaway string lengths from the feed', async () => {
+    const longCallsign = `QCTT_${'A'.repeat(200)}_TWR`;
+    const entries = [rawEntry({ callsign: longCallsign })];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
+
+    const [atc] = await fetchDivisionAtc(['QC']);
+    expect(atc?.callsign.length).toBeLessThanOrEqual(32);
+  });
+
+  it('dedupes two sessions sharing a callsign, keeping the higher session id, and logs only a count', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const entries = [
+      rawEntry({ id: 1, userId: 100, callsign: 'QCTT_TWR' }),
+      rawEntry({ id: 2, userId: 200, callsign: 'qctt_twr' }),
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
+
+    const result = await fetchDivisionAtc(['QC']);
+    expect(result).toHaveLength(1);
+    expect(result[0]?.userId).toBe(200);
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'ivao_duplicate_callsign', count: 1 }));
+  });
+
+  it('remints and retries exactly once after a 401 on an authenticated request', async () => {
+    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(Response.json({ access_token: 'fresh', expires_in: 1800 }))
+      .mockResolvedValueOnce(Response.json([rawEntry()]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchDivisionAtc(['QC'], auth(kv));
+    expect(result).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const secondCallHeaders = fetchMock.mock.calls[2]?.[1]?.headers as Record<string, string>;
+    expect(secondCallHeaders.authorization).toBe('Bearer fresh');
+  });
+
+  it('surfaces a second consecutive 401 instead of retrying forever', async () => {
+    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(Response.json({ access_token: 'fresh', expires_in: 1800 }))
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchDivisionAtc(['QC'], auth(kv))).rejects.toThrow('IVAO API responded with 401');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry a 401 on an anonymous request, since it cannot be a token problem', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('IVAO API responded with 401');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to an anonymous request when the token mint fails, instead of taking the bot down', async () => {
+    const kv = fakeKv();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('nope', { status: 500 }))
+      .mockResolvedValueOnce(Response.json([rawEntry()]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchDivisionAtc(['QC'], auth(kv));
+    expect(result).toHaveLength(1);
+    const headers = fetchMock.mock.calls[1]?.[1]?.headers as Record<string, string>;
+    expect(headers.authorization).toBeUndefined();
+  });
+
+  it('throws on a bad payload shape', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ not: 'an array' })));
+    await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('unexpected payload');
+  });
+
+  it('treats zero ATC worldwide as a feed outage', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([])));
+    await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('feed outage');
+  });
+
+  it('tolerates a KV delete failure on the 401 path instead of failing the whole poll', async () => {
+    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
+    kv.delete.mockRejectedValueOnce(new Error('KV unavailable'));
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(Response.json({ access_token: 'fresh', expires_in: 1800 }))
+      .mockResolvedValueOnce(Response.json([rawEntry()]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
   });
 });

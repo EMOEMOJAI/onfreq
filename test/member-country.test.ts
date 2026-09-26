@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { enrichMemberCountries } from '../src/member-country';
 import { resetTokenCache } from '../src/ivao';
+import { TOKEN_KEY } from '../src/config';
 import type { IvaoAuth, OnlineAtc, StateMap } from '../src/types';
 
 const NOW = 1_800_000_000_000;
@@ -24,6 +25,7 @@ beforeEach(() => {
   auth = { clientId: 'test', clientSecret: 'test', kv: {
     get: vi.fn(async (key: string) => values.get(key) ?? null),
     put: vi.fn(async (key: string, raw: string) => { values.set(key, JSON.parse(raw)); }),
+    delete: vi.fn(async (key: string) => { values.delete(key); }),
   } as unknown as KVNamespace };
   network = vi.fn<typeof fetch>(async () => Response.json({ countryId: 'ca', divisionId: 'XX', publicNickname: 'Not stored' }));
   vi.stubGlobal('fetch', network);
@@ -78,13 +80,53 @@ describe('member profile country enrichment', () => {
     expect(network).not.toHaveBeenCalled();
   });
 
-  it.each([401, 404, 429, 500])('backs off unavailable profiles (%s) without failing notifications', async (status) => {
+  it.each([401, 404, 429, 500])('backs off unavailable profiles (%s) without failing notifications, and without persisting the failure to KV', async (status) => {
     network.mockImplementation(async () => new Response(null, { status }));
     const current = [controller()];
     await expect(enrichMemberCountries(current, {}, auth)).resolves.toBeUndefined();
     expect(current[0]?.memberCountry).toEqual({ countryId: null, expiresAt: NOW + 900_000 });
+    expect(auth.kv.put).not.toHaveBeenCalled();
+    // Nothing was written to KV, so a bare retry with no snapshot hits the network again...
     await enrichMemberCountries([controller()], {}, auth);
-    expect(network).toHaveBeenCalledTimes(1);
+    expect(network).toHaveBeenCalledTimes(2);
+    // ...but the coordinator snapshot carrying the backoff forward suppresses it, as in production.
+    const state: StateMap = { QCTT_TWR: {
+      ...controller(), since: new Date(NOW).toISOString(), missed: 0, memberCountry: current[0]!.memberCountry,
+    } };
+    await enrichMemberCountries([controller()], state, auth);
+    expect(network).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops the rest of the batch after a 401/403/429, but not after a 404/500', async () => {
+    for (const status of [401, 403, 429]) {
+      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+      network.mockClear();
+      network.mockImplementation(async () => new Response(null, { status }));
+      const current = Array.from({ length: 3 }, (_, i) => controller(300 + i, `QCTT_${i}_TWR`));
+      await enrichMemberCountries(current, {}, auth);
+      expect(network).toHaveBeenCalledTimes(1);
+    }
+    for (const status of [404, 500]) {
+      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+      network.mockClear();
+      network.mockImplementation(async () => new Response(null, { status }));
+      const current = Array.from({ length: 3 }, (_, i) => controller(400 + i, `QDTT_${i}_TWR`));
+      await enrichMemberCountries(current, {}, auth);
+      expect(network).toHaveBeenCalledTimes(3);
+    }
+  });
+
+  it('resets the cached IVAO token (memory and KV) on a profile 401, but not on other statuses', async () => {
+    network.mockImplementation(async () => new Response(null, { status: 401 }));
+    await enrichMemberCountries([controller()], {}, auth);
+    expect(auth.kv.delete).toHaveBeenCalledWith(TOKEN_KEY);
+    expect(values.has(TOKEN_KEY)).toBe(false);
+
+    values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+    vi.mocked(auth.kv.delete).mockClear();
+    network.mockImplementation(async () => new Response(null, { status: 500 }));
+    await enrichMemberCountries([controller(101, 'QCTT_2_TWR')], {}, auth);
+    expect(auth.kv.delete).not.toHaveBeenCalled();
   });
 
   it('keeps the last known country through a failed refresh', async () => {

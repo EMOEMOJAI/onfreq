@@ -65,7 +65,7 @@ it('shares member-list cooldowns across pagination cursors', async () => {
 it('defers standalone public requests instead of shortening a 65-second cooldown', async () => {
   const network = vi.fn().mockImplementation(async () => Response.json({ retry_after: 65 }, { status: 429 }));
   vi.stubGlobal('fetch', network);
-  await expect(postMessage('test-token', 'a', { title: 'Synthetic' }))
+  await expect(postMessage('test-token', 'a', { title: 'Synthetic' }, undefined, undefined, new DiscordRateLimits()))
     .rejects.toMatchObject({ retryAt: START + 65_000 });
   expect(network).toHaveBeenCalledTimes(1);
 });
@@ -75,3 +75,49 @@ it.each([null, { retry_after: -5 }, { retry_after: 'invalid' }])(
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => Response.json(body, { status: 429 })));
     await expect(request('/channels/a/messages')).rejects.toMatchObject({ retryAt: START + 60_000 });
   });
+
+it('does not mask the rate-limit error when persisting the cooldown fails', async () => {
+  const network = vi.fn().mockImplementation(async () => Response.json({ retry_after: 65 }, { status: 429 }));
+  vi.stubGlobal('fetch', network);
+  const storage = { put: vi.fn().mockRejectedValue(new Error('storage unavailable')) } as unknown as DurableObjectStorage;
+  const limits = new DiscordRateLimits(storage);
+
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+    .rejects.toMatchObject({ status: 429, requestMade: true, retryAt: START + 65_000 });
+  expect(storage.put).toHaveBeenCalledTimes(1);
+});
+
+it('sets a short in-memory-only cooldown when a 2xx reports an exhausted bucket, without persisting it', async () => {
+  const network = vi.fn()
+    .mockImplementationOnce(async () => Response.json({ id: 'first' }, {
+      headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset-after': '2.5' },
+    }))
+    .mockImplementation(async () => Response.json({ id: 'second' }));
+  vi.stubGlobal('fetch', network);
+  const storage = { put: vi.fn(), get: vi.fn().mockResolvedValue(undefined) } as unknown as DurableObjectStorage;
+  const limits = new DiscordRateLimits(storage);
+
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+    .rejects.toMatchObject({ requestMade: false, retryAt: START + 2500 });
+  expect(network).toHaveBeenCalledTimes(1);
+  expect(storage.put).not.toHaveBeenCalled();
+
+  now += 2500;
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+  expect(network).toHaveBeenCalledTimes(2);
+});
+
+it('keeps a 2xx-derived soft cooldown scoped to its own route, leaving other channels usable', async () => {
+  const network = vi.fn()
+    .mockImplementationOnce(async () => Response.json({ id: 'first' }, {
+      headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset-after': '2.5' },
+    }))
+    .mockImplementation(async () => Response.json({ id: 'second' }));
+  vi.stubGlobal('fetch', network);
+  const limits = new DiscordRateLimits();
+
+  await limits.fetch('/channels/a/messages', { method: 'POST' });
+  await expect(limits.fetch('/channels/b/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+  expect(network).toHaveBeenCalledTimes(2);
+});

@@ -14,6 +14,7 @@ import {
   parseChannelIds,
   postMessage,
 } from '../src/discord';
+import { DiscordRateLimits } from '../src/discord-rate-limit';
 import type { OfflineEvent, OnlineAtc, TrackedAtc } from '../src/types';
 
 // Fictional callsign prefixes and a geographically mixed display fixture.
@@ -167,6 +168,16 @@ describe('embeds', () => {
     expect(embed.color).toBe(COLOR_OFFLINE);
     expect(embed.fields?.map((f) => f.value)).toContain('2h 0m');
   });
+
+  it('escapes IVAO-supplied markdown in the station/location line so it cannot break embed formatting', () => {
+    const embed = buildOnlineEmbed(
+      { ...sample, station: '*Evil* __Tower__', location: '`injected` [link](http://example.test)' },
+      undefined, LABELS,
+    );
+    expect(embed.description).toContain('\\*Evil\\* \\_\\_Tower\\_\\_');
+    expect(embed.description).toContain('\\`injected\\` \\[link\\](http://example.test)');
+    expect(embed.description).not.toContain('**Evil**');
+  });
 });
 
 function other(callsign: string, over: Partial<OnlineAtc> = {}): OnlineAtc {
@@ -185,6 +196,13 @@ function other(callsign: string, over: Partial<OnlineAtc> = {}): OnlineAtc {
 describe('also-online roster', () => {
   it('renders nothing when no one else is online', () => {
     expect(formatRoster([], LABELS)).toBeUndefined();
+  });
+
+  it('strips backticks from roster cells so they cannot prematurely close the code block', () => {
+    const text = formatRoster([other('QCTT_GND', { station: '``` @everyone' })], LABELS) ?? '';
+    // Only the opening and closing code fences remain; the injected backticks are gone.
+    expect(text.split('```').length - 1).toBe(2);
+    expect(text).toContain("''' @everyone");
   });
 
   it('omits controllers that have not tuned a frequency yet', () => {
@@ -357,7 +375,7 @@ describe('REST calls', () => {
 
   it('returns the id of the posted message', async () => {
     const fetchMock = stubFetch(Response.json({ id: '999' }));
-    const id = await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), '<@&role>');
+    const id = await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), '<@&role>', undefined, new DiscordRateLimits());
     expect(id).toBe('999');
     const [url, init] = fetchMock.mock.calls[0] ?? [];
     expect(url).toBe('https://discord.com/api/v10/channels/123/messages');
@@ -367,7 +385,7 @@ describe('REST calls', () => {
 
   it('posts continuations as replies without pinging the parent author', async () => {
     const fetchMock = stubFetch(Response.json({ id: '999' }));
-    await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, 'parent');
+    await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, 'parent', new DiscordRateLimits());
     const payload = JSON.parse(fetchMock.mock.calls[0]![1].body);
     expect(payload.message_reference).toEqual({ message_id: 'parent', fail_if_not_exists: false });
     expect(payload.allowed_mentions.replied_user).toBe(false);
@@ -376,14 +394,14 @@ describe('REST calls', () => {
 
   it('deletes obsolete continuations and accepts an already-deleted message', async () => {
     const fetchMock = stubFetch(new Response(null, { status: 204 }), new Response(null, { status: 404 }));
-    await deleteMessage('token', '123', '999');
-    await deleteMessage('token', '123', '999');
+    await deleteMessage('token', '123', '999', new DiscordRateLimits());
+    await deleteMessage('token', '123', '999', new DiscordRateLimits());
     expect(fetchMock.mock.calls.every(([, init]) => init.method === 'DELETE' && init.body === undefined)).toBe(true);
   });
 
   it('patches the original message when a session ends', async () => {
     const fetchMock = stubFetch(Response.json({ id: '999' }));
-    await editMessage('token', '123', '999', buildSessionEndedEmbed(endedEvent, LABELS));
+    await editMessage('token', '123', '999', buildSessionEndedEmbed(endedEvent, LABELS), new DiscordRateLimits());
     const [url, init] = fetchMock.mock.calls[0] ?? [];
     expect(url).toBe('https://discord.com/api/v10/channels/123/messages/999');
     expect(init.method).toBe('PATCH');
@@ -395,13 +413,13 @@ describe('REST calls', () => {
       Response.json({ retry_after: 0 }, { status: 429 }),
       Response.json({ id: '42' }),
     );
-    await expect(postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS))).resolves.toBe('42');
+    await expect(postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, new DiscordRateLimits())).resolves.toBe('42');
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('reports a deleted message as gone without retrying', async () => {
     const fetchMock = stubFetch(Response.json({ message: 'Unknown Message' }, { status: 404 }));
-    const err = await editMessage('token', '123', '999', buildOnlineEmbed(sample, undefined, LABELS)).catch((e) => e);
+    const err = await editMessage('token', '123', '999', buildOnlineEmbed(sample, undefined, LABELS), new DiscordRateLimits()).catch((e) => e);
     expect(err).toBeInstanceOf(DiscordApiError);
     expect((err as DiscordApiError).isGone).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -411,9 +429,68 @@ describe('REST calls', () => {
     const fetchMock = stubFetch(
       ...Array.from({ length: 4 }, () => Response.json({ retry_after: 0 }, { status: 429 })),
     );
-    await expect(postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS))).rejects.toThrow(
+    await expect(postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, new DiscordRateLimits())).rejects.toThrow(
       'Discord API 429',
     );
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('never retries a POST on a 5xx, to avoid posting a duplicate card', async () => {
+    const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    const err = await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, new DiscordRateLimits()).catch((e) => e);
+    expect(err).toBeInstanceOf(DiscordApiError);
+    expect((err as DiscordApiError).status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps retrying a PATCH/DELETE on a 5xx, since they are idempotent', async () => {
+    const fetchMock = stubFetch(
+      Response.json({ message: 'server error' }, { status: 503 }),
+      Response.json({ id: '999' }),
+    );
+    await editMessage('token', '123', '999', buildSessionEndedEmbed(endedEvent, LABELS), new DiscordRateLimits());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('makes later requests in the same poll fail fast after a request exhausts its 5xx retries', async () => {
+    // POST never retries a 5xx (see above), so this exhausts its budget on the first attempt.
+    const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    const limits = new DiscordRateLimits();
+    await expect(
+      postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // A later call in the same poll must not spend its own retry budget on a
+    // service that just proved to be down, and must not consume a "real"
+    // rate-limit attempt (requestMade stays false).
+    const err = await postMessage('token', '456', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
+    expect(err).toMatchObject({ status: 429, requestMade: false });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not mask a rate-limit error with a message that carries a response body', async () => {
+    const fetchMock = stubFetch(Response.json({ message: 'You are being rate limited.', code: 0 }, { status: 429, headers: { 'retry-after': '1' } }));
+    const err = await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, new DiscordRateLimits()).catch((e) => e);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(err.message).not.toContain('You are being rate limited');
+  });
+
+  it('reports the Discord numeric code in the message, without echoing the rest of the response body', async () => {
+    const body = { message: 'Missing Permissions and a lot of extra detail that must never reach a log line', code: 50013 };
+    const fetchMock = stubFetch(Response.json(body, { status: 403 }));
+    const err = await editMessage('token', '123', '999', buildOnlineEmbed(sample, undefined, LABELS), new DiscordRateLimits()).catch((e) => e);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(err).toBeInstanceOf(DiscordApiError);
+    expect((err as DiscordApiError).message).toBe('Discord API 403 (code 50013)');
+    expect((err as DiscordApiError).body).toContain('a lot of extra detail');
+    expect((err as DiscordApiError).isGone).toBe(true);
+  });
+
+  it('names rate-limit errors for log clarity', async () => {
+    const fetchMock = stubFetch(Response.json({ retry_after: 0.5 }, { status: 429 }));
+    const err = await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, new DiscordRateLimits()).catch((e) => e);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(err.name).toBe('DiscordRateLimitError');
   });
 });

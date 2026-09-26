@@ -37,12 +37,17 @@ export function formatDuration(totalSeconds: number): string {
   return `${totalSeconds}s`;
 }
 
+/** Escape characters Discord treats as markdown, so IVAO-derived text can't break embed formatting. */
+function escapeMarkdown(text: string): string {
+  return text.replace(/([\\*_~`|[\]])/g, '\\$1');
+}
+
 function stationLine(atc: TrackedAtc): string | undefined {
   if (atc.station && atc.location && atc.station !== atc.location) {
-    return `**${atc.station}** — ${atc.location}`;
+    return `**${escapeMarkdown(atc.station)}** — ${escapeMarkdown(atc.location)}`;
   }
-  if (atc.station) return `**${atc.station}**`;
-  if (atc.location) return `**${atc.location}**`;
+  if (atc.station) return `**${escapeMarkdown(atc.station)}**`;
+  if (atc.location) return `**${escapeMarkdown(atc.location)}**`;
   return undefined;
 }
 
@@ -104,6 +109,11 @@ const FIR_COL_WIDTH = 2 + 1 + FIR_NAME_WIDTH;
  * that have not tuned a frequency yet are left out — they are not announced
  * anywhere else either, so listing them here would be inconsistent.
  */
+/** A backtick inside a roster cell would otherwise prematurely close the code block. */
+function stripBackticks(text: string): string {
+  return text.replace(/`/g, "'");
+}
+
 export function formatRoster(others: OnlineAtc[], labels: FirLabel[] = []): string | undefined {
   const usable = others.filter(hasFrequency);
   if (usable.length === 0) return undefined;
@@ -127,9 +137,9 @@ export function formatRoster(others: OnlineAtc[], labels: FirLabel[] = []): stri
       // rest are indented so the callsign column stays aligned.
       const label =
         i === 0 ? `${group.flag} ${group.name.padEnd(FIR_NAME_WIDTH)}` : ' '.repeat(FIR_COL_WIDTH);
-      const station = (atc.station ?? '').slice(0, stationWidth).padEnd(stationWidth);
+      const station = stripBackticks((atc.station ?? '').slice(0, stationWidth)).padEnd(stationWidth);
       lines.push(
-        `${label}${atc.callsign.padEnd(callsignWidth)}  ${station}  ${atc.frequency.toFixed(3)}`,
+        `${label}${stripBackticks(atc.callsign).padEnd(callsignWidth)}  ${station}  ${atc.frequency.toFixed(3)}`,
       );
     });
   }
@@ -296,12 +306,26 @@ export function parseChannelIds(raw: string | undefined): string[] {
 }
 
 export class DiscordApiError extends Error {
+  /** Discord's own numeric error code, when the body carried one. */
+  readonly code?: number;
+
   constructor(
     readonly status: number,
     readonly body: string,
   ) {
-    super(`Discord API ${status}: ${body.slice(0, 300)}`);
+    const code = DiscordApiError.parseCode(body);
+    super(`Discord API ${status}${code !== undefined ? ` (code ${code})` : ''}`);
     this.name = 'DiscordApiError';
+    this.code = code;
+  }
+
+  private static parseCode(body: string): number | undefined {
+    try {
+      const parsed = JSON.parse(body) as { code?: unknown };
+      return typeof parsed.code === 'number' ? parsed.code : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** The target message is gone (deleted, or the channel is inaccessible). */
@@ -312,6 +336,9 @@ export class DiscordApiError extends Error {
 
 const MAX_ATTEMPTS = 4;
 
+/** How long later calls in the same poll fail fast after a request exhausts its 5xx retries. */
+const OUTAGE_COOLDOWN_MS = 30_000;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -319,6 +346,10 @@ function sleep(ms: number): Promise<void> {
 /**
  * Retry transient server errors within a bounded budget. Positive rate-limit
  * cooldowns defer delivery to a later poll instead of holding the coordinator.
+ *
+ * POST is never retried on a 5xx: a successful-but-unacknowledged POST would
+ * otherwise be resent, posting a duplicate card and re-pinging a role. The
+ * next poll re-delivers instead. PATCH/DELETE are idempotent and keep retrying.
  */
 async function discordRequest(
   botToken: string,
@@ -345,8 +376,9 @@ async function discordRequest(
     if (res.ok) return res;
 
     const body = await res.text();
-    const retryable = res.status >= 500;
+    const retryable = method !== 'POST' && res.status >= 500;
     if (!retryable || attempt >= MAX_ATTEMPTS) {
+      if (res.status >= 500) limits.markOutage(OUTAGE_COOLDOWN_MS);
       throw new DiscordApiError(res.status, body);
     }
     await sleep(500 * 2 ** (attempt - 1));
