@@ -6,6 +6,8 @@ import {
   buildOnlineEmbeds,
   buildSessionEndedEmbed,
   DiscordApiError,
+  DiscordInvalidMessageIdError,
+  DiscordResponseTooLargeError,
   DiscordUnconfirmedPostError,
   deleteMessage,
   escapeMarkdown,
@@ -20,7 +22,10 @@ import {
   postMessage,
 } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
-import type { OfflineEvent, OnlineAtc, TrackedAtc } from '../src/types';
+import { countsAgainstBudget, type OfflineEvent, type OnlineAtc, type TrackedAtc } from '../src/types';
+
+/** Any unpaired UTF-16 surrogate, which makes a Discord payload invalid text. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 // Fictional callsign prefixes and a geographically mixed display fixture.
 const LABELS = parseFirLabels(JSON.stringify([
@@ -237,6 +242,23 @@ describe('embeds', () => {
   it('collapses embedded newlines to a single space instead of adding embed lines', () => {
     expect(escapeMarkdown('line one\nline two\r\nline three')).toBe('line one line two line three');
   });
+
+  it('collapses Unicode line and paragraph separators like newlines', () => {
+    expect(escapeMarkdown('row one\u2028QXXX_TWR fake\u2029\u2028row three')).toBe('row one QXXX_TWR fake row three');
+    expect(escapeMarkdown('\u2028# header after separator')).toBe(' \\# header after separator');
+  });
+
+  it.each([
+    ['1. fake item', '1\\. fake item'],
+    ['  12. indented item', '  12\\. indented item'],
+    ['\n3.\tafter newline', ' 3\\.\tafter newline'],
+  ])('escapes a leading ordered-list marker in %j', (input, expected) => {
+    expect(escapeMarkdown(input)).toBe(expected);
+  });
+
+  it.each(['118.100 MHz', '1.5 nm', 'Runway 1. North', '1.'])('leaves %j without a list marker as is', (text) => {
+    expect(escapeMarkdown(text)).toBe(text);
+  });
 });
 
 function other(callsign: string, over: Partial<OnlineAtc> = {}): OnlineAtc {
@@ -313,6 +335,17 @@ describe('also-online roster', () => {
     const text = formatRoster([other('KJFK_TWR')], LABELS) ?? '';
     expect(text).toContain('🌐');
     expect(text).toContain('Other');
+  });
+
+  it('never splits a surrogate pair when cutting a long station name to the column width', () => {
+    // 21 ASCII units then an astral character spanning units 21-22 of the 22-unit column.
+    const station = `${'A'.repeat(21)}\u{1F600}${'B'.repeat(10)}`;
+    const text = formatRoster([other('QCTT_GND', { station })], LABELS) ?? '';
+    expect(text).not.toMatch(LONE_SURROGATE);
+    expect(text).toContain(`${'A'.repeat(21)} `);
+    const kept = formatRoster([other('QCTT_GND', { station: `${'A'.repeat(20)}\u{1F600}${'B'.repeat(10)}` })], LABELS) ?? '';
+    expect(kept).toContain(`${'A'.repeat(20)}\u{1F600}`);
+    expect(kept).not.toMatch(LONE_SURROGATE);
   });
 
   it('shows every station when more than ten are online', () => {
@@ -780,6 +813,69 @@ describe('REST calls', () => {
     expect((err as DiscordApiError).body).toContain('a lot of extra detail');
     expect((err as DiscordApiError).isGone).toBe(true);
   });
+
+  it('treats an oversized channel scan as a budgeted lookup failure without deferring later posts', async () => {
+    const botId = '100000000000000009';
+    const token = `${btoa(botId)}.synthetic.token`;
+    const at = 1_800_000_000_000;
+    const fetchMock = stubFetch(
+      new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
+      Response.json({ id: '100000000000000999' }),
+    );
+    const limits = new DiscordRateLimits();
+    const err = await findBotMessages(token, '100000000000000123', { from: at, to: at }, limits, () => true)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DiscordResponseTooLargeError);
+    expect(err).toBeInstanceOf(DiscordApiError);
+    expect(countsAgainstBudget(err)).toBe(true);
+    expect((err as DiscordApiError).isGone).toBe(false);
+    expect((err as DiscordResponseTooLargeError).upstreamStatus).toBe(200);
+    expect((err as Error).message).toBe('Discord API response exceeded size limit');
+    // No outage was marked: the next post in the same poll is still sent.
+    await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
+      .resolves.toBe('100000000000000999');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not count an oversized response towards the POST outage streak', async () => {
+    const limits = new DiscordRateLimits();
+    stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, limits))
+      .rejects.toBeInstanceOf(DiscordApiError);
+    stubFetch(new Response('x', { status: 400, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }));
+    await expect(postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, limits))
+      .rejects.toBeInstanceOf(DiscordResponseTooLargeError);
+    // The oversized response proved Discord reachable, so one more 5xx is not yet an outage.
+    const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }), Response.json({ id: '100000000000000999' }));
+    await expect(postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, limits))
+      .rejects.toMatchObject({ status: 503 });
+    await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
+      .resolves.toBe('100000000000000999');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports an accepted POST with an oversized response as unconfirmed, never as a rejection', async () => {
+    stubFetch(new Response('x', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }));
+    await expect(postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, new DiscordRateLimits()))
+      .rejects.toBeInstanceOf(DiscordUnconfirmedPostError);
+  });
+
+  it.each(['../100000000000000999', '100000000000000999/reactions', 'posted-1', '123', '1'.repeat(21), ''])(
+    'never places a stored message id %j that is not a snowflake in a request path', async (messageId) => {
+      const fetchMock = stubFetch(Response.json({ id: '100000000000000999' }), new Response(null, { status: 204 }));
+      const edit = await editMessage('token', '100000000000000123', messageId, { title: 'Synthetic' }, new DiscordRateLimits())
+        .catch((e: unknown) => e);
+      // Unaddressable, so treated as gone: callers fall back as for a deleted card.
+      expect(edit).toBeInstanceOf(DiscordInvalidMessageIdError);
+      expect((edit as DiscordApiError).isGone).toBe(true);
+      expect((edit as Error).message).not.toContain(messageId || 'unused');
+      const del = await deleteMessage('token', '100000000000000123', messageId, new DiscordRateLimits())
+        .catch((e: unknown) => e);
+      // Not silently treated as deleted: a budgeted permanent failure instead.
+      expect(del).toBeInstanceOf(DiscordInvalidMessageIdError);
+      expect(countsAgainstBudget(del)).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
 
   it('names rate-limit errors for log clarity', async () => {
     const fetchMock = stubFetch(Response.json({ retry_after: 0.5 }, { status: 429 }));

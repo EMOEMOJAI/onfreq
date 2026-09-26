@@ -11,6 +11,18 @@ export const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
 const TOO_LARGE_MESSAGE = 'upstream response exceeded size limit';
 const REDIRECT_MESSAGE = 'upstream request was redirected';
 
+/**
+ * The upstream answered, but its body exceeded the caller's cap. Distinct from
+ * a timeout or network failure: the service is reachable, so callers must not
+ * treat this as an outage. `status` is the HTTP status of the discarded response.
+ */
+export class ResponseTooLargeError extends Error {
+  constructor(readonly status: number) {
+    super(TOO_LARGE_MESSAGE);
+    this.name = 'ResponseTooLargeError';
+  }
+}
+
 async function readCapped(response: Response, maxBytes: number): Promise<Uint8Array> {
   if (!response.body) return new Uint8Array(0);
   const reader = response.body.getReader();
@@ -23,7 +35,7 @@ async function readCapped(response: Response, maxBytes: number): Promise<Uint8Ar
     total += chunk.byteLength;
     if (total > maxBytes) {
       await reader.cancel().catch(() => {});
-      throw new Error(TOO_LARGE_MESSAGE);
+      throw new ResponseTooLargeError(response.status);
     }
     chunks.push(chunk);
   }
@@ -57,7 +69,7 @@ export async function fetchBuffered(
     const declared = Number(response.headers.get('content-length') ?? '');
     if (Number.isFinite(declared) && declared > maxBytes) {
       await response.body?.cancel().catch(() => {});
-      throw new Error(TOO_LARGE_MESSAGE);
+      throw new ResponseTooLargeError(response.status);
     }
     const body = await readCapped(response, maxBytes);
     return new Response([204, 205, 304].includes(response.status) ? null : body, {

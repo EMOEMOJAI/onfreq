@@ -121,7 +121,8 @@ export class DiscordRateLimits {
       if (response.ok && response.headers.get('x-ratelimit-remaining') === '0') {
         const resetAfter = Number(response.headers.get('x-ratelimit-reset-after'));
         if (Number.isFinite(resetAfter) && resetAfter >= 0) {
-          this.softDeadlines[route] = Date.now() + Math.ceil(resetAfter * 1000);
+          // Clamped like a real 429, so one absurd header cannot block the route.
+          this.softDeadlines[route] = Date.now() + Math.min(MAX_RATE_LIMIT_COOLDOWN_MS, Math.ceil(resetAfter * 1000));
         }
       }
       return response;

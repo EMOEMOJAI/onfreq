@@ -195,3 +195,21 @@ it('drops a stored cooldown beyond the one-hour cap on load, so delivery resumes
   await expect(request('/channels/b/messages')).rejects.toMatchObject({ requestMade: false, reason: 'rate_limit' });
   expect(network).toHaveBeenCalledTimes(1);
 });
+
+it.each(['1e12', '1e308', String(MAX_RATE_LIMIT_COOLDOWN_MS)])(
+  'clamps an absurd 2xx x-ratelimit-reset-after of %s to the one-hour cap', async (resetAfter) => {
+    const network = vi.fn()
+      .mockImplementationOnce(async () => Response.json({ id: 'first' }, {
+        headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset-after': resetAfter },
+      }))
+      .mockImplementation(async () => Response.json({ id: 'second' }));
+    vi.stubGlobal('fetch', network);
+    const limits = new DiscordRateLimits();
+
+    await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+    await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+      .rejects.toMatchObject({ requestMade: false, reason: 'soft', retryAt: START + MAX_RATE_LIMIT_COOLDOWN_MS });
+    now += MAX_RATE_LIMIT_COOLDOWN_MS;
+    await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+    expect(network).toHaveBeenCalledTimes(2);
+  });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_MAX_RESPONSE_BYTES, fetchBuffered } from '../src/http';
+import { DEFAULT_MAX_RESPONSE_BYTES, fetchBuffered, ResponseTooLargeError } from '../src/http';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -33,6 +33,18 @@ describe('response size cap', () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(chunked(64 * 1024, 1000, cancel))));
     await expect(fetchBuffered(URL)).rejects.toThrow('upstream response exceeded size limit');
     expect(cancel).toHaveBeenCalled();
+  });
+
+  it('throws a distinct error carrying the discarded response status, declared or streamed', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response('x', { headers: { 'content-length': String(DEFAULT_MAX_RESPONSE_BYTES + 1) } }))
+      .mockResolvedValueOnce(new Response(chunked(64 * 1024, 1000), { status: 503 })));
+    const declared = await fetchBuffered(URL).then(() => null, (e: unknown) => e);
+    expect(declared).toBeInstanceOf(ResponseTooLargeError);
+    expect(declared).toMatchObject({ status: 200, message: 'upstream response exceeded size limit' });
+    const streamed = await fetchBuffered(URL).then(() => null, (e: unknown) => e);
+    expect(streamed).toBeInstanceOf(ResponseTooLargeError);
+    expect(streamed).toMatchObject({ status: 503 });
   });
 
   it('accepts a body of exactly the default cap', async () => {
