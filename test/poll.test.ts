@@ -192,6 +192,25 @@ describe('polling through the Durable Object', () => {
     expect(network.mock.calls.some(([url]) => String(url).includes('/v2/users/'))).toBe(false);
   });
 
+  it('never posts a fallback OFFLINE card for a session that was only ever silently seeded', async () => {
+    const minimal: Env = {
+      ATC_STATE: env.ATC_STATE, POLL_COORDINATOR: env.POLL_COORDINATOR,
+      OFFLINE_GRACE_POLLS: '2', DISCORD_BOT_TOKEN: env.DISCORD_BOT_TOKEN,
+      DISCORD_CHANNEL_IDS: 'test-channel', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
+    };
+    const firstRunPoll = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, minimal).poll());
+    feed = [entry(a)];
+    await firstRunPoll();
+    expect(sent).toHaveLength(0);
+    feed = [];
+    now += 60_000;
+    await firstRunPoll();
+    now += 60_000;
+    await firstRunPoll();
+    expect(sent).toHaveLength(0);
+    expect((await stub().getState())?.[a]).toBeUndefined();
+  });
+
   function configuredPoll(overrides: Partial<Env> = {}) {
     return runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
       ...env, DISCORD_CHANNEL_IDS: 'test-channel,test-channel-b,test-channel', ...overrides,
@@ -315,6 +334,38 @@ describe('polling through the Durable Object', () => {
     expect((await snapshot())?.lastSuccessfulPollAt).toBeUndefined();
     now += 60_000;
     await expect(configuredPoll()).resolves.toEqual({ skipped: false });
+  });
+
+  it('closes out an ended session before announcing a new one in the same poll', async () => {
+    await seed({ [a]: session(a) });
+    feed = [entry(b)];
+    await expect(configuredPoll({ OFFLINE_GRACE_POLLS: '1', DISCORD_CHANNEL_IDS: 'test-channel' }))
+      .resolves.toEqual({ skipped: false });
+    expect(sent.map((message) => message.method)).toEqual(['PATCH', 'POST']);
+    expect(cards.get(a)?.title).toContain('OFFLINE');
+    expect(sent[1]!.embed.title).toContain(`${b} is now ONLINE`);
+  });
+
+  it('closes out a carded session\'s card once its callsign becomes excluded', async () => {
+    await seed({ [a]: session(a) });
+    feed = [entry(a)];
+    await expect(configuredPoll({ EXCLUDED_CALLSIGNS: a })).resolves.toEqual({ skipped: false });
+    expect(cards.get(a)?.title).toContain('OFFLINE');
+    expect((await stub().getState())?.[a]).toBeUndefined();
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('drops a retried offline job once its channels are removed from configuration', async () => {
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
+        event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
+        messages: [{ channelId: 'removed-channel', messageId: a }],
+        channelIds: ['removed-channel-2'], attempts: 3,
+      }] } satisfies PollSnapshot);
+    });
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+    expect(network.mock.calls.some(([input]) => String(input).includes('removed-channel'))).toBe(false);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
   it('keeps a roster in each channel during partial delivery and moves it after retry', async () => {
@@ -516,7 +567,12 @@ describe('polling through the Durable Object', () => {
     feed = [entry(a)];
     await expect(configuredPoll(overrides)).rejects.toThrow('required');
     expect(network).not.toHaveBeenCalled();
-    expect(await snapshot()).toEqual({ state: {} });
+    expect(await snapshot()).toMatchObject({ state: {}, lastPollStartedAt: START, error: expect.stringContaining('required') });
+    // The cached error applies on the very next call too, so a misconfigured
+    // bot cannot bypass MIN_POLL_INTERVAL by retrying every invocation.
+    await expect(configuredPoll(overrides)).rejects.toThrow('required');
+    expect(network).not.toHaveBeenCalled();
+    now += 60_000;
     await configuredPoll();
     expect((await snapshot())?.state?.[a]?.messages).toHaveLength(2);
   });
@@ -897,6 +953,66 @@ describe('polling through the Durable Object', () => {
     expect(sent).toHaveLength(count);
   });
 
+  it('abandons an online card destination after exhausting its retry budget', async () => {
+    await seed({});
+    feed = [entry(a)];
+    failures.add('test-channel');
+    failureStatus = 400;
+    for (let i = 0; i < 11; i++) {
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow();
+      now += 60_000;
+    }
+    expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual([]);
+    expect(cards.has(a)).toBe(false);
+    const attemptsBefore = sent.length;
+    failures.clear();
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
+    // Abandoned: no further attempt is made even once delivery would succeed.
+    expect(sent).toHaveLength(attemptsBefore);
+    expect(cards.has(a)).toBe(false);
+  });
+
+  it('does not retry an already-failed edit when a deleted host forces another reconcile pass', async () => {
+    const c = 'QGLL_TWR';
+    await seed({ [a]: session(a), [b]: session(b, START - 30_000), [c]: session(c, START - 90_000) });
+    feed = [entry(a), entry(b), entry(c)];
+    await poll();
+    cards.delete(b);
+    const original = network.getMockImplementation()!;
+    let editsToA = 0;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith(`/messages/${b}`) && init?.method === 'PATCH') return new Response(null, { status: 404 });
+      if (url.endsWith(`/messages/${a}`) && init?.method === 'PATCH') {
+        editsToA++;
+        return new Response('nope', { status: 400 });
+      }
+      return original(input, init);
+    });
+    // A coverage change makes the deleted host's next edit discover the 404,
+    // forcing a second reconcile pass in the same poll.
+    feed = [entry(a, 121.7), entry(b), entry(c)];
+    const response = await nextPoll();
+    expect(response.status).toBe(500);
+    expect(editsToA).toBe(1);
+  });
+
+  it('treats a 403 online card edit as gone instead of retrying it forever', async () => {
+    const c = 'QGLL_TWR';
+    await seed({ [a]: session(a), [b]: session(b, START - 30_000), [c]: session(c, START - 90_000) });
+    feed = [entry(a), entry(b), entry(c)];
+    await poll();
+    failures.add(b);
+    failureStatus = 403;
+    cards.delete(b);
+    feed = [entry(a, 121.7), entry(b), entry(c)];
+    await nextPoll();
+    expect((await stub().getState())?.[b]?.messages).toEqual([]);
+    const count = sent.length;
+    await nextPoll();
+    expect(sent).toHaveLength(count);
+  });
+
   describe('roster continuation messages', () => {
     async function prepare(count = 120): Promise<void> {
       const many = Array.from({ length: count }, (_, i) => {
@@ -1030,6 +1146,22 @@ describe('polling through the Durable Object', () => {
       expect(deleted).toContain(pages[0]!.messageId);
     });
 
+    it('abandons a roster continuation that can never be deleted', async () => {
+      await prepare();
+      await poll();
+      const page = (await snapshot())!.rosterMessages![0]!;
+      failures.add(page.messageId);
+      failureStatus = 403;
+      feed = [];
+      for (let i = 0; i < 11; i++) {
+        expect((await nextPoll()).status).toBe(500);
+      }
+      expect((await snapshot())?.rosterMessages).toBeUndefined();
+      const deletesBefore = deleted.length;
+      await nextPoll();
+      expect(deleted).toHaveLength(deletesBefore);
+    });
+
     it('retains failed cleanup after the roster shrinks and the host ends', async () => {
       await prepare();
       await poll();
@@ -1037,10 +1169,10 @@ describe('polling through the Durable Object', () => {
       failures.add(page.messageId);
       feed = [];
       expect((await nextPoll()).status).toBe(500);
-      expect((await snapshot())?.rosterMessages).toEqual([page]);
+      expect((await snapshot())?.rosterMessages).toEqual([{ ...page, deleteAttempts: 1 }]);
       expect((await nextPoll()).status).toBe(500);
       expect(await stub().getState()).toEqual({});
-      expect((await snapshot())?.rosterMessages).toEqual([page]);
+      expect((await snapshot())?.rosterMessages).toEqual([{ ...page, deleteAttempts: 2 }]);
       failures.clear();
       await abortAllDurableObjects();
       expect((await nextPoll()).status).toBe(200);
@@ -1094,15 +1226,17 @@ describe('polling through the Durable Object', () => {
     await runInDurableObject(stub(), () => vi.advanceTimersByTimeAsync(10_000).then(() => undefined));
     const response = await pending;
     expect(response.status).toBe(500);
-    expect(await response.json()).toMatchObject({ error: expect.stringContaining('timed out') });
+    expect(await response.json()).toMatchObject({ error: 'poll failed' });
     vi.useRealTimers();
-    expect((await poll()).status).toBe(200);
+    // The failed attempt is now cached, so an immediate retry is still
+    // cooled down; only the next interval clears it.
+    expect((await poll()).status).toBe(500);
+    expect((await nextPoll()).status).toBe(200);
   });
 
   it('retains failed offline updates without making ended cards green again', async () => {
     const tracked = session(b, START);
     tracked.missed = 1;
-    tracked.roster = true;
     await seed({ [a]: session(a), [b]: tracked });
     feed = [entry(a)];
     failures.add(b);
@@ -1141,7 +1275,10 @@ describe('polling through the Durable Object', () => {
     expect(sent).toEqual([]);
     feedStatus = 200;
     feed = [entry(a)];
-    expect((await poll()).status).toBe(200);
+    // The failed attempt is now cached, so an immediate retry stays cooled
+    // down; only the next interval clears it.
+    expect((await poll()).status).toBe(500);
+    expect((await nextPoll()).status).toBe(200);
   });
 
   it('leaves tracked sessions untouched when the feed reports zero ATC worldwide', async () => {
@@ -1150,9 +1287,7 @@ describe('polling through the Durable Object', () => {
     network.mockImplementationOnce(async () => Response.json([]));
     const response = await poll();
     expect(response.status).toBe(500);
-    expect(await response.json()).toMatchObject({
-      error: expect.stringContaining('zero ATC worldwide'),
-    });
+    expect(await response.json()).toMatchObject({ error: 'poll failed' });
     expect(await stub().getState()).toEqual(state);
     expect(sent).toEqual([]);
   });

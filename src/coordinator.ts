@@ -48,6 +48,8 @@ export class PollCoordinator extends DurableObject<Env> {
     const snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
     const lastSuccessfulPollAt = snapshot?.lastSuccessfulPollAt ?? null;
     const ageMs = lastSuccessfulPollAt === null ? null : Date.now() - lastSuccessfulPollAt;
+    // A negative age (clock skew or a corrupted future timestamp) is treated
+    // as unhealthy rather than trusted, same as a stale one.
     const ok = ageMs !== null && ageMs >= 0 && ageMs < HEALTH_MAX_AGE_MS;
     return { ok, lastSuccessfulPollAt, maxAgeSeconds: HEALTH_MAX_AGE_MS / 1000 };
   }
@@ -61,11 +63,16 @@ export class PollCoordinator extends DurableObject<Env> {
 
   async getGcaHistory(after = '') {
     const sql = this.ctx.storage.sql;
+    // Existence check runs on every call rather than being cached per
+    // instance: it is cheap, and it keeps this method correct even the very
+    // first time the tables are created mid-lifetime of a warm instance.
     const tables = new Set(sql.exec<{ name: string }>(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('gca_reminders', 'gca_occurrences')",
     ).toArray().map((row) => row.name));
     if (!tables.has('gca_reminders')) return { records: [], nextCursor: null };
     const hasOccurrences = tables.has('gca_occurrences');
+    // `after` is an opaque pagination cursor over session_key's lexicographic
+    // order, not a timestamp: rows are not returned in chronological order.
     const records = sql.exec<{
       sessionKey: string; status: string; attempts: number; lastSeenAt: number; occurrence: number | null;
     }>(`SELECT r.session_key AS sessionKey, r.status, r.attempts, r.last_seen AS lastSeenAt,
@@ -93,8 +100,27 @@ export class PollCoordinator extends DurableObject<Env> {
       return { skipped: true };
     }
 
-    const outcome = await runPoll(this.env, snapshot.state, new Date(startedAt).toISOString(),
-      this.ctx.storage, snapshot.rosterMessages, snapshot.pendingOffline);
+    let outcome: Awaited<ReturnType<typeof runPoll>>;
+    try {
+      outcome = await runPoll(this.env, snapshot.state, new Date(startedAt).toISOString(), {
+        storage: this.ctx.storage,
+        previousRosterMessages: snapshot.rosterMessages,
+        previousPendingOffline: snapshot.pendingOffline,
+      });
+    } catch (err) {
+      // A config/precondition throw never reached the outcome object below,
+      // so record the same lastPollStartedAt/error shape by hand: otherwise
+      // a misconfigured bot bypasses MIN_POLL_INTERVAL on every invocation.
+      await this.ctx.storage.put(POLL_SNAPSHOT_KEY, {
+        state: snapshot.state,
+        ...(snapshot.pendingOffline?.length ? { pendingOffline: snapshot.pendingOffline } : {}),
+        ...(snapshot.rosterMessages?.length ? { rosterMessages: snapshot.rosterMessages } : {}),
+        lastPollStartedAt: startedAt,
+        ...(snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt }),
+        error: err instanceof Error ? err.message : String(err),
+      } satisfies PollSnapshot);
+      throw err;
+    }
     // One durable write commits the state, cadence, and outcome together.
     // No successful response or in-memory checkpoint precedes persistence.
     await this.ctx.storage.put(POLL_SNAPSHOT_KEY, {

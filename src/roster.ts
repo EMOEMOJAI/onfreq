@@ -1,6 +1,6 @@
 import { deleteMessage, DiscordApiError, editMessage, postMessage, type DiscordEmbed } from './discord';
 import type { RosterMessage } from './types';
-import type { DiscordRateLimits } from './discord-rate-limit';
+import { DiscordRateLimitError, type DiscordRateLimits } from './discord-rate-limit';
 
 export interface RosterTarget {
   channelId: string;
@@ -8,6 +8,9 @@ export interface RosterTarget {
   /** Absent while the parent edit is failing: preserve its existing continuations. */
   embeds?: DiscordEmbed[];
 }
+
+/** Extra polls an undeletable roster continuation is retried for before it is dropped. */
+const DELETE_RETRY_POLLS = 10;
 
 /** Reconcile separately sent pages, retaining failed edits/deletions for later polls. */
 export async function syncRosterMessages(
@@ -32,8 +35,19 @@ export async function syncRosterMessages(
     try {
       await deleteMessage(botToken, ref.channelId, ref.messageId, limits);
     } catch (err) {
-      messages.push({ ...ref });
+      // A permanently forbidden channel (403) must not be retried every poll
+      // forever: cap it the same way an undeliverable offline closeout is,
+      // excluding rate-limit deferrals from the count.
+      const rateLimited = err instanceof DiscordRateLimitError;
+      const used = (ref.deleteAttempts ?? 0) + (rateLimited ? 0 : 1);
       logFailure('delete', ref.channelId, ref.parentMessageId, err);
+      if (rateLimited || used <= DELETE_RETRY_POLLS) {
+        messages.push({ ...ref, deleteAttempts: used });
+      } else {
+        console.error(JSON.stringify({
+          event: 'roster_delete_abandoned', channelId: ref.channelId, parentMessageId: ref.parentMessageId,
+        }));
+      }
     }
   }
 

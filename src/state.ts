@@ -35,6 +35,12 @@ export function diffState(
   let changed = false;
 
   function close(tracked: TrackedAtc, missed: number, endedAt: string): void {
+    // `pendingChannelIds` set (even to an empty array) alongside no
+    // successful `messages` means this session never earned a real ONLINE
+    // card — every caller that persists a session without messages (a
+    // failed announcement, or silently seeding first-run state) must set
+    // `pendingChannelIds` for this to hold; a legacy session predating both
+    // fields has neither, and is treated as already announced.
     if (tracked.pending || (tracked.pendingChannelIds && !tracked.messages?.length)) return;
     const durationSeconds = Math.max(0, Math.round(
       (Date.parse(endedAt) - Date.parse(tracked.since)) / 1000,

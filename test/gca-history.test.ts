@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { SELF, reset, runInDurableObject } from 'cloudflare:test';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { COORDINATOR_NAME } from '../src/config';
 
@@ -57,6 +57,18 @@ it('paginates without dropping or repeating a connection', async () => {
   expect(second.records).toHaveLength(5);
   expect(second.nextCursor).toBeNull();
   expect(new Set([...first.records, ...second.records].map((row) => JSON.stringify(row))).size).toBe(105);
+});
+
+it('returns a generic failure if the coordinator is unavailable', async () => {
+  await seed();
+  await runInDurableObject(env.POLL_COORDINATOR.getByName(COORDINATOR_NAME), (_instance, ctx) => {
+    vi.spyOn(ctx.storage.sql, 'exec').mockImplementationOnce(() => {
+      throw new Error('synthetic private storage details');
+    });
+  });
+  const response = await SELF.fetch('https://example.com/gca-history', { headers });
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({ error: 'coordinator unavailable' });
 });
 
 it('rejects invalid cursors and write methods', async () => {

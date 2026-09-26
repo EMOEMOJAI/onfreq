@@ -84,6 +84,8 @@ export interface RosterMessage extends PostedMessage {
   parentMessageId: string;
   /** Zero-based index within the continuation messages (excluding the main card). */
   page: number;
+  /** Failed delete attempts (e.g. a permanently forbidden channel); rate-limit deferrals don't count. */
+  deleteAttempts?: number;
 }
 
 /** An ATC position we are tracking across polls. */
@@ -105,6 +107,8 @@ export interface TrackedAtc extends OnlineAtc {
   messages?: PostedMessage[];
   /** Online destinations still awaiting their first successful card. */
   pendingChannelIds?: string[];
+  /** Failed initial-card attempts per pending destination; rate-limit deferrals don't count. */
+  onlineAttemptsByChannel?: Record<string, number>;
   /**
    * Connected, but the feed has not published a frequency yet (0.000 MHz).
    * Tracked so the start time is right, but not announced and never given
@@ -117,11 +121,6 @@ export interface TrackedAtc extends OnlineAtc {
    * waiting for a frequency and so was carded later than it connected.
    */
   cardAt?: string;
-  /**
-   * This session is the intended host of the "also online now" roster.
-   * Per-message onlineEmbed records successful edits, so failed changes retry.
-   */
-  roster?: boolean;
 }
 
 /** Persisted session state, keyed by callsign. */

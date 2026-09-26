@@ -39,6 +39,21 @@ it.each(['', '   ', 'preserved-state'])('uses the same identity for cron with ov
   expect(poll).toHaveBeenCalledOnce();
 });
 
+it('rethrows a scheduled poll failure so the invocation is recorded as failed', async () => {
+  const poll = vi.fn(async () => { throw new Error('synthetic scheduled failure'); });
+  const getByName = vi.fn(() => ({ poll }));
+  await expect(worker.scheduled(createScheduledController(),
+    { ...env, POLL_COORDINATOR: { getByName } as unknown as Env['POLL_COORDINATOR'] },
+    createExecutionContext())).rejects.toThrow('synthetic scheduled failure');
+});
+
+it('reports GET / as reachable without authentication', async () => {
+  const response = await worker.fetch(new Request('https://example.test/'), env, createExecutionContext());
+  expect(response.status).toBe(200);
+  expect(response.headers.get('content-type')).toContain('text/plain');
+  expect(await response.text()).toContain('onfreq HTTP endpoint is reachable');
+});
+
 it('reads existing durable state through the override without starting a new coordinator', async () => {
   const selected = env.POLL_COORDINATOR.getByName('preserved-state');
   const lastSuccessfulPollAt = Date.now();
