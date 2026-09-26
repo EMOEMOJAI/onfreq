@@ -14,7 +14,7 @@ import { COORDINATOR_NAME, IVAO_ATC_SUMMARY_URL, POLL_SNAPSHOT_KEY, STATE_KEY } 
 import { PollCoordinator, type PollSnapshot } from '../src/coordinator';
 import { buildOnlineEmbed, type DiscordEmbed } from '../src/discord';
 import { resetTokenCache } from '../src/ivao';
-import type { IvaoAtcSummaryEntry, StateMap, TrackedAtc } from '../src/types';
+import type { IvaoAtcSummaryEntry, PendingOffline, StateMap, TrackedAtc } from '../src/types';
 import { AUTH_HEADERS } from './helpers';
 
 const START = Date.parse('2026-09-06T10:00:00Z');
@@ -338,6 +338,22 @@ describe('polling through the Durable Object', () => {
     expect((await snapshot())?.lastSuccessfulPollAt).toBeUndefined();
     now += 60_000;
     await expect(configuredPoll()).resolves.toEqual({ skipped: false });
+  });
+
+  it('strips a legacy roster field from an imported pending-offline event', async () => {
+    // V2-A4: this event comes straight from a stored `PendingOffline` job,
+    // never through `diffState`'s own stripping.
+    await runInDurableObject(stub(), async (_, ctx) => {
+      const event = {
+        ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600, roster: true,
+      } as PendingOffline['event'];
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
+        event, messages: [{ channelId: 'test-channel', messageId: a }], channelIds: [],
+      }] } satisfies PollSnapshot);
+    });
+    await expect(configuredPoll()).resolves.toEqual({ skipped: false });
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    expect(cards.get(a)?.title).toContain('OFFLINE');
   });
 
   it('closes out an ended session before announcing a new one in the same poll', async () => {
@@ -1219,6 +1235,8 @@ describe('polling through the Durable Object', () => {
       await prepare();
       await poll();
       const page = (await snapshot())!.rosterMessages![0]!;
+      const originalPost = sent.find((message) => message.method === 'POST' && message.id === page.messageId)!;
+      expect(originalPost.nonce).toBeTruthy();
       const atc = feed.find((item) => item.callsign === 'QE119_TWR')!;
       atc.atcSession.frequency = 121.7;
       failures.add(page.messageId);
@@ -1237,9 +1255,14 @@ describe('polling through the Durable Object', () => {
       expect(replacement.messageId).not.toBe(page.messageId);
       expect(cards.get(replacement.messageId)?.fields?.some((field) => field.value.includes('122.800'))).toBe(true);
       expect(visibleCallsigns()).toHaveLength(121);
+      // X-P3-4: the re-post after the previous copy was found gone must use a
+      // different nonce, so Discord never hands back the deleted message.
+      const replacementPost = sent.find((message) => message.method === 'POST' && message.id === replacement.messageId)!;
+      expect(replacementPost.nonce).toBeTruthy();
+      expect(replacementPost.nonce).not.toBe(originalPost.nonce);
     });
 
-    it('abandons a roster continuation page whose edit keeps failing (not merely a 404)', async () => {
+    it('freezes a roster continuation page whose edit keeps failing instead of re-posting it as a duplicate', async () => {
       await prepare();
       await poll();
       const page = (await snapshot())!.rosterMessages![0]!;
@@ -1250,7 +1273,50 @@ describe('polling through the Durable Object', () => {
       for (let i = 0; i < 11; i++) {
         expect((await nextPoll()).status).toBe(500);
       }
-      expect((await snapshot())?.rosterMessages).toBeUndefined();
+      // X-P3-3: frozen in place, not removed — an absent entry would read as
+      // "never posted" and get re-created as a duplicate next poll.
+      const frozen = (await snapshot())!.rosterMessages!;
+      expect(frozen).toHaveLength(1);
+      expect(frozen[0]).toMatchObject({ messageId: page.messageId, abandoned: true });
+      const postsBefore = sent.filter((message) => message.method === 'POST').length;
+      const editsBefore = sent.filter((message) => message.method === 'PATCH').length;
+      // One poll past abandonment: no new POST and no change to tracking.
+      expect((await nextPoll()).status).toBe(200);
+      expect(sent.filter((message) => message.method === 'POST')).toHaveLength(postsBefore);
+      expect(sent.filter((message) => message.method === 'PATCH')).toHaveLength(editsBefore);
+      expect((await snapshot())?.rosterMessages).toEqual(frozen);
+    });
+
+    it('gives a continuation post that has never once succeeded a retry budget too', async () => {
+      await prepare(400);
+      await poll();
+      const pages = (await snapshot())!.rosterMessages!;
+      expect(pages.length).toBeGreaterThan(1);
+      const lastPage = pages.reduce((max, item) => (item.page > max.page ? item : max), pages[0]!);
+      // Drop tracking for the last page, as if its very first POST had
+      // already failed and left nothing behind: there is no way to tell that
+      // apart from "never posted" without a dedicated attempt counter
+      // (P3-R3b), so its next attempt goes through the exact same path.
+      await runInDurableObject(stub(), async (_instance, ctx) => {
+        const existing = (await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY))!;
+        await ctx.storage.put(POLL_SNAPSHOT_KEY, {
+          ...existing, rosterMessages: pages.filter((item) => item !== lastPage),
+        } satisfies PollSnapshot);
+      });
+      failures.add('POST');
+      failureStatus = 400;
+      for (let i = 0; i < 11; i++) {
+        expect((await nextPoll()).status).toBe(500);
+      }
+      // Abandoned like every other budget: still never posted, and still not
+      // tracked (nothing to freeze in place since no message ever existed).
+      expect((await snapshot())!.rosterMessages!.map((item) => item.page).sort())
+        .toEqual(pages.filter((item) => item !== lastPage).map((item) => item.page).sort());
+      const postsBefore = sent.filter((message) => message.method === 'POST').length;
+      failures.clear();
+      expect((await nextPoll()).status).toBe(200);
+      // Abandoned: no further attempt is made even once delivery would succeed.
+      expect(sent.filter((message) => message.method === 'POST')).toHaveLength(postsBefore);
     });
 
     it('keeps continuations until a failed parent edit has succeeded', async () => {

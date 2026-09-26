@@ -86,6 +86,25 @@ describe('diffState', () => {
     expect(result.next['QESS_APP']).not.toHaveProperty('roster');
   });
 
+  // V2-A4: a legacy `roster` field must not survive on a session that only
+  // ever stays missing (never resumes), or on the offline event a closed-out
+  // session is copied into — not just on one that resumes.
+  it('strips a legacy roster field from a session that stays missing during the grace window', () => {
+    const prev: StateMap = {
+      QESS_APP: { ...tracked('QESS_APP'), roster: true } as TrackedAtc,
+    };
+    const result = diffState(prev, [], NOW, 2);
+    expect(result.next['QESS_APP']).not.toHaveProperty('roster');
+  });
+
+  it('strips a legacy roster field from a closed-out offline event', () => {
+    const prev: StateMap = {
+      QESS_APP: { ...tracked('QESS_APP', { missed: 1 }), roster: true } as TrackedAtc,
+    };
+    const result = diffState(prev, [], NOW, 2);
+    expect(result.wentOffline[0]).not.toHaveProperty('roster');
+  });
+
   it('reports offline once the grace window is exhausted', () => {
     const prev: StateMap = { QESS_APP: tracked('QESS_APP', { missed: 1 }) };
     const result = diffState(prev, [], NOW, 2);

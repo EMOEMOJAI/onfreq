@@ -1,3 +1,18 @@
+import { DiscordApiError } from './discord';
+
+/**
+ * A definite Discord-side rejection (4xx, excluding the 429 rate-limit
+ * deferral, which throws a distinct `DiscordRateLimitError` instead) counts
+ * against a bounded retry budget. A 5xx outage, a timeout/network error
+ * (neither is a `DiscordApiError`), or a rate-limit deferral is transient and
+ * retried indefinitely instead. Shared by the online first-card budget,
+ * the offline closeout budget, and the roster page budgets so they agree on
+ * what "permanent" means (X-P3-2).
+ */
+export function countsAgainstBudget(err: unknown): boolean {
+  return err instanceof DiscordApiError && err.status >= 400 && err.status <= 499;
+}
+
 /**
  * Shapes returned by https://api.ivao.aero/v2/tracker/now/atc/summary
  * (only the fields this bot uses).
@@ -86,8 +101,35 @@ export interface RosterMessage extends PostedMessage {
   page: number;
   /** Failed delete attempts (e.g. a permanently forbidden channel); rate-limit deferrals don't count. */
   deleteAttempts?: number;
-  /** Failed edit/post attempts for this page; rate-limit deferrals don't count. */
+  /**
+   * Failed edit attempts for this already-posted page since its last success
+   * (4xx only, via `countsAgainstBudget`; rate-limit deferrals don't count).
+   * Cleared on `abandoned` since there's nothing left to count towards.
+   */
   pageAttempts?: number;
+  /**
+   * Permanently gave up on this page (its budget above was exhausted): frozen
+   * in place, never edited or re-posted, while its parent target still lives
+   * (X-P3-3). An absent entry reads as "never posted" and would otherwise be
+   * re-created as a duplicate the next poll.
+   */
+  abandoned?: true;
+}
+
+/**
+ * Tracks failed continuation-post attempts for a page that has never once
+ * posted successfully, so it has no `RosterMessage` of its own to hold a
+ * counter on (P3-R3b). Keyed by destination + page since there is no message
+ * id yet; dropped once the page is no longer targeted.
+ */
+export interface RosterPostAttempt {
+  channelId: string;
+  parentMessageId: string;
+  page: number;
+  /** Failed post attempts (4xx only, via `countsAgainstBudget`); rate-limit deferrals don't count. */
+  attempts: number;
+  /** Permanently gave up: never retried again while this parent target lives. */
+  abandoned?: true;
 }
 
 /** An ATC position we are tracking across polls. */

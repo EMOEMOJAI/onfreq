@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { MIN_POLL_INTERVAL_MS, POLL_SNAPSHOT_KEY, STATE_KEY } from './config';
 import { runPoll } from './poll';
-import type { PendingOffline, RosterMessage, StateMap } from './types';
+import type { PendingOffline, RosterMessage, RosterPostAttempt, StateMap } from './types';
 import { cleanupGcaCopies } from './retention';
 
 export const HEALTH_MAX_AGE_MS = 5 * 60_000;
@@ -9,6 +9,8 @@ export const HEALTH_MAX_AGE_MS = 5 * 60_000;
 export interface PollSnapshot {
   state: StateMap | null;
   rosterMessages?: RosterMessage[];
+  /** P3-R3b: budget for continuation pages that have never once posted successfully. */
+  rosterPostAttempts?: RosterPostAttempt[];
   pendingOffline?: PendingOffline[];
   lastPollStartedAt?: number;
   lastSuccessfulPollAt?: number;
@@ -105,6 +107,7 @@ export class PollCoordinator extends DurableObject<Env> {
       outcome = await runPoll(this.env, snapshot.state, new Date(startedAt).toISOString(), {
         storage: this.ctx.storage,
         previousRosterMessages: snapshot.rosterMessages,
+        previousRosterPostAttempts: snapshot.rosterPostAttempts,
         previousPendingOffline: snapshot.pendingOffline,
       });
     } catch (err) {
@@ -118,6 +121,7 @@ export class PollCoordinator extends DurableObject<Env> {
           state: snapshot.state,
           ...(snapshot.pendingOffline?.length ? { pendingOffline: snapshot.pendingOffline } : {}),
           ...(snapshot.rosterMessages?.length ? { rosterMessages: snapshot.rosterMessages } : {}),
+          ...(snapshot.rosterPostAttempts?.length ? { rosterPostAttempts: snapshot.rosterPostAttempts } : {}),
           lastPollStartedAt: startedAt,
           ...(snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt }),
           error: err instanceof Error ? err.message : String(err),
@@ -133,6 +137,7 @@ export class PollCoordinator extends DurableObject<Env> {
       state: outcome.state,
       ...(outcome.pendingOffline.length ? { pendingOffline: outcome.pendingOffline } : {}),
       ...(outcome.rosterMessages.length ? { rosterMessages: outcome.rosterMessages } : {}),
+      ...(outcome.rosterPostAttempts.length ? { rosterPostAttempts: outcome.rosterPostAttempts } : {}),
       lastPollStartedAt: startedAt,
       ...(outcome.error
         ? (snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt })

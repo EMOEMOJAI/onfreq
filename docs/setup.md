@@ -66,7 +66,7 @@ GCA coverage is private configuration, with no built-in region list. Set `GCA_RE
 
 **Recipient setup:** staff must verify each member's VID and assign the member role. The server nickname must contain exactly one six-digit VID, for example `Example (600001)`, with no other numbers. Duplicate VIDs anywhere in the server are skipped; restrict nickname changes to keep this mapping trustworthy. Supply a known home country through IVAO API credentials or `GCA_HOME_OVERRIDES`; unknown codes such as `ZZ` are invalid. Test a new connection after setup: existing connections are baselined, and fixing an unmapped nickname does not retry that same connection.
 
-`OFFLINE_GRACE_POLLS` is the only plain Wrangler variable; the default is two missed polls. Public cards retry failed destinations without resetting connection times; crashes between Discord acceptance and storage can still cause duplicates.
+`OFFLINE_GRACE_POLLS` is the only plain Wrangler variable; the default is two missed polls. Public cards retry failed destinations without resetting connection times. Card posts carry a Discord nonce keyed to the session being announced, so a re-send after a crash between Discord acceptance and storage is deduped by Discord within its own nonce window (a few minutes); crashes outside that window can still cause duplicates.
 
 ## Health and optional Mac fallback
 

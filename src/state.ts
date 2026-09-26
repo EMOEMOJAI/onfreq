@@ -2,6 +2,20 @@ import { hasFrequency } from './ivao';
 import type { DiffResult, OfflineEvent, OnlineAtc, StateMap, TrackedAtc } from './types';
 
 /**
+ * `roster` is a legacy field removed from `TrackedAtc`; strip it from any
+ * session loaded from storage before an older deploy wrote it. Used both by
+ * `diffState` (so it never survives on a resumed, still-missing, or
+ * just-closed session) and by callers that load a session or offline event
+ * from storage outside `diffState` (excluded-callsign closeouts, imported
+ * `PendingOffline` jobs) — a legacy field must not survive on any of those
+ * paths either (V2-A4).
+ */
+export function stripLegacyRoster<T extends TrackedAtc>(session: T): T {
+  const { roster: _legacyRoster, ...kept } = session as T & { roster?: boolean };
+  return kept as T;
+}
+
+/**
  * Compare the previous tracked state with the current poll result.
  *
  * - A callsign not seen before goes into `wentOnline`.
@@ -27,6 +41,10 @@ export function diffState(
   nowIso: string,
   gracePolls: number,
 ): DiffResult {
+  // V2-A4: strip a legacy `roster` field from every loaded session up front,
+  // not just ones that resume below — it must not survive on a session that
+  // stays missing, or on the offline event `close()` copies out.
+  prev = Object.fromEntries(Object.entries(prev).map(([callsign, session]) => [callsign, stripLegacyRoster(session)]));
   const next: StateMap = {};
   const wentOnline: TrackedAtc[] = [];
   const wentOffline: OfflineEvent[] = [];
@@ -57,10 +75,8 @@ export function diffState(
       if (existing.missed !== 0 || existing.missingSince !== undefined) changed = true;
       // `missingSince` is dropped rather than overwritten so a resumed
       // session doesn't carry a stale end time. `messages` is preserved.
-      // `roster` is a legacy field removed from `TrackedAtc`; strip it from
-      // any session loaded from storage before an older deploy wrote it.
-      const { missingSince: _resumed, pending: _held, roster: _legacyRoster, ...kept } =
-        existing as TrackedAtc & { roster?: boolean };
+      // `roster` was already stripped above.
+      const { missingSince: _resumed, pending: _held, ...kept } = existing;
       const entry: TrackedAtc = {
         ...kept,
         ...atc,

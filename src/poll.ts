@@ -17,12 +17,15 @@ import {
   parseExcludedCallsigns,
   parsePrefixes,
 } from './ivao';
-import { diffState, newestCardedSession } from './state';
+import { diffState, newestCardedSession, stripLegacyRoster } from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
 import { gcaMismatch, parseGcaPolicy, sendGcaReminders, type GcaPolicy } from './gca';
 import { syncRosterMessages, type RosterTarget } from './roster';
-import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
-import type { OfflineEvent, PendingOffline, OnlineAtc, PostedMessage, RosterMessage, StateMap, TrackedAtc } from './types';
+import { DiscordRateLimits } from './discord-rate-limit';
+import { countsAgainstBudget } from './types';
+import type {
+  OfflineEvent, PendingOffline, OnlineAtc, PostedMessage, RosterMessage, RosterPostAttempt, StateMap, TrackedAtc,
+} from './types';
 
 function parseGracePolls(raw: string | undefined): number {
   const n = Number.parseInt(raw ?? '', 10);
@@ -65,7 +68,7 @@ async function announceOnline(
   mentionedChannels: Set<string>,
   current: OnlineAtc[],
   holderChannels: Set<string>,
-): Promise<{ posted: PostedMessage[]; failed: Map<string, unknown> }> {
+): Promise<{ posted: PostedMessage[]; failed: Map<string, unknown>; unconfirmed: Set<string> }> {
   const { env, labels, gcaPolicy, limits, nowIso } = ctx;
   const mismatch = highlightMismatch(atc, gcaPolicy);
   const plain = buildOnlineEmbed(atc, current, labels, mismatch);
@@ -76,6 +79,9 @@ async function announceOnline(
   )[0];
   const posted: PostedMessage[] = [];
   const failed = new Map<string, unknown>();
+  // V2-A6: a 2xx POST with no usable id (Discord accepted it, but the
+  // response can't be tied to a message) is never retried.
+  const unconfirmed = new Set<string>();
   for (const channelId of channelIds) {
     // At most one role ping per channel per poll, however many controllers
     // connected at once.
@@ -85,18 +91,34 @@ async function announceOnline(
         : undefined;
     const embed = holderChannels.has(channelId) ? holder : plain;
     try {
-      // A POST whose 5xx hid a success is re-sent next poll; the stable nonce
-      // lets Discord return the original message instead of a duplicate card.
+      // A POST whose 5xx hid a success is re-sent next poll; a nonce keyed to
+      // this tracked session (`since`, not the IVAO-issued `sessionId`, which
+      // changes across a grace-window resume) lets Discord return the
+      // original message instead of a duplicate card (X-P3-1).
       const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits,
-        messageNonce(`online:${atc.userId}:${atc.sessionId}`, channelId));
+        messageNonce(`online:${atc.userId}:${atc.since}`, channelId));
       posted.push({ channelId, messageId, postedAt: nowIso, onlineEmbed: JSON.stringify(embed) });
       if (content) mentionedChannels.add(channelId);
     } catch (err) {
+      // V2-A6: `postMessage` throws this specific, bodyless `Error` (rather
+      // than a `DiscordApiError`) only for a 2xx response with no `id` field.
+      // Retrying would either accept a literal duplicate or spin forever with
+      // nothing to dedupe against on our side, so this destination is
+      // abandoned outright instead of joining the bounded 4xx retry budget
+      // below. `entry.messages` stays empty for this channel either way, so
+      // the existing "no card ever sent" invariant still suppresses a
+      // spurious fallback OFFLINE if the session ends before a retry would
+      // have succeeded — matching a destination that never had a card.
+      if (err instanceof Error && err.message === 'Discord API returned a message without an id') {
+        console.error(JSON.stringify({ event: 'online_post_unconfirmed', callsign: atc.callsign, channelId }));
+        unconfirmed.add(channelId);
+        continue;
+      }
       logFailure('online_post_failed', atc.callsign, channelId, err);
       failed.set(channelId, err);
     }
   }
-  return { posted, failed };
+  return { posted, failed, unconfirmed };
 }
 
 /** Reconcile displayed cards, retrying only messages whose last edit failed. */
@@ -172,11 +194,17 @@ async function announceOffline(
   let delivered = 0;
   let failed = false;
   const attempts = job.attemptsByChannel ??= {};
+  // X-P3-2: only a definite Discord-side rejection (4xx, excluding the 429
+  // rate-limit deferral) counts towards this budget, via the same predicate
+  // the online first-card and roster page budgets use; a 5xx outage or a
+  // timeout/network error is transient and retried indefinitely instead —
+  // previously any non-rate-limited error counted, so a prolonged 5xx outage
+  // could abandon a closeout and leave a stale green card.
   const keepForRetry = (channelId: string, err: unknown): boolean => {
     failed = true;
-    const rateLimited = err instanceof DiscordRateLimitError;
-    const used = (attempts[channelId] ?? job.attempts ?? 0) + (rateLimited ? 0 : 1);
-    if (rateLimited || used <= OFFLINE_RETRY_POLLS) {
+    const counts = countsAgainstBudget(err);
+    const used = (attempts[channelId] ?? job.attempts ?? 0) + (counts ? 1 : 0);
+    if (!counts || used <= OFFLINE_RETRY_POLLS) {
       attempts[channelId] = used;
       return true;
     }
@@ -184,7 +212,10 @@ async function announceOffline(
     console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign, channelId }));
     return false;
   };
-  const offlineKey = `offline:${job.event.userId}:${job.event.sessionId}`;
+  // X-P3-1: keyed on the tracked session's stable `since`, not the
+  // IVAO-issued `sessionId`, so a genuinely new session at the same callsign
+  // never collides with this one's nonce.
+  const offlineKey = `offline:${job.event.userId}:${job.event.since}`;
   for (const ref of job.messages) {
     try {
       await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, endedEmbed, limits);
@@ -230,6 +261,8 @@ async function announceOffline(
 export interface PollOutcome {
   state: StateMap;
   rosterMessages: RosterMessage[];
+  /** P3-R3b: budget for continuation pages that have never once posted successfully. */
+  rosterPostAttempts: RosterPostAttempt[];
   pendingOffline: PendingOffline[];
   error?: string;
 }
@@ -237,6 +270,7 @@ export interface PollOutcome {
 export interface RunPollOptions {
   storage?: DurableObjectStorage;
   previousRosterMessages?: RosterMessage[];
+  previousRosterPostAttempts?: RosterPostAttempt[];
   previousPendingOffline?: PendingOffline[];
 }
 
@@ -244,7 +278,9 @@ export interface RunPollOptions {
 export async function runPoll(
   env: Env, stored: StateMap | null, nowIso: string, options: RunPollOptions = {},
 ): Promise<PollOutcome> {
-  const { storage, previousRosterMessages = [], previousPendingOffline = [] } = options;
+  const {
+    storage, previousRosterMessages = [], previousRosterPostAttempts = [], previousPendingOffline = [],
+  } = options;
   const channelIds = [...new Set(parseChannelIds(env.DISCORD_CHANNEL_IDS))];
   if (!channelIds.length || !env.DISCORD_BOT_TOKEN?.trim()) {
     throw new Error('Discord bot token and notification channels are required');
@@ -274,7 +310,9 @@ export async function runPoll(
   const excludedClosures: OfflineEvent[] = [];
   for (const callsign of Object.keys(prev)) {
     if (isExcludedCallsign(callsign, excluded)) {
-      const tracked = prev[callsign]!;
+      // V2-A4: strip a legacy `roster` field here too — this session comes
+      // straight from storage, not through `diffState`'s own stripping.
+      const tracked = stripLegacyRoster(prev[callsign]!);
       if (!tracked.pending && tracked.messages?.length) {
         // A session already missing (grace window) keeps the poll it went
         // missing as its end time, matching `diffState`'s `close()`, instead
@@ -323,7 +361,10 @@ export async function runPoll(
     // later disconnects would silently earn a fallback OFFLINE post despite
     // never having had a real ONLINE card.
     for (const session of Object.values(next)) session.pendingChannelIds ??= [];
-    return { state: next, rosterMessages: previousRosterMessages, pendingOffline: previousPendingOffline };
+    return {
+      state: next, rosterMessages: previousRosterMessages, rosterPostAttempts: previousRosterPostAttempts,
+      pendingOffline: previousPendingOffline,
+    };
   }
 
   let attempted = 0;
@@ -350,6 +391,9 @@ export async function runPoll(
       const { attemptsByChannel: _oldAttempts, ...rest } = job;
       return {
         ...rest,
+        // V2-A4: this event was loaded from storage across a poll boundary,
+        // never through `diffState`'s own stripping — strip it here too.
+        event: stripLegacyRoster(rest.event),
         messages,
         channelIds: jobChannelIds,
         ...(prunedAttempts && Object.keys(prunedAttempts).length ? { attemptsByChannel: prunedAttempts } : {}),
@@ -388,9 +432,9 @@ export async function runPoll(
     const holderChannels = new Set(targets.filter((id) => lastPoster.get(id) === entry));
     // No destination left needing a first card: skip building/posting
     // embeds and just run the bookkeeping below.
-    const { posted, failed } = targets.length
+    const { posted, failed, unconfirmed } = targets.length
       ? await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels)
-      : { posted: [] as PostedMessage[], failed: new Map<string, unknown>() };
+      : { posted: [] as PostedMessage[], failed: new Map<string, unknown>(), unconfirmed: new Set<string>() };
     delivered += posted.length;
     if (failed.size) deliveryFailed = true;
     if (posted.length) {
@@ -411,10 +455,14 @@ export async function runPoll(
     const kept: string[] = [];
     for (const id of targets) {
       if (posted.some((ref) => ref.channelId === id)) continue;
+      // V2-A6: a 2xx-but-unconfirmed destination is dropped outright, same as
+      // one that just exhausted its budget below — never retried, and never
+      // given a counter.
+      if (unconfirmed.has(id)) continue;
       const err = failed.get(id);
-      const countsAgainstBudget = err instanceof DiscordApiError && err.status >= 400 && err.status <= 499;
-      const used = (previousAttempts[id] ?? 0) + (countsAgainstBudget ? 1 : 0);
-      if (!countsAgainstBudget || used <= OFFLINE_RETRY_POLLS) {
+      const counts = countsAgainstBudget(err);
+      const used = (previousAttempts[id] ?? 0) + (counts ? 1 : 0);
+      if (!counts || used <= OFFLINE_RETRY_POLLS) {
         attempts[id] = used;
         kept.push(id);
       } else {
@@ -431,8 +479,11 @@ export async function runPoll(
   }
 
   const cards = await syncOnlineCards(ctx, next, current);
-  const roster = await syncRosterMessages(env.DISCORD_BOT_TOKEN, previousRosterMessages, cards.targets, limits);
+  const roster = await syncRosterMessages(
+    env.DISCORD_BOT_TOKEN, previousRosterMessages, cards.targets, limits, previousRosterPostAttempts,
+  );
   const rosterMessages = roster.messages;
+  const rosterPostAttempts = roster.postAttempts;
   const rosterFailed = cards.failed || roster.failed;
 
   if (attempted > 0) {
@@ -453,6 +504,7 @@ export async function runPoll(
   return {
     state: next,
     rosterMessages,
+    rosterPostAttempts,
     pendingOffline,
     ...(deliveryFailed && delivered > 0 ? { error: 'some Discord notifications failed' } :
       attempted > 0 && delivered === 0 ? { error: 'all Discord notifications failed' } :
