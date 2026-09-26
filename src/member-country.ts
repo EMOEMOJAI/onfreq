@@ -1,11 +1,16 @@
+import { TOKEN_KEY } from './config';
 import { fetchBuffered } from './http';
-import { getAccessToken, hasFrequency } from './ivao';
+import { getAccessToken, hasFrequency, resetTokenCache } from './ivao';
 import type { IvaoAuth, MemberCountry, OnlineAtc, StateMap } from './types';
 
 const COUNTRY_TTL_MS = 24 * 60 * 60 * 1000;
 const RETRY_MS = 15 * 60 * 1000;
 // Bound optional enrichment work even when many controllers connect at once.
 const MAX_LOOKUPS_PER_POLL = 5;
+/** A profile request failing with one of these means the whole batch is
+ * currently blocked (bad/rejected auth, or already rate-limited) — further
+ * lookups in the same run would just fail the same way. */
+const STOP_RUN_STATUSES = new Set([401, 403, 429]);
 
 export function countryCode(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -33,36 +38,62 @@ export async function enrichMemberCountries(
     .sort((a, b) => (cached.get(a)?.expiresAt ?? 0) - (cached.get(b)?.expiresAt ?? 0))
     .slice(0, MAX_LOOKUPS_PER_POLL);
   let token: Promise<string> | undefined;
-  await Promise.all(ids.map(async (id) => {
+  // Sequential, not Promise.all: a 401/403/429 means the rest of this batch
+  // would fail the same way, so later ids in the list are skipped entirely.
+  let stopRun = false;
+  for (const id of ids) {
+    if (stopRun) break;
     const key = `ivao-member-country-v1:${id}`;
-    let value: MemberCountry = { countryId: cached.get(id)?.countryId ?? null, expiresAt: now + RETRY_MS };
+    let value: MemberCountry;
+    let persist = true;
     try {
       const stored = await auth.kv.get<MemberCountry>(key, 'json');
       if (stored && stored.expiresAt > now) {
         cached.set(id, { countryId: countryCode(stored.countryId), expiresAt: stored.expiresAt });
-        return;
+        continue;
       }
       token ??= getAccessToken(auth);
       const res = await fetchBuffered(`https://api.ivao.aero/v2/users/${id}`, {
         headers: { accept: 'application/json', authorization: `Bearer ${await token}` },
       });
-      if (!res.ok) throw new Error(`IVAO profile request failed with ${res.status}`);
+      if (!res.ok) {
+        if (res.status === 401) {
+          // The cached token was rejected; reset it like the tracker feed
+          // does, so the next lookup or poll mints a fresh one instead of
+          // failing the same way for up to ~28 more minutes.
+          resetTokenCache();
+          try {
+            await auth.kv.delete(TOKEN_KEY);
+          } catch (err) {
+            console.warn(JSON.stringify({ event: 'ivao_token_delete_failed', error: String(err) }));
+          }
+        }
+        if (STOP_RUN_STATUSES.has(res.status)) stopRun = true;
+        throw new Error(`IVAO profile request failed with ${res.status}`);
+      }
       const body = await res.json() as { countryId?: unknown } | null;
       value = { countryId: countryCode(body?.countryId), expiresAt: now + COUNTRY_TTL_MS };
     } catch {
-      // Keep a previously known country during transient failures; retry later.
+      // Keep a previously known country during transient failures; retry
+      // later. Not written to KV below: a failing lookup must not consume
+      // the KV write quota on every poll, only this run's in-memory map and
+      // the session snapshot (via `previous`) carry the backoff forward.
       console.warn(JSON.stringify({ event: 'member_country_unavailable', userId: id }));
+      value = { countryId: cached.get(id)?.countryId ?? null, expiresAt: now + RETRY_MS };
+      persist = false;
     }
     cached.set(id, value);
-    try {
-      // Store only the country and expiry, never the rest of the member profile.
-      await auth.kv.put(key, JSON.stringify(value), {
-        expirationTtl: Math.max(60, Math.ceil((value.expiresAt - now) / 1000)),
-      });
-    } catch {
-      // The coordinator snapshot still retains this cache entry for the session.
-      console.warn(JSON.stringify({ event: 'member_country_cache_failed', userId: id }));
+    if (persist) {
+      try {
+        // Store only the country and expiry, never the rest of the member profile.
+        await auth.kv.put(key, JSON.stringify(value), {
+          expirationTtl: Math.max(60, Math.ceil((value.expiresAt - now) / 1000)),
+        });
+      } catch {
+        // The coordinator snapshot still retains this cache entry for the session.
+        console.warn(JSON.stringify({ event: 'member_country_cache_failed', userId: id }));
+      }
     }
-  }));
+  }
   for (const atc of current) atc.memberCountry = cached.get(atc.userId) ?? null;
 }
