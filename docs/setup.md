@@ -15,7 +15,7 @@
 | `DISCORD_BOT_TOKEN` | The token from your application's **Bot** page |
 | `DISCORD_CHANNEL_IDS` | Enable Discord **Developer Mode**, right-click each text channel → **Copy Channel ID**; separate multiple IDs with commas |
 | `FIR_PREFIXES` | Your chosen ICAO callsign prefixes, separated by commas; each is 1–4 letters, with no default region |
-| `POLL_SECRET` | Generate a random secret with your password manager or `openssl rand -hex 32`; save it privately for health checks |
+| `POLL_SECRET` | Generate a random secret of at least 32 characters with your password manager or `openssl rand -hex 32`; save it privately for health checks |
 
 Channel overrides must allow all four permissions; roster continuations are replies. Store values as encrypted **Worker secrets**, never in repository files, build variables or GitHub Actions. GCA reminders stay off until configured. Usage follows your [Cloudflare plan](https://developers.cloudflare.com/durable-objects/platform/pricing/).
 
@@ -61,6 +61,7 @@ The public `npm run deploy` command uses `wrangler.jsonc`. It stops if a private
 | `GCA_REGIONS` | Private region names, callsign prefixes and home-country groups |
 | `GCA_APPROVALS`, `GCA_HOME_OVERRIDES` | Operator-maintained approvals and home-region corrections |
 | `GCA_COPY_USER_ID`, `GCA_POLICY_URL` | Optional staff copies and policy link |
+| `HISTORY_SECRET` | Separate bearer secret for private history endpoints |
 
 GCA coverage is private configuration, with no built-in region list. Set `GCA_REGIONS` before upgrading an existing reminder deployment. Malformed or absent coverage or approval records disable reminders; `{}` explicitly means no approvals. These records are not an authoritative registry. A first enabled poll baselines existing connections. Possible DM deliveries are not repeated, so ambiguous failures can mean a missed reminder. See [data retention](../SECURITY.md#data-retention) before enabling this feature.
 
@@ -70,7 +71,7 @@ GCA coverage is private configuration, with no built-in region list. Set `GCA_RE
 
 ## Health and optional Mac fallback
 
-`GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs.
+`GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters count as unset: their endpoints return 503.
 
 The Mac helper reads private files under `~/.onfreq`. Create that directory with mode 0700; store your HTTPS `/poll` URL in `poll-endpoint` and the URL-safe token in `poll-secret`, both mode 0600, using a local editor. Then:
 
@@ -89,6 +90,6 @@ For failures, check `npm run tail`. A 401 means the token is wrong; a 403 from D
 
 ## Private history maintenance
 
-`POLL_SECRET` also grants access to `GET /gca-history`. This is private member data; do not give the token to third-party uptime monitors.
+`GET /gca-history` and `/gca-history/cleanup` require `Authorization: Bearer <HISTORY_SECRET>`, a separate secret of at least 32 characters; `POLL_SECRET` does not grant access. Without it these endpoints return 503. History is private member data; keep this token off monitors and the Mac helper.
 
 Preview old staff-copy cleanup with `GET /gca-history/cleanup`. Applying it requires `POST` plus `X-Onfreq-Confirm: delete-old-copies`; it removes at most 500 eligible copies older than 30 days and may cancel pending copies. A 409 means a poll is running. It preserves reminder/occurrence ledgers and does not erase Discord messages or all member data.
