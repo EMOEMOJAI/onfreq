@@ -3,6 +3,7 @@ import { createExecutionContext, createScheduledController, reset, runInDurableO
 import { afterEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { COORDINATOR_NAME, POLL_SNAPSHOT_KEY } from '../src/config';
+import { AUTH_HEADERS } from './helpers';
 
 afterEach(async () => { vi.restoreAllMocks(); await reset(); });
 
@@ -23,7 +24,7 @@ it.each([
   const configured = { ...env, COORDINATOR_NAME: ' preserved-state ',
     POLL_COORDINATOR: { getByName } as unknown as Env['POLL_COORDINATOR'] };
   const response = await worker.fetch(new Request(`https://example.test${path}`, {
-    method, headers: { authorization: 'Bearer test-poll-secret', 'x-onfreq-confirm': 'delete-old-copies' },
+    method, headers: { ...AUTH_HEADERS, 'x-onfreq-confirm': 'delete-old-copies' },
   }), configured, createExecutionContext());
   expect(response.status).toBe(200);
   expect(getByName).toHaveBeenCalledExactlyOnceWith('preserved-state');
@@ -62,7 +63,7 @@ it('reads existing durable state through the override without starting a new coo
   }));
   const configured = { ...env, COORDINATOR_NAME: 'preserved-state' };
   const request = (path: string, method = 'GET') => worker.fetch(new Request(`https://example.test${path}`, {
-    method, headers: { authorization: 'Bearer test-poll-secret' },
+    method, headers: AUTH_HEADERS,
   }), configured, createExecutionContext());
   expect(await (await request('/health')).json()).toMatchObject({ ok: true, lastSuccessfulPollAt });
   expect(await (await request('/poll', 'POST')).json()).toMatchObject({ ok: true, skipped: true });

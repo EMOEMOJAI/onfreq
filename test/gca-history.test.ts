@@ -3,8 +3,9 @@ import { SELF, reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { COORDINATOR_NAME } from '../src/config';
+import { AUTH_HEADERS } from './helpers';
 
-const headers = { authorization: 'Bearer test-poll-secret' };
+const headers = AUTH_HEADERS;
 afterEach(reset);
 
 async function seed(count = 1) {

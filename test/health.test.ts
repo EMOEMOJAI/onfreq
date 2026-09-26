@@ -3,8 +3,9 @@ import { SELF, reset, runInDurableObject, evictDurableObject } from 'cloudflare:
 import { afterEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { POLL_SNAPSHOT_KEY, COORDINATOR_NAME } from '../src/config';
+import { AUTH_HEADERS } from './helpers';
 
-const headers = { authorization: 'Bearer test-poll-secret' };
+const headers = AUTH_HEADERS;
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
 afterEach(async () => { vi.restoreAllMocks(); await reset(); });
 

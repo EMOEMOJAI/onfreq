@@ -380,19 +380,6 @@ async function fetchMembers(limits: DiscordRateLimits, token: string, guildId: s
 
 type ReminderRow = { status: string; attempts: number; retry_at: number };
 
-// DiscordRateLimits (src/discord-rate-limit.ts) persists cooldowns under this
-// storage key, keyed by route with '*' reserved for a global limit. Neither
-// is exported; duplicated here only to tell a global 429 (which must widen
-// the shared GCA backoff) apart from a single DM channel's own cooldown
-// (which must never block unrelated members' reminders).
-const DISCORD_RATE_LIMIT_STORAGE_KEY = 'discord-rate-limits-v1'; // gitleaks:allow — storage key name, not a credential
-const DISCORD_GLOBAL_RATE_LIMIT_KEY = '*';
-
-async function isGlobalRateLimit(storage: DurableObjectStorage, err: DiscordRateLimitError): Promise<boolean> {
-  const stored = await storage.get<Record<string, number>>(DISCORD_RATE_LIMIT_STORAGE_KEY);
-  return stored?.[DISCORD_GLOBAL_RATE_LIMIT_KEY] === err.retryAt;
-}
-
 interface DeliveryOutcome {
   status: 'pending' | 'failed';
   attempts: number;
@@ -591,7 +578,7 @@ async function sendMemberReminders(
       // shared backoff: one recipient's DM-channel cooldown must not block
       // unrelated members' reminders.
       if (outcome.rateLimited) {
-        if (await isGlobalRateLimit(storage, err as DiscordRateLimitError)) {
+        if ((err as DiscordRateLimitError).global) {
           await storage.put(BACKOFF_KEY, outcome.retryAt);
         }
         break;
@@ -630,7 +617,7 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits
         outcome.status, outcome.attempts, outcome.retryAt, outcome.status === 'pending' ? row.payload : '', row.session_key);
       console.warn(JSON.stringify({ event: 'gca_copy_failed', status: outcome.statusCode, retry: outcome.status === 'pending' }));
       if (outcome.rateLimited) {
-        if (await isGlobalRateLimit(storage, err as DiscordRateLimitError)) {
+        if ((err as DiscordRateLimitError).global) {
           await storage.put(BACKOFF_KEY, outcome.retryAt);
         }
         break;

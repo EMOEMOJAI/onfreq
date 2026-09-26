@@ -15,7 +15,7 @@ const DELETE_RETRY_POLLS = 10;
 /** Reconcile separately sent pages, retaining failed edits/deletions for later polls. */
 export async function syncRosterMessages(
   botToken: string, previous: RosterMessage[], targets: RosterTarget[],
-  limits?: DiscordRateLimits,
+  limits: DiscordRateLimits,
 ): Promise<{ messages: RosterMessage[]; failed: boolean }> {
   const messages: RosterMessage[] = [];
   let failed = false;

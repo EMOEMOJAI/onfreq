@@ -15,6 +15,7 @@ import { PollCoordinator, type PollSnapshot } from '../src/coordinator';
 import { buildOnlineEmbed, type DiscordEmbed } from '../src/discord';
 import { resetTokenCache } from '../src/ivao';
 import type { IvaoAtcSummaryEntry, StateMap, TrackedAtc } from '../src/types';
+import { AUTH_HEADERS } from './helpers';
 
 const START = Date.parse('2026-09-06T10:00:00Z');
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
@@ -67,7 +68,7 @@ async function snapshot(): Promise<PollSnapshot | undefined> {
 
 function poll(): Promise<Response> {
   return worker.fetch(new Request('https://bot.test/poll', {
-    method: 'POST', headers: { authorization: 'Bearer test-poll-secret' },
+    method: 'POST', headers: AUTH_HEADERS,
   }), env, createExecutionContext());
 }
 
@@ -755,7 +756,10 @@ describe('polling through the Durable Object', () => {
   });
 
   it('refuses maintenance while a poll is in flight', async () => {
-    await runInDurableObject(stub(), async (instance) => {
+    await runInDurableObject(stub(), async (object) => {
+      // Env marks POLL_SECRET optional, so the pool's Cloudflare.Env-based stub type
+      // no longer infers the coordinator class here.
+      const instance = object as unknown as PollCoordinator;
       let release!: () => void;
       let entered!: () => void;
       const ready = new Promise<void>((resolve) => { entered = resolve; });

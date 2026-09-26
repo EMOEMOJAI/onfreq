@@ -3,8 +3,9 @@ import { SELF, reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it } from 'vitest';
 import { COORDINATOR_NAME } from '../src/config';
 import { cleanupGcaCopies } from '../src/retention';
+import { AUTH_HEADERS } from './helpers';
 
-const headers = { authorization: 'Bearer test-poll-secret' };
+const headers = AUTH_HEADERS;
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
 const endpoint = 'https://example.com/gca-history/cleanup';
 const now = Date.now();

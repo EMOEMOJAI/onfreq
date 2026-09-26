@@ -355,8 +355,8 @@ async function discordRequest(
   botToken: string,
   method: 'POST' | 'PATCH' | 'DELETE',
   path: string,
-  payload?: unknown,
-  limits = new DiscordRateLimits(),
+  payload: unknown,
+  limits: DiscordRateLimits,
 ): Promise<Response> {
   for (let attempt = 1; ; attempt++) {
     const res = await limits.fetch(path, {
@@ -390,9 +390,9 @@ export async function postMessage(
   botToken: string,
   channelId: string,
   embed: DiscordEmbed,
-  content?: string,
-  replyTo?: string,
-  limits?: DiscordRateLimits,
+  content: string | undefined,
+  replyTo: string | undefined,
+  limits: DiscordRateLimits,
 ): Promise<string> {
   const res = await discordRequest(botToken, 'POST', `/channels/${channelId}/messages`, {
     content,
@@ -411,7 +411,7 @@ export async function editMessage(
   channelId: string,
   messageId: string,
   embed: DiscordEmbed,
-  limits?: DiscordRateLimits,
+  limits: DiscordRateLimits,
 ): Promise<void> {
   await discordRequest(botToken, 'PATCH', `/channels/${channelId}/messages/${messageId}`, {
     embeds: [embed],
@@ -419,7 +419,7 @@ export async function editMessage(
 }
 
 /** Remove an obsolete roster continuation; already-deleted messages are clean. */
-export async function deleteMessage(botToken: string, channelId: string, messageId: string, limits?: DiscordRateLimits): Promise<void> {
+export async function deleteMessage(botToken: string, channelId: string, messageId: string, limits: DiscordRateLimits): Promise<void> {
   try {
     await discordRequest(botToken, 'DELETE', `/channels/${channelId}/messages/${messageId}`, undefined, limits);
   } catch (err) {

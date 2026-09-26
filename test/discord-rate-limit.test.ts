@@ -27,11 +27,11 @@ it.each([
     .mockImplementationOnce(async () => Response.json({ retry_after: 65, ...body }, { status: 429, headers }))
     .mockImplementation(async () => Response.json({ id: 'synthetic' }));
   vi.stubGlobal('fetch', network);
-  await expect(request('/channels/a/messages')).rejects.toMatchObject({ retryAt: START + 65_000, requestMade: true });
+  await expect(request('/channels/a/messages')).rejects.toMatchObject({ retryAt: START + 65_000, requestMade: true, global: true });
   await evictDurableObject(stub());
   now += 64_999;
   await expect(request('/guilds/example/members?limit=1000&after=0', 'GET'))
-    .rejects.toMatchObject({ requestMade: false });
+    .rejects.toMatchObject({ requestMade: false, global: true });
   expect(network).toHaveBeenCalledTimes(1);
   now++;
   await expect(request('/channels/b/messages')).resolves.toBe(200);
@@ -120,4 +120,10 @@ it('keeps a 2xx-derived soft cooldown scoped to its own route, leaving other cha
   await limits.fetch('/channels/a/messages', { method: 'POST' });
   await expect(limits.fetch('/channels/b/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
   expect(network).toHaveBeenCalledTimes(2);
+});
+
+it('marks route-scoped cooldowns as not global', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ retry_after: 5 }, { status: 429 })));
+  await expect(request('/channels/a/messages')).rejects.toMatchObject({ requestMade: true, global: false });
+  await expect(request('/channels/a/messages')).rejects.toMatchObject({ requestMade: false, global: false });
 });

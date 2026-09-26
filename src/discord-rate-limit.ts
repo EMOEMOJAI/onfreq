@@ -5,7 +5,7 @@ const GLOBAL = '*';
 
 export class DiscordRateLimitError extends Error {
   readonly status = 429;
-  constructor(readonly retryAt: number, readonly requestMade: boolean) {
+  constructor(readonly retryAt: number, readonly requestMade: boolean, readonly global = false) {
     super('Discord API 429: delivery deferred until cooldown expires');
     this.name = 'DiscordRateLimitError';
   }
@@ -53,7 +53,9 @@ export class DiscordRateLimits {
       this.softDeadlines[route] ?? 0,
       this.outageUntil,
     );
-    if (blockedUntil > Date.now()) throw new DiscordRateLimitError(blockedUntil, false);
+    if (blockedUntil > Date.now()) {
+      throw new DiscordRateLimitError(blockedUntil, false, blockedUntil === this.deadlines[GLOBAL]);
+    }
 
     const response = await fetchBuffered(`https://discord.com/api/v10${path}`, init);
     if (response.status !== 429) {
@@ -89,6 +91,6 @@ export class DiscordRateLimits {
     } catch (err) {
       console.warn(JSON.stringify({ event: 'discord_rate_limit_persist_failed', error: String(err) }));
     }
-    throw new DiscordRateLimitError(this.deadlines[key], true);
+    throw new DiscordRateLimitError(this.deadlines[key], true, global);
   }
 }
