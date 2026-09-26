@@ -63,9 +63,16 @@ async function announceOnline(
   channelIds: string[],
   mentionedChannels: Set<string>,
   current: OnlineAtc[],
+  holderChannels: Set<string>,
 ): Promise<{ posted: PostedMessage[]; failed: Map<string, unknown> }> {
   const { env, labels, gcaPolicy, limits, nowIso } = ctx;
-  const embed = buildOnlineEmbed(atc, current, labels, highlightMismatch(atc, gcaPolicy));
+  const mismatch = highlightMismatch(atc, gcaPolicy);
+  const plain = buildOnlineEmbed(atc, current, labels, mismatch);
+  // The expected roster holder posts its first roster page directly, matching
+  // what syncOnlineCards renders, so the new card needs no follow-up edit.
+  const holder = buildOnlineEmbeds(
+    atc, current.filter((other) => other.callsign !== atc.callsign), current, labels, mismatch,
+  )[0];
   const posted: PostedMessage[] = [];
   const failed = new Map<string, unknown>();
   for (const channelId of channelIds) {
@@ -75,6 +82,7 @@ async function announceOnline(
       env.MENTION_ROLE_ID && !mentionedChannels.has(channelId)
         ? `<@&${env.MENTION_ROLE_ID}>`
         : undefined;
+    const embed = holderChannels.has(channelId) ? holder : plain;
     try {
       const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits);
       posted.push({ channelId, messageId, postedAt: nowIso, onlineEmbed: JSON.stringify(embed) });
@@ -336,12 +344,19 @@ export async function runPoll(
 
   const ctx: PollContext = { env, labels, gcaPolicy, limits, nowIso };
   for (const atc of wentOnline) next[atc.callsign]!.pendingChannelIds = channelIds;
-  for (const entry of Object.values(next)) {
-    if (entry.pending || entry.missed > 0 || !entry.pendingChannelIds) continue;
-    const targets = entry.pendingChannelIds.filter((id) => channelIds.includes(id) &&
-      !entry.messages?.some((ref) => ref.channelId === id));
+  const announcements = Object.values(next)
+    .filter((entry) => !entry.pending && entry.missed === 0 && entry.pendingChannelIds)
+    .map((entry) => ({ entry, targets: entry.pendingChannelIds!.filter((id) => channelIds.includes(id) &&
+      !entry.messages?.some((ref) => ref.channelId === id)) }));
+  // Cards posted this poll share the newest postedAt, and newestCardedSession
+  // breaks that tie in favour of the later entry: the last poster per channel
+  // is expected to hold the roster.
+  const lastPoster = new Map<string, TrackedAtc>();
+  for (const { entry, targets } of announcements) for (const id of targets) lastPoster.set(id, entry);
+  for (const { entry, targets } of announcements) {
     attempted += targets.length;
-    const { posted, failed } = await announceOnline(ctx, entry, targets, mentionedChannels, coverage);
+    const holderChannels = new Set(targets.filter((id) => lastPoster.get(id) === entry));
+    const { posted, failed } = await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels);
     delivered += posted.length;
     if (failed.size) deliveryFailed = true;
     if (posted.length) {

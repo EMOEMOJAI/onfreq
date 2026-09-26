@@ -822,13 +822,19 @@ describe('polling through the Durable Object', () => {
 
   it('shares a slow in-flight poll even when another poll interval has elapsed', async () => {
     await seed({});
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
     network.mockImplementationOnce(async () => {
       now += 120_000;
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      await gate;
       return Response.json([entry(a)]);
     });
-    const results = await Promise.all([stub().poll(), stub().poll()]);
-    expect(results).toEqual([{ skipped: false }, { skipped: true }]);
+    // Hold the feed request until the second trigger has reached the coordinator.
+    const calls = vi.spyOn(PollCoordinator.prototype, 'poll');
+    const results = Promise.all([stub().poll(), stub().poll()]);
+    await vi.waitFor(() => expect(calls).toHaveBeenCalledTimes(2));
+    release();
+    expect(await results).toEqual([{ skipped: false }, { skipped: true }]);
     expect(network.mock.calls.filter(([url]) => url === IVAO_ATC_SUMMARY_URL)).toHaveLength(1);
     expect(sent.filter((message) => message.method === 'POST')).toHaveLength(1);
   });
@@ -903,6 +909,24 @@ describe('polling through the Durable Object', () => {
     feed.reverse();
     await nextPoll();
     expect(sent).toHaveLength(count);
+  });
+
+  it('posts a new roster holder with its roster instead of editing it afterwards', async () => {
+    await seed({ [a]: session(a) });
+    feed = [entry(a), entry(b)];
+    await poll();
+    const posted = sent.filter((message) => message.method === 'POST');
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.embed.fields?.find((field) => field.name.startsWith('Also online'))?.value).toContain(a);
+    // Only the previous holder is edited; the new card is never patched.
+    expect(sent.filter((message) => message.method === 'PATCH').map((message) => message.id)).toEqual([a]);
+  });
+
+  it('posts earlier cards of a simultaneous connection without a roster', async () => {
+    await seed({});
+    feed = [entry(a), entry(b)];
+    await poll();
+    expect(sent.map((message) => message.method)).toEqual(['POST', 'POST']);
   });
 
   it('re-homes the roster when its host disappears and restores it on return', async () => {
