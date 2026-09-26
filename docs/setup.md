@@ -43,7 +43,7 @@ npx wrangler secret put POLL_SECRET --config wrangler.local.jsonc
 npm run deploy:local
 ```
 
-The public `npm run deploy` command uses `wrangler.jsonc`. It stops if a private `wrangler.local.jsonc` exists; use `deploy:local` for that installation. Keep an existing button installation's generated resource IDs when managing its copied repository.
+The public `npm run deploy` command uses `wrangler.jsonc`. It stops, even with npm scripts ignored, if a private `wrangler.local.jsonc`, `.json` or `.toml` exists; use `deploy:local` for that installation. Keep an existing button installation's generated resource IDs when managing its copied repository.
 
 **Upgrading:** set `FIR_PREFIXES`, and migrate any custom labels to private `FIR_LABELS` before deploying. Preserve the existing Worker, KV namespace, Durable Object class and migration tag in your private config. If its coordinator object name differs from `onfreq`, set the `COORDINATOR_NAME` secret to the exact existing name **before deploying**. Changing identity disconnects stored state. Do not restart an old KV-only deployment against stale state.
 
@@ -73,9 +73,16 @@ GCA coverage is private configuration, with no built-in region list. Set `GCA_RE
 
 `GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters count as unset: their endpoints return 503.
 
-The Mac helper reads private files under `~/.onfreq`. Create that directory with mode 0700; store your HTTPS `/poll` URL in `poll-endpoint` and the URL-safe token in `poll-secret`, both mode 0600, using a local editor. Then:
+The Mac helper reads private files under `~/.onfreq` and logs `FAIL permissions` without polling if other accounts can access them. Create the directory:
 
 ```sh
+install -d -m 700 ~/.onfreq
+```
+
+Store your HTTPS `/poll` URL in `~/.onfreq/poll-endpoint` and the URL-safe token in `~/.onfreq/poll-secret` using a local editor. Then:
+
+```sh
+chmod 600 ~/.onfreq/poll-endpoint ~/.onfreq/poll-secret
 mkdir -p ~/Library/Logs ~/Library/LaunchAgents
 cp scripts/poll-trigger.sh ~/.onfreq/
 chmod 700 ~/.onfreq/poll-trigger.sh
@@ -84,7 +91,7 @@ chmod 600 "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
 ```
 
-The agent runs every minute while the Mac is awake and logged in. Before reinstalling or moving files, unload the existing agent with `launchctl bootout`; preserve the endpoint and secret and avoid loading duplicate pollers.
+The agent runs every minute with `/bin/sh` while the Mac is awake and logged in. Before reinstalling or moving files, unload the existing agent with `launchctl bootout`; preserve the endpoint and secret and avoid loading duplicate pollers.
 
 For failures, check `npm run tail`. A 401 means the token is wrong; a 403 from Discord usually means channel permissions are missing. Never post unredacted logs publicly.
 

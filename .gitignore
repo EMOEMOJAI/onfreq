@@ -27,7 +27,10 @@ poll-endpoint
 
 # Local, operator-specific helper scripts (may contain real IDs)
 *.local.sh
-wrangler.local.jsonc
+wrangler.local.*
+
+# npm registry credentials
+.npmrc
 
 # Local logs and privacy/secret scan reports can contain sensitive matches.
 *.log

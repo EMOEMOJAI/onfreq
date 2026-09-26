@@ -1,0 +1,23 @@
+#!/bin/sh
+# Blocks a push until publication privacy and deployment setup checks pass,
+# so tracked private files or operator settings are caught before publication.
+#
+# Install alongside pre-commit (per clone). Check `git config --get core.hooksPath`
+# first. Only if unset:
+#   git config core.hooksPath scripts/hooks
+# Preserve existing hooks and any private-history push guard.
+set -eu
+
+if ! command -v npm >/dev/null 2>&1; then
+  printf 'pre-push: install Node.js 24 and run npm ci before pushing.\n' >&2
+  exit 1
+fi
+
+# The checks never print matched private values; stdin (pushed refs) is unused.
+if ! npm run --silent check:privacy </dev/null || ! npm run --silent check:setup </dev/null; then
+  printf '\npre-push: BLOCKED — privacy or deployment setup checks failed.\n' >&2
+  printf 'Fix the reported files locally before pushing.\n' >&2
+  exit 1
+fi
+
+exit 0

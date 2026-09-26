@@ -1,18 +1,43 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { imagePrivacy, privateCommitEmails, privatePath, publicConfig } from './check-privacy.mjs';
+import { imagePrivacy, privateCommitEmails, privatePath, publicConfig, wranglerConfigErrors } from './check-privacy.mjs';
 import { checkExternalLinks, checkLocalLinks, documentLinks } from './check-links.mjs';
-import { testDeployGuard, validateSetup } from './check-setup.mjs';
+import { testDeployGuard, validateHooks, validateSetup } from './check-setup.mjs';
 import { jsonc } from './repo-files.mjs';
 
 test('rejects private paths independently of gitignore, allowing public templates', () => {
   for (const file of ['.dev.vars', '.env.production', 'nested/.dev.vars.preview', 'wrangler.local.jsonc',
+    'wrangler.local.json', 'wrangler.local.toml', 'nested/wrangler.local.yaml', '.npmrc', 'nested/.npmrc',
     'set-secrets.local.sh', '.local/report.txt', '.wrangler/state.db', 'poll-secret', 'poll-endpoint',
     'key.pem', 'private.key', 'trace.log', '.claude/settings.local.json']) assert.equal(privatePath(file), true, file);
   for (const file of ['.dev.vars.example', '.env.example', 'wrangler.jsonc', 'config/optional-secrets.example']) {
     assert.equal(privatePath(file), false, file);
   }
+});
+
+test('checks every tracked Wrangler config, including nested and JSON files, and refuses TOML', () => {
+  const safe = Buffer.from(JSON.stringify({ kv_namespaces: [{ id: '0'.repeat(32) }] }));
+  const leaked = Buffer.from('{ "account_id": "synthetic-private-value" }');
+  for (const file of ['wrangler.jsonc', 'wrangler.json', 'wrangler.staging.jsonc', 'nested/wrangler.jsonc']) {
+    assert.deepEqual(wranglerConfigErrors(file, safe), [], file);
+    const errors = wranglerConfigErrors(file, leaked);
+    assert.ok(errors.length > 0 && errors.every((error) => error.startsWith(`${file}: `)), file);
+    assert.doesNotMatch(errors.join(' '), /synthetic-private-value/);
+  }
+  for (const file of ['wrangler.toml', 'nested/wrangler.production.toml']) {
+    assert.match(wranglerConfigErrors(file, Buffer.from('name = "synthetic"'))[0], /TOML configuration is not allowed/);
+  }
+  assert.match(wranglerConfigErrors('wrangler.json', Buffer.from('{ synthetic-private-value'))[0], /invalid/);
+  assert.doesNotMatch(wranglerConfigErrors('wrangler.json', Buffer.from('{ synthetic-private-value'))[0], /synthetic/);
+  assert.deepEqual(wranglerConfigErrors('docs/not-wrangler.json', leaked), []);
+});
+
+test('requires versioned hooks tracked as executable under scripts/hooks', () => {
+  const hooks = new Map([['scripts/hooks/pre-commit', { mode: '100755' }], ['scripts/hooks/pre-push', { mode: '100755' }]]);
+  validateHooks(hooks);
+  assert.throws(() => validateHooks(new Map([...hooks, ['scripts/hooks/pre-push', { mode: '100644' }]])));
+  assert.throws(() => validateHooks(new Map([['scripts/pre-commit', { mode: '100755' }]])));
 });
 
 test('rejects operator IDs and variables without revealing their values', () => {
@@ -112,10 +137,16 @@ test('validates guided setup and rejects changed prompts, values and deployment 
   assert.throws(() => validateSetup({ ...config, kv_namespaces: [{ binding: 'ATC_STATE', id: '1'.repeat(32) }] }, pkg, example));
   assert.throws(() => validateSetup(config, { ...pkg, cloudflare: { bindings: {} } }, example));
   assert.throws(() => validateSetup(config, { ...pkg, scripts: { ...pkg.scripts, predeploy: 'echo skipped' } }, example));
+  // Relying on predeploy alone is bypassed by npm --ignore-scripts.
+  assert.throws(() => validateSetup(config, { ...pkg, scripts: { ...pkg.scripts, deploy: 'wrangler deploy' } }, example));
 });
 
-test('npm predeploy permits a fresh template and blocks private configuration before deployment', () => {
-  testDeployGuard(readFileSync(new URL('./check-deploy.mjs', import.meta.url)));
+test('public deploy permits a fresh template and blocks private configuration, even with ignore-scripts', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  testDeployGuard(readFileSync(new URL('./check-deploy.mjs', import.meta.url)), pkg.scripts.deploy);
+  // Regression: the former predeploy-only script reached deployment under ignore-scripts.
+  assert.throws(() => testDeployGuard(readFileSync(new URL('./check-deploy.mjs', import.meta.url)), 'wrangler deploy'),
+    /Private installation must refuse public deployment/);
 });
 
 test('parses Markdown references, nested badge images, HTML and duplicate heading anchors', () => {
