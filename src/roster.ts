@@ -1,4 +1,6 @@
-import { deleteMessage, DiscordApiError, editMessage, messageNonce, postMessage, type DiscordEmbed } from './discord';
+import {
+  deleteMessage, DiscordApiError, DiscordUnconfirmedPostError, editMessage, messageNonce, postMessage, type DiscordEmbed,
+} from './discord';
 import { countsAgainstBudget, type RosterMessage, type RosterPostAttempt } from './types';
 import type { DiscordRateLimits } from './discord-rate-limit';
 
@@ -102,21 +104,22 @@ export async function syncRosterMessages(
         // This page has never once posted successfully: give it the
         // same budget via the sibling attempt map instead.
         const used = (postAttemptsByKey.get(key)?.attempts ?? 0) + (counts ? 1 : 0);
+        const entry = { channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: used };
         if (!counts || used <= DELETE_RETRY_POLLS) {
-          postAttemptsByKey.set(key, { channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: used });
+          postAttemptsByKey.set(key, { ...entry, nonceKey });
           return;
         }
         console.error(JSON.stringify({
           event: 'roster_page_abandoned', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
         }));
-        postAttemptsByKey.set(key, {
-          channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: used, abandoned: true,
-        });
+        postAttemptsByKey.set(key, { ...entry, abandoned: true });
       };
-      // A re-post after the previous copy of this page was found gone
-      // must use a different nonce key than the original post, or Discord
-      // could hand back the deleted message instead of creating a new one.
-      let goneMessageId: string | undefined;
+      // Every fresh post gets its own nonce key, kept across its retries: a
+      // re-post after a gone copy, or after the roster shrank and grew again,
+      // must never reuse an earlier post's key, or Discord could hand back
+      // the deleted message instead of creating a new one.
+      const nonceKey = postAttemptsByKey.get(key)?.nonceKey ??
+        `roster:${target.parentMessageId}:${page}:${Date.now().toString(36)}`;
       if (ref) {
         try {
           await editMessage(botToken, ref.channelId, ref.messageId, embed, limits);
@@ -129,18 +132,28 @@ export async function syncRosterMessages(
             giveUp(err);
             continue;
           }
-          goneMessageId = ref.messageId;
           messages.splice(index, 1);
           index = -1;
         }
       }
       try {
-        const nonce = messageNonce(`roster:${target.parentMessageId}:${page}:${goneMessageId ?? 'new'}`, target.channelId);
+        const nonce = messageNonce(nonceKey, target.channelId);
         const messageId = await postMessage(botToken, target.channelId, embed, undefined, target.parentMessageId, limits, nonce);
         messages.push({ channelId: target.channelId, parentMessageId: target.parentMessageId,
           page, messageId, onlineEmbed: rendered });
         postAttemptsByKey.delete(key);
       } catch (err) {
+        if (err instanceof DiscordUnconfirmedPostError) {
+          // Discord accepted the page but returned no id to track it by:
+          // posting again could only duplicate it, so freeze this page.
+          console.error(JSON.stringify({
+            event: 'roster_post_unconfirmed', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
+          }));
+          postAttemptsByKey.set(key, {
+            channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: 0, abandoned: true,
+          });
+          continue;
+        }
         logFailure('post', target.channelId, target.parentMessageId, err);
         giveUp(err);
       }
@@ -150,9 +163,10 @@ export async function syncRosterMessages(
   // Only keep counters/markers for pages still targeted this poll; if the
   // roster shrank or the host moved/ended, there is nothing left to freeze
   // or retry against.
-  const liveKeys = new Set(targets.flatMap((target) =>
-    (target.embeds ?? []).map((_embed, page) => attemptKey(target.channelId, target.parentMessageId, page))));
-  const postAttempts = [...postAttemptsByKey.values()]
-    .filter((entry) => liveKeys.has(attemptKey(entry.channelId, entry.parentMessageId, entry.page)));
+  // A target whose parent edit failed this poll has unknown pages: keep all
+  // of its entries, as its existing continuations are kept above.
+  const postAttempts = [...postAttemptsByKey.values()].filter((entry) => targets.some((target) =>
+    target.channelId === entry.channelId && target.parentMessageId === entry.parentMessageId &&
+    (target.embeds === undefined || entry.page < target.embeds.length)));
   return { messages, postAttempts, failed };
 }

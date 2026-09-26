@@ -477,6 +477,16 @@ describe('fetchDivisionAtc', () => {
     expect(secondCallHeaders.authorization).toBe('Bearer fresh');
   });
 
+  it('does not let a profile 401 discard the token just reminted after a tracker 401', async () => {
+    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(Response.json({ access_token: 'fresh', expires_in: 1800 }))
+      .mockResolvedValueOnce(Response.json([rawEntry()])));
+    await fetchDivisionAtc(['QC'], auth(kv));
+    expect(invalidateCachedToken()).toBe(false);
+  });
+
   it('surfaces a second consecutive 401 instead of retrying forever', async () => {
     const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
     const fetchMock = vi.fn()

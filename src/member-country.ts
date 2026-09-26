@@ -78,8 +78,8 @@ export async function enrichMemberCountries(
       }
       if (!res.ok) {
         if (res.status === 401 && invalidateCachedToken()) {
-          // The cached token was rejected; drop it so the next lookup or
-          // poll mints a fresh one instead of failing the same way for up to
+          // The cached token was rejected; drop it so the next poll mints a
+          // fresh one instead of failing the same way for up to
           // ~28 more minutes. Rate-limited internally: if the profile
           // endpoint rejects even freshly minted tokens, this must not churn
           // through a fresh mint on every single lookup.

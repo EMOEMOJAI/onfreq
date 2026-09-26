@@ -405,6 +405,12 @@ describe('REST calls', () => {
     return fetchMock;
   }
 
+  it('escapes markdown in callsigns and positions but keeps word-internal underscores', () => {
+    const embed = buildOnlineEmbed({ ...sample, callsign: 'LE*MD_TWR', position: '<@&1>\nTWR' }, undefined, LABELS);
+    expect(embed.title).toContain('LE\\*MD_TWR');
+    expect(embed.fields?.find((field) => field.name === 'Position')?.value).toBe('\\<@&1\\> TWR');
+  });
+
   it.each([
     new Response(null, { status: 200 }),
     new Response('not json', { status: 200 }),

@@ -47,6 +47,8 @@ let sent: Sent[];
 let deleted: string[];
 let cards: Map<string, DiscordEmbed>;
 let failures: Set<string>;
+/** POSTs matching these channel ids (or 'POST') succeed without returning a message id. */
+let unconfirmed: Set<string>;
 let failureStatus: number;
 let feedStatus: number;
 let profileStatus: number;
@@ -104,6 +106,7 @@ beforeEach(() => {
   deleted = [];
   cards = new Map();
   failures = new Set();
+  unconfirmed = new Set();
   failureStatus = 400;
   feedStatus = 200;
   profileStatus = 200;
@@ -159,6 +162,7 @@ beforeEach(() => {
       if (failures.has(channelId) || failures.has(method === 'POST' ? 'POST' : id)) {
         return new Response('test delivery failure', { status: failureStatus });
       }
+      if (method === 'POST' && (unconfirmed.has('POST') || unconfirmed.has(channelId))) return Response.json({});
       cards.set(id, embed);
       return Response.json({ id });
     }
@@ -969,6 +973,43 @@ describe('polling through the Durable Object', () => {
     expect(posts[1]!.nonce).toBe(posts[0]!.nonce);
   });
 
+  it('gives each callsign of one controller its own card nonce', async () => {
+    await seed({});
+    feed = [entry(a), entry(b)];
+    await poll();
+    const posts = sent.filter((message) => message.method === 'POST');
+    expect(posts).toHaveLength(2);
+    expect(posts[0]!.nonce).not.toBe(posts[1]!.nonce);
+  });
+
+  it('does not retry an ONLINE card that Discord accepted without returning its id', async () => {
+    await seed({});
+    feed = [entry(a)];
+    unconfirmed.add('POST');
+    expect((await poll()).status).toBe(200);
+    unconfirmed.clear();
+    await nextPoll();
+    expect(sent.filter((message) => message.method === 'POST')).toHaveLength(1);
+    const tracked = (await stub().getState())?.[a];
+    expect(tracked?.pendingChannelIds ?? []).toEqual([]);
+    expect(tracked?.onlineAttemptsByChannel).toBeUndefined();
+  });
+
+  it('treats an OFFLINE fallback accepted without an id as delivered', async () => {
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
+        event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
+        messages: [], channelIds: ['test-channel'],
+      }] } satisfies PollSnapshot);
+    });
+    unconfirmed.add('POST');
+    expect((await poll()).status).toBe(200);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    unconfirmed.clear();
+    await nextPoll();
+    expect(sent.filter((message) => message.method === 'POST')).toHaveLength(1);
+  });
+
   it('posts earlier cards of a simultaneous connection without a roster', async () => {
     await seed({});
     feed = [entry(a), entry(b)];
@@ -1295,8 +1336,8 @@ describe('polling through the Durable Object', () => {
       const lastPage = pages.reduce((max, item) => (item.page > max.page ? item : max), pages[0]!);
       // Drop tracking for the last page, as if its very first POST had
       // already failed and left nothing behind: there is no way to tell that
-      // apart from "never posted" without a dedicated attempt counter
-      //, so its next attempt goes through the exact same path.
+      // apart from "never posted" without a dedicated attempt counter, so its
+      // next attempt goes through the exact same path.
       await runInDurableObject(stub(), async (_instance, ctx) => {
         const existing = (await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY))!;
         await ctx.storage.put(POLL_SNAPSHOT_KEY, {
@@ -1317,6 +1358,56 @@ describe('polling through the Durable Object', () => {
       expect((await nextPoll()).status).toBe(200);
       // Abandoned: no further attempt is made even once delivery would succeed.
       expect(sent.filter((message) => message.method === 'POST')).toHaveLength(postsBefore);
+    });
+
+    it('freezes a never-posted continuation accepted without an id, even across a failed parent edit', async () => {
+      await prepare(400);
+      await poll();
+      const pages = (await snapshot())!.rosterMessages!;
+      const lastPage = pages.reduce((max, item) => (item.page > max.page ? item : max), pages[0]!);
+      await runInDurableObject(stub(), async (_instance, ctx) => {
+        const existing = (await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY))!;
+        await ctx.storage.put(POLL_SNAPSHOT_KEY, {
+          ...existing, rosterMessages: pages.filter((item) => item !== lastPage),
+        } satisfies PollSnapshot);
+      });
+      unconfirmed.add('POST');
+      expect((await nextPoll()).status).toBe(200);
+      unconfirmed.clear();
+      expect((await snapshot())?.rosterPostAttempts).toEqual([
+        expect.objectContaining({ page: lastPage.page, abandoned: true }),
+      ]);
+      const postsBefore = sent.filter((message) => message.method === 'POST').length;
+      // A failed parent edit leaves this poll's pages unknown; the frozen
+      // marker must survive it rather than grant a fresh budget.
+      failures.add(lastPage.parentMessageId);
+      feed.find((item) => item.callsign === a)!.atcSession.frequency = 121.7;
+      expect((await nextPoll()).status).toBe(500);
+      expect((await snapshot())?.rosterPostAttempts).toEqual([
+        expect.objectContaining({ page: lastPage.page, abandoned: true }),
+      ]);
+      failures.clear();
+      expect((await nextPoll()).status).toBe(200);
+      expect(sent.filter((message) => message.method === 'POST')).toHaveLength(postsBefore);
+    });
+
+    it('retries a failed re-post of a gone page with the re-post nonce, not the original one', async () => {
+      await prepare();
+      await poll();
+      const page = (await snapshot())!.rosterMessages![0]!;
+      const originalNonce = sent.find((message) => message.method === 'POST' && message.id === page.messageId)!.nonce;
+      feed.find((item) => item.callsign === 'QE119_TWR')!.atcSession.frequency = 121.7;
+      failures.add(page.messageId);
+      failures.add('POST');
+      failureStatus = 404;
+      cards.delete(page.messageId);
+      expect((await nextPoll()).status).toBe(500);
+      const failedRepost = sent.filter((message) => message.method === 'POST').at(-1)!;
+      expect(failedRepost.nonce).not.toBe(originalNonce);
+      failures.clear();
+      expect((await nextPoll()).status).toBe(200);
+      const retry = sent.filter((message) => message.method === 'POST').at(-1)!;
+      expect(retry.nonce).toBe(failedRepost.nonce);
     });
 
     it('keeps continuations until a failed parent edit has succeeded', async () => {

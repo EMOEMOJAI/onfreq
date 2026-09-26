@@ -385,7 +385,10 @@ export async function fetchDivisionAtc(
   // exactly one retry with a freshly minted one — but only when we actually
   // sent one: an anonymous request rejected with 401 is not a token problem.
   if (res.status === 401 && auth && headers.authorization) {
-    resetTokenCache();
+    // Drop the rejected token and count this as the invalidation window, so a
+    // profile 401 right after cannot discard the token minted below.
+    memoryToken = null;
+    lastInvalidatedAt = Date.now();
     try {
       await auth.kv.delete(TOKEN_KEY);
     } catch (err) {

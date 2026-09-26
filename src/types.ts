@@ -1,11 +1,10 @@
 import { DiscordApiError } from './discord';
 
 /**
- * A definite Discord-side rejection (4xx, excluding the 429 rate-limit
- * deferral, which throws a distinct `DiscordRateLimitError` instead) counts
- * against a bounded retry budget. A 5xx outage, a timeout/network error
- * (neither is a `DiscordApiError`), or a rate-limit deferral is transient and
- * retried indefinitely instead. Shared by the online first-card budget,
+ * A definite Discord-side rejection (a 4xx `DiscordApiError`; a 429 throws a
+ * `DiscordRateLimitError` instead) counts against a bounded retry budget.
+ * A 5xx (a `DiscordApiError` with status 500 or above), a timeout/network
+ * error, or a rate-limit deferral is transient and retried indefinitely. Shared by the online first-card budget,
  * the offline closeout budget, and the roster page budgets so they agree on
  * what "permanent" means.
  */
@@ -99,7 +98,7 @@ export interface RosterMessage extends PostedMessage {
   parentMessageId: string;
   /** Zero-based index within the continuation messages (excluding the main card). */
   page: number;
-  /** Failed delete attempts (e.g. a permanently forbidden channel); rate-limit deferrals don't count. */
+  /** Failed delete attempts (4xx only, via `countsAgainstBudget`), e.g. a permanently forbidden channel. */
   deleteAttempts?: number;
   /**
    * Failed edit attempts for this already-posted page since its last success
@@ -109,9 +108,9 @@ export interface RosterMessage extends PostedMessage {
   pageAttempts?: number;
   /**
    * Permanently gave up on this page (its budget above was exhausted): frozen
-   * in place, never edited or re-posted, while its parent target still lives
-   *. An absent entry reads as "never posted" and would otherwise be
-   * re-created as a duplicate the next poll.
+   * in place, never edited or re-posted, while its parent target still lives.
+   * An absent entry reads as "never posted" and would otherwise be re-created
+   * as a duplicate the next poll.
    */
   abandoned?: true;
 }
@@ -126,9 +125,17 @@ export interface RosterPostAttempt {
   channelId: string;
   parentMessageId: string;
   page: number;
-  /** Failed post attempts (4xx only, via `countsAgainstBudget`); rate-limit deferrals don't count. */
+  /** Failed post attempts (4xx only, via `countsAgainstBudget`). */
   attempts: number;
-  /** Permanently gave up: never retried again while this parent target lives. */
+  /**
+   * Nonce key of the pending post, reused by its retries so Discord can
+   * deduplicate a post whose success was hidden by a 5xx or timeout.
+   */
+  nonceKey?: string;
+  /**
+   * Permanently gave up, or Discord accepted the post without returning its
+   * id: never posted again while this parent target lives.
+   */
   abandoned?: true;
 }
 

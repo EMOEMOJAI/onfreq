@@ -45,7 +45,7 @@ export class DiscordRateLimits {
   private outageUntil = 0;
   /** In-memory only per-route soft cooldowns inferred from 2xx rate headers. */
   private readonly softDeadlines: Record<string, number> = {};
-  /** Consecutive POST 5xx/timeout failures on this instance since the last success. */
+  /** Consecutive POST 5xx/timeout failures since Discord last returned a non-5xx, non-429 response. */
   private postFailureStreak = 0;
 
   constructor(
@@ -79,10 +79,10 @@ export class DiscordRateLimits {
   }
 
   /**
-   * Any non-5xx HTTP response — a 2xx, 3xx, or 4xx, on any method — proves
-   * Discord itself is reachable and breaks the POST failure streak. A 4xx
-   * (e.g. an unknown-message 404) is not an outage signal, so it must reset
-   * the streak just as readily as a 2xx does.
+   * Any non-5xx HTTP response on any method proves Discord itself is
+   * reachable and breaks the POST failure streak; a 4xx such as an
+   * unknown-message 404 is not an outage signal. A 429 never reaches this
+   * point: it is thrown as a DiscordRateLimitError by `fetch` instead.
    */
   noteDiscordResponded(): void {
     this.postFailureStreak = 0;

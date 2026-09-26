@@ -41,10 +41,13 @@ export function formatDuration(totalSeconds: number): string {
  * Escape characters Discord treats as markdown or mentions, so IVAO-derived
  * text can't break embed formatting or invoke `<@&123>`-style pings. Runs of
  * CR/LF are collapsed to a single space so injected newlines can't fake extra
- * embed lines.
+ * embed lines. An underscore between two letters or digits (as in `EGLL_TWR`)
+ * cannot start or end emphasis, so it is left readable.
  */
 export function escapeMarkdown(text: string): string {
-  return text.replace(/[\r\n]+/g, ' ').replace(/([\\*_~`|[\]<>])/g, '\\$1');
+  return text.replace(/[\r\n]+/g, ' ').replace(/[\\*_~`|[\]<>]/g, (char, index: number, whole: string) =>
+    char === '_' && /[A-Za-z0-9]/.test(whole[index - 1] ?? '') && /[A-Za-z0-9]/.test(whole[index + 1] ?? '')
+      ? char : `\\${char}`);
 }
 
 function stationLine(atc: TrackedAtc): string | undefined {
@@ -195,7 +198,7 @@ export function buildOnlineEmbeds(
 ): [DiscordEmbed, ...DiscordEmbed[]] {
   const fields: NonNullable<DiscordEmbed['fields']> = [
     { name: 'Frequency', value: formatFrequency(atc.frequency), inline: true },
-    { name: 'Position', value: atc.position, inline: true },
+    { name: 'Position', value: escapeMarkdown(atc.position), inline: true },
     { name: 'Controller', value: formatController(atc, gcaMismatch), inline: true },
   ];
 
@@ -203,7 +206,7 @@ export function buildOnlineEmbeds(
   if (coverage) fields.push({ name: `Online at ${atc.airport!.icao}`, value: coverage, inline: false });
 
   const first: DiscordEmbed = {
-    title: `${gcaMismatch ? '🔴' : '🟢'} ${stationFlag(atc, labels)} ${atc.callsign} is now ONLINE`,
+    title: `${gcaMismatch ? '🔴' : '🟢'} ${stationFlag(atc, labels)} ${escapeMarkdown(atc.callsign)} is now ONLINE`,
     description: describe(atc, `Online since ${relativeTime(atc.since)}`),
     color: gcaMismatch ? COLOR_OFFLINE : COLOR_ONLINE,
     fields,
@@ -228,7 +231,7 @@ export function buildOnlineEmbeds(
       if (length + field.name.length + value.length > EMBED_TEXT_LIMIT ||
           page.fields!.length >= EMBED_FIELD_LIMIT) {
         page = {
-          title: `${gcaMismatch ? '🔴' : '🟢'} Also online now — ${atc.callsign} (continued)`,
+          title: `${gcaMismatch ? '🔴' : '🟢'} Also online now — ${escapeMarkdown(atc.callsign)} (continued)`,
           color: gcaMismatch ? COLOR_OFFLINE : COLOR_ONLINE,
           fields: [],
           footer: { text: EMBED_FOOTER },
@@ -258,7 +261,7 @@ function embedTextLength(embed: DiscordEmbed): number {
  */
 export function buildSessionEndedEmbed(event: OfflineEvent, labels: FirLabel[] = []): DiscordEmbed {
   return {
-    title: `⚪ ${stationFlag(event, labels)} ${event.callsign} is OFFLINE`,
+    title: `⚪ ${stationFlag(event, labels)} ${escapeMarkdown(event.callsign)} is OFFLINE`,
     description: describe(
       event,
       `Was online for **${formatDuration(event.durationSeconds)}** · disconnected ${relativeTime(
@@ -273,7 +276,7 @@ export function buildSessionEndedEmbed(event: OfflineEvent, labels: FirLabel[] =
         inline: true,
       },
       { name: 'Frequency', value: formatFrequency(event.frequency), inline: true },
-      { name: 'Position', value: event.position, inline: true },
+      { name: 'Position', value: escapeMarkdown(event.position), inline: true },
       { name: 'Controller', value: formatController(event), inline: true },
     ],
     footer: { text: EMBED_FOOTER },
@@ -288,7 +291,7 @@ export function buildSessionEndedEmbed(event: OfflineEvent, labels: FirLabel[] =
  */
 export function buildOfflineEmbed(event: OfflineEvent, labels: FirLabel[] = []): DiscordEmbed {
   return {
-    title: `🔴 ${stationFlag(event, labels)} ${event.callsign} went OFFLINE`,
+    title: `🔴 ${stationFlag(event, labels)} ${escapeMarkdown(event.callsign)} went OFFLINE`,
     description: stationLine(event),
     color: COLOR_OFFLINE,
     fields: [

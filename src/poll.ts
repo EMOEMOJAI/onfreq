@@ -93,18 +93,17 @@ async function announceOnline(
     const embed = holderChannels.has(channelId) ? holder : plain;
     try {
       // A POST whose 5xx hid a success is re-sent next poll; a nonce keyed to
-      // this tracked session (`since`, not the IVAO-issued `sessionId`, which
-      // changes across a grace-window resume) lets Discord return the
-      // original message instead of a duplicate card.
+      // this tracked session (callsign and `since`, not the IVAO-issued
+      // `sessionId`, which changes across a grace-window resume) lets Discord
+      // return the original message instead of a duplicate card.
       const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits,
-        messageNonce(`online:${atc.userId}:${atc.since}`, channelId));
+        messageNonce(`online:${atc.userId}:${atc.callsign}:${atc.since}`, channelId));
       posted.push({ channelId, messageId, postedAt: nowIso, onlineEmbed: JSON.stringify(embed) });
       if (content) mentionedChannels.add(channelId);
     } catch (err) {
-      // `postMessage` throws DiscordUnconfirmedPostError only for a 2xx
-      // response without a usable message id.
-      // Retrying would either accept a literal duplicate or spin forever with
-      // nothing to dedupe against on our side, so this destination is
+      // A 2xx without a usable message id: retrying would either accept a
+      // literal duplicate or spin forever with nothing to dedupe against on
+      // our side, so this destination is
       // abandoned outright instead of joining the bounded 4xx retry budget
       // below. `entry.messages` stays empty for this channel either way, so
       // the existing "no card ever sent" invariant still suppresses a
@@ -198,10 +197,17 @@ async function announceOffline(
   // Only a definite Discord-side rejection (4xx, excluding the 429
   // rate-limit deferral) counts towards this budget, via the same predicate
   // the online first-card and roster page budgets use; a 5xx outage or a
-  // timeout/network error is transient and retried indefinitely instead —
-  // previously any non-rate-limited error counted, so a prolonged 5xx outage
-  // could abandon a closeout and leave a stale green card.
+  // timeout/network error is transient and retried indefinitely instead, so
+  // a prolonged outage cannot abandon a closeout and leave a stale green card.
   const keepForRetry = (channelId: string, err: unknown): boolean => {
+    if (err instanceof DiscordUnconfirmedPostError) {
+      // Discord accepted the fallback without returning its id: it was
+      // delivered, and posting again could only duplicate it.
+      console.error(JSON.stringify({ event: 'offline_post_unconfirmed', callsign: job.event.callsign, channelId }));
+      delivered++;
+      delete attempts[channelId];
+      return false;
+    }
     failed = true;
     const counts = countsAgainstBudget(err);
     const used = (attempts[channelId] ?? job.attempts ?? 0) + (counts ? 1 : 0);
@@ -213,10 +219,10 @@ async function announceOffline(
     console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign, channelId }));
     return false;
   };
-  // Keyed on the tracked session's stable `since`, not the
-  // IVAO-issued `sessionId`, so a genuinely new session at the same callsign
-  // never collides with this one's nonce.
-  const offlineKey = `offline:${job.event.userId}:${job.event.since}`;
+  // Keyed on the tracked session (callsign and stable `since`), not the
+  // IVAO-issued `sessionId`, so a genuinely new session never collides with
+  // this one's nonce.
+  const offlineKey = `offline:${job.event.userId}:${job.event.callsign}:${job.event.since}`;
   for (const ref of job.messages) {
     try {
       await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, endedEmbed, limits);
@@ -436,7 +442,7 @@ export async function runPoll(
     const { posted, failed, unconfirmed } = targets.length
       ? await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels)
       : { posted: [] as PostedMessage[], failed: new Map<string, unknown>(), unconfirmed: new Set<string>() };
-    delivered += posted.length;
+    delivered += posted.length + unconfirmed.size;
     if (failed.size) deliveryFailed = true;
     if (posted.length) {
       entry.messages = [...(entry.messages ?? []), ...posted];
