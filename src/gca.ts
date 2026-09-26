@@ -1,4 +1,4 @@
-import { EMBED_FOOTER, firOf, parseFirLabels, type FirLabel } from './config';
+import { EMBED_FOOTER, firOf, type FirLabel } from './config';
 import type { DiscordEmbed } from './discord';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import { hasFrequency } from './ivao';
@@ -13,10 +13,17 @@ const MAX_POLICY_URL_LENGTH = 2048;
 const names = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none' });
 const INITIALIZED_KEY = 'gca-initialized-v1'; // gitleaks:allow — storage key name, not a credential
 const BACKOFF_KEY = 'gca-discord-backoff-v1';
+const LAST_ACTIVE_KEY = 'gca-last-active-v1';
 const RETENTION_MS = 7 * 86_400_000;
 const MAX_SENDS_PER_POLL = 3;
 const MAX_ATTEMPTS = 5;
 const OCCURRENCE_MIGRATION = 'gca-occurrences-migrated-v1';
+// A gap since the last poll that actually ran reminders wider than this is
+// treated as an outage or a disable/re-enable, not an ordinary retry-backoff
+// delay (which can legitimately run into several minutes): brand-new sessions
+// discovered on that first poll back are baselined rather than immediately
+// warned, the same as on first-ever startup.
+const REBASELINE_GAP_MS = 15 * 60_000;
 
 export interface GcaApproval {
   region: Region;
@@ -35,11 +42,96 @@ export interface GcaPolicy {
   policyUrl?: string;
 }
 
+/**
+ * A minimal recursive-descent JSON parser used only to reject duplicate object
+ * keys, which `JSON.parse` silently collapses to the last value. Private
+ * policy JSON with a repeated key (e.g. two `"AA"` regions, or the same VID
+ * twice in an approvals object) must disable reminders rather than silently
+ * keep only one of the two entries — an approved controller could otherwise
+ * be DMed, or an unapproved one could be missed.
+ */
+function parseJsonRejectDuplicateKeys(text: string): unknown {
+  let i = 0;
+  const len = text.length;
+  const fail = (): never => { throw new SyntaxError('invalid or duplicate-key JSON'); };
+  const skipWs = () => { while (i < len && /[\s]/.test(text[i]!)) i++; };
+  function parseValue(): unknown {
+    skipWs();
+    const c = text[i];
+    if (c === '{') return parseObject();
+    if (c === '[') return parseArray();
+    if (c === '"') return parseString();
+    if (text.startsWith('true', i)) { i += 4; return true; }
+    if (text.startsWith('false', i)) { i += 5; return false; }
+    if (text.startsWith('null', i)) { i += 4; return null; }
+    return parseNumber();
+  }
+  function parseObject(): Record<string, unknown> {
+    i++;
+    const obj: Record<string, unknown> = {};
+    skipWs();
+    if (text[i] === '}') { i++; return obj; }
+    for (;;) {
+      skipWs();
+      if (text[i] !== '"') fail();
+      const key = parseString();
+      skipWs();
+      if (text[i] !== ':') fail();
+      i++;
+      const value = parseValue();
+      if (Object.hasOwn(obj, key)) fail();
+      // A plain `obj[key] = value` would invoke Object.prototype's `__proto__`
+      // setter instead of creating an own property, unlike JSON.parse.
+      Object.defineProperty(obj, key, { value, writable: true, enumerable: true, configurable: true });
+      skipWs();
+      if (text[i] === ',') { i++; continue; }
+      if (text[i] === '}') { i++; break; }
+      fail();
+    }
+    return obj;
+  }
+  function parseArray(): unknown[] {
+    i++;
+    const arr: unknown[] = [];
+    skipWs();
+    if (text[i] === ']') { i++; return arr; }
+    for (;;) {
+      arr.push(parseValue());
+      skipWs();
+      if (text[i] === ',') { i++; continue; }
+      if (text[i] === ']') { i++; break; }
+      fail();
+    }
+    return arr;
+  }
+  function parseString(): string {
+    const start = i;
+    i++;
+    while (i < len) {
+      const c = text[i];
+      if (c === '\\') { i += 2; continue; }
+      if (c === '"') { i++; return JSON.parse(text.slice(start, i)) as string; }
+      i++;
+    }
+    return fail();
+  }
+  function parseNumber(): number {
+    const start = i;
+    while (i < len && /[-+0-9.eE]/.test(text[i]!)) i++;
+    if (start === i) fail();
+    return JSON.parse(text.slice(start, i)) as number;
+  }
+  const value = parseValue();
+  skipWs();
+  if (i !== len) fail();
+  return value;
+}
+
 function parseJsonObject(raw: string | undefined): Record<string, unknown> | null {
   const text = raw?.trim();
   if (!text) return null;
   try {
-    const parsed = JSON.parse(text) as unknown;
+    const parsed = parseJsonRejectDuplicateKeys(text);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     return parsed as Record<string, unknown>;
   } catch {
@@ -128,8 +220,9 @@ function parsePolicyUrl(raw: string | undefined): string | undefined {
 }
 
 /**
- * Build the policy from the environment, or null when coverage or approvals are missing
- * or malformed.
+ * Build the policy from the environment, or null when coverage, approvals or
+ * home overrides are missing or malformed (including duplicate object keys,
+ * which would otherwise silently keep only the last value).
  *
  * Reminders are then skipped rather than sent with an empty record: telling
  * approved controllers they lack approval is far worse than staying quiet.
@@ -140,6 +233,9 @@ export function parseGcaPolicy(env: Env): GcaPolicy | null {
   const approvals = parseApprovals(env.GCA_APPROVALS, regions.regionNames);
   const homeOverrides = parseHomeOverrides(env.GCA_HOME_OVERRIDES);
   if (!approvals || !homeOverrides) return null;
+  if (env.GCA_POLICY_URL?.trim() && !parsePolicyUrl(env.GCA_POLICY_URL)) {
+    console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'policy_url' }));
+  }
   return { ...regions, approvals, homeOverrides, policyUrl: parsePolicyUrl(env.GCA_POLICY_URL) };
 }
 
@@ -219,6 +315,10 @@ export function indexMemberVids(members: GuildMember[], roleId: string): Map<num
   return result;
 }
 
+
+/** A deterministic failure: retrying would only repeat the exact same outcome. */
+class PermanentGcaError extends Error {}
+
 class GcaDiscordError extends Error {
   constructor(readonly status: number, readonly retryMs: number) {
     super(`Discord status ${status}`); // Never include response bodies or credentials in logs.
@@ -246,7 +346,8 @@ async function openDm(limits: DiscordRateLimits, token: string, recipient: strin
   if (!channel || typeof channel.id !== 'string' || !/^\d{17,20}$/.test(channel.id) ||
       channel.type !== 1 || !Array.isArray(channel.recipients) ||
       channel.recipients.length !== 1 || channel.recipients[0]?.id !== recipient) {
-    throw new Error('Unexpected DM recipient');
+    // Deterministic for this VID/channel: retrying wastes a round trip every poll.
+    throw new PermanentGcaError('Unexpected DM recipient');
   }
   return channel.id;
 }
@@ -279,12 +380,118 @@ async function fetchMembers(limits: DiscordRateLimits, token: string, guildId: s
 
 type ReminderRow = { status: string; attempts: number; retry_at: number };
 
+// DiscordRateLimits (src/discord-rate-limit.ts) persists cooldowns under this
+// storage key, keyed by route with '*' reserved for a global limit. Neither
+// is exported; duplicated here only to tell a global 429 (which must widen
+// the shared GCA backoff) apart from a single DM channel's own cooldown
+// (which must never block unrelated members' reminders).
+const DISCORD_RATE_LIMIT_STORAGE_KEY = 'discord-rate-limits-v1'; // gitleaks:allow — storage key name, not a credential
+const DISCORD_GLOBAL_RATE_LIMIT_KEY = '*';
+
+async function isGlobalRateLimit(storage: DurableObjectStorage, err: DiscordRateLimitError): Promise<boolean> {
+  const stored = await storage.get<Record<string, number>>(DISCORD_RATE_LIMIT_STORAGE_KEY);
+  return stored?.[DISCORD_GLOBAL_RATE_LIMIT_KEY] === err.retryAt;
+}
+
+interface DeliveryOutcome {
+  status: 'pending' | 'failed';
+  attempts: number;
+  retryAt: number;
+  rateLimited: boolean;
+  statusCode: number | 'unavailable';
+}
+
+/**
+ * Shared at-most-once retry classification for both member DMs and staff
+ * copies, so the two paths can never drift apart on what counts as retryable.
+ */
+function classifyDeliveryFailure(err: unknown, attempts: number, messageAttempted: boolean, now: number): DeliveryOutcome {
+  const rateLimited = err instanceof DiscordRateLimitError;
+  const permanent = err instanceof PermanentGcaError ||
+    (err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && !rateLimited);
+  // 429 is an explicit rejection, safe to retry after its requested delay.
+  // Timeouts/5xx after the message POST may have delivered: do not retry those.
+  const used = attempts + (rateLimited && !err.requestMade ? 0 : 1);
+  const retry = !permanent && (!messageAttempted || rateLimited) && used < MAX_ATTEMPTS;
+  const delay = err instanceof GcaDiscordError || rateLimited ? err.retryMs : 60_000;
+  return {
+    status: retry ? 'pending' : 'failed',
+    attempts: used,
+    retryAt: now + delay,
+    rateLimited,
+    statusCode: err instanceof GcaDiscordError || rateLimited ? (err as GcaDiscordError | DiscordRateLimitError).status : 'unavailable',
+  };
+}
+
+/** Same schema, created idempotently from whichever path (reminders or copies) runs first. */
+function ensureGcaSchema(sql: SqlStorage): void {
+  sql.exec(`CREATE TABLE IF NOT EXISTS gca_reminders (
+    session_key TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
+  )`);
+  sql.exec('CREATE INDEX IF NOT EXISTS gca_reminders_last_seen_idx ON gca_reminders (last_seen)');
+  sql.exec(`CREATE TABLE IF NOT EXISTS gca_occurrences (
+    session_key TEXT PRIMARY KEY, user_id INTEGER NOT NULL, occurrence INTEGER NOT NULL,
+    UNIQUE(user_id, occurrence)
+  )`);
+  sql.exec(`CREATE TABLE IF NOT EXISTS gca_copies (
+    session_key TEXT PRIMARY KEY, recipient_id TEXT NOT NULL, payload TEXT NOT NULL,
+    status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
+  )`);
+}
+
+/** One-time migration from before per-VID occurrence counters existed. */
+async function migrateLegacyOccurrences(storage: DurableObjectStorage, sql: SqlStorage): Promise<void> {
+  if (await storage.get<boolean>(OCCURRENCE_MIGRATION)) return;
+  // Preserve known qualifying connections from before occurrence labels existed.
+  // Failed attempts count as detections, not as proof of delivery or misconduct.
+  // Baseline, unmapped and never-attempted pending connections do not count.
+  sql.exec(`INSERT OR IGNORE INTO gca_occurrences (session_key, user_id, occurrence)
+    SELECT session_key, CAST(substr(session_key, 1, instr(session_key, ':') - 1) AS INTEGER),
+      ROW_NUMBER() OVER (
+        PARTITION BY substr(session_key, 1, instr(session_key, ':') - 1)
+        ORDER BY last_seen, session_key
+      )
+    FROM gca_reminders
+    WHERE status IN ('sent', 'reserved', 'failed') OR (status = 'pending' AND attempts > 0)`);
+  await storage.put(OCCURRENCE_MIGRATION, true);
+}
+
+type Candidate = { atc: OnlineAtc; key: string; mismatch: GcaMismatch };
+
+/**
+ * Insert/refresh every current session, then return candidates due a reminder
+ * right now, deduplicated by session key using the row just written (never a
+ * second, stale copy of the same key). Also prunes long-settled rows.
+ */
+function updateSessionsAndCollectCandidates(
+  sql: SqlStorage, current: OnlineAtc[], policy: GcaPolicy, baselineNow: boolean, now: number,
+): Map<string, Candidate> {
+  const candidates = new Map<string, Candidate>();
+  for (const atc of current) {
+    if (!Number.isSafeInteger(atc.userId) || atc.userId <= 0 ||
+        !Number.isSafeInteger(atc.sessionId) || atc.sessionId <= 0 ||
+        !/^[A-Z0-9_]{3,40}$/.test(atc.callsign)) continue;
+    const key = `${atc.userId}:${atc.sessionId}`;
+    sql.exec(`INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)
+      ON CONFLICT(session_key) DO UPDATE SET last_seen = excluded.last_seen`, key, baselineNow ? 'baseline' : 'pending', now);
+    const row = sql.exec<ReminderRow>('SELECT status, attempts, retry_at FROM gca_reminders WHERE session_key = ?', key).one();
+    const mismatch = gcaMismatch(atc, policy);
+    if (row.status === 'pending' && row.retry_at <= now && row.attempts < MAX_ATTEMPTS && mismatch) {
+      candidates.set(key, { atc, key, mismatch });
+    }
+  }
+  // Keep every possible delivery permanently: even a very old connection ID
+  // reappearing after a feed outage must not receive another notification.
+  sql.exec("DELETE FROM gca_reminders WHERE last_seen < ? AND status NOT IN ('sent', 'reserved', 'failed')", now - RETENTION_MS);
+  return candidates;
+}
+
 /** Called inside the coordinator's serialized poll, before channel notifications. */
 async function sendMemberReminders(
-  env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number,
-  limits: DiscordRateLimits,
+  env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number, limits: DiscordRateLimits,
+  policy: GcaPolicy | null, labels: FirLabel[], deadline: number,
 ): Promise<void> {
-  if (env.GCA_DM_ENABLED !== 'true') return;
   // Missing or unusable configuration disables reminders for this poll; it
   // must never throw, or one bad setting would stop the online cards too.
   const guildId = env.GCA_DISCORD_GUILD_ID ?? '';
@@ -293,76 +500,54 @@ async function sendMemberReminders(
     console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'guild_or_role' }));
     return;
   }
-  const policy = parseGcaPolicy(env);
   if (!policy) {
     console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'policy' }));
     return;
   }
-  const labels = parseFirLabels(env.FIR_LABELS);
   const sql = storage.sql;
-  sql.exec(`CREATE TABLE IF NOT EXISTS gca_reminders (
-    session_key TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen INTEGER NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
-  )`);
-  sql.exec(`CREATE TABLE IF NOT EXISTS gca_occurrences (
-    session_key TEXT PRIMARY KEY, user_id INTEGER NOT NULL, occurrence INTEGER NOT NULL,
-    UNIQUE(user_id, occurrence)
-  )`);
-  if (!await storage.get<boolean>(OCCURRENCE_MIGRATION)) {
-    // Preserve known qualifying connections from before occurrence labels existed.
-    // Failed attempts count as detections, not as proof of delivery or misconduct.
-    // Baseline, unmapped and never-attempted pending connections do not count.
-    sql.exec(`INSERT OR IGNORE INTO gca_occurrences (session_key, user_id, occurrence)
-      SELECT session_key, CAST(substr(session_key, 1, instr(session_key, ':') - 1) AS INTEGER),
-        ROW_NUMBER() OVER (
-          PARTITION BY substr(session_key, 1, instr(session_key, ':') - 1)
-          ORDER BY last_seen, session_key
-        )
-      FROM gca_reminders
-      WHERE status IN ('sent', 'reserved', 'failed') OR (status = 'pending' AND attempts > 0)`);
-    await storage.put(OCCURRENCE_MIGRATION, true);
-  }
+  ensureGcaSchema(sql);
+  await migrateLegacyOccurrences(storage, sql);
+  // A gap since the last poll that actually ran this far (config valid, tables
+  // ready) wider than ~2 poll intervals is treated like first-ever startup for
+  // any session not already tracked: it is baselined rather than immediately
+  // warned, the same way the very first poll ever is — sessions already
+  // online throughout an outage or a disable/re-enable must not be flooded
+  // with a first-ever DM. This only changes the status given to a brand-new
+  // session key; an existing session already due a retry is still sent below.
+  const lastActive = await storage.get<number>(LAST_ACTIVE_KEY);
+  const stale = lastActive !== undefined && now - lastActive > REBASELINE_GAP_MS;
+  await storage.put(LAST_ACTIVE_KEY, now);
   const initialized = await storage.get<boolean>(INITIALIZED_KEY);
-  const candidates: { atc: OnlineAtc; key: string; mismatch: GcaMismatch; attempts: number }[] = [];
-  for (const atc of current) {
-    if (!Number.isSafeInteger(atc.userId) || atc.userId <= 0 ||
-        !Number.isSafeInteger(atc.sessionId) || atc.sessionId <= 0 ||
-        !/^[A-Z0-9_]{3,40}$/.test(atc.callsign)) continue;
-    const key = `${atc.userId}:${atc.sessionId}`;
-    sql.exec(`INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)
-      ON CONFLICT(session_key) DO UPDATE SET last_seen = excluded.last_seen`, key, initialized ? 'pending' : 'baseline', now);
-    const row = sql.exec<ReminderRow>('SELECT status, attempts, retry_at FROM gca_reminders WHERE session_key = ?', key).one();
-    const mismatch = gcaMismatch(atc, policy);
-    if (row.status === 'pending' && row.retry_at <= now && row.attempts < MAX_ATTEMPTS && mismatch) {
-      candidates.push({ atc, key, mismatch, attempts: row.attempts });
-    }
-  }
-  // Keep every possible delivery permanently: even a very old connection ID
-  // reappearing after a feed outage must not receive another notification.
-  sql.exec("DELETE FROM gca_reminders WHERE last_seen < ? AND status NOT IN ('sent', 'reserved', 'failed')", now - RETENTION_MS);
+  const candidates = updateSessionsAndCollectCandidates(sql, current, policy, !initialized || stale, now);
   if (!initialized) {
     await storage.put(INITIALIZED_KEY, true);
     console.log(JSON.stringify({ event: 'gca_baseline_seeded', sessions: current.length }));
     return;
   }
-  if (!candidates.length || (await storage.get<number>(BACKOFF_KEY) ?? 0) > now) return;
-  const deadline = Date.now() + 25_000;
+  if (stale) console.log(JSON.stringify({ event: 'gca_rebaselined', sessions: current.length }));
+  if (!candidates.size || (await storage.get<number>(BACKOFF_KEY) ?? 0) > now) return;
   const members = await fetchMembers(limits, env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
-    if (err instanceof GcaDiscordError || err instanceof DiscordRateLimitError) {
-      await storage.put(BACKOFF_KEY, Date.now() + err.retryMs);
-    }
+    // Any member-list failure — HTTP, rate limit, or a malformed/incomplete
+    // page — must back off: otherwise the same lookup is retried on every
+    // poll indefinitely instead of roughly every few minutes.
+    const retryMs = err instanceof GcaDiscordError || err instanceof DiscordRateLimitError ? err.retryMs : 5 * 60_000;
+    await storage.put(BACKOFF_KEY, Date.now() + retryMs);
+    console.warn(JSON.stringify({ event: 'gca_member_list_failed' }));
     throw err;
   });
   const index = indexMemberVids(members, memberRoleId);
   let attemptsThisPoll = 0;
-  for (const { atc, key, mismatch, attempts } of candidates) {
+  for (const { atc, key, mismatch } of candidates.values()) {
     if (attemptsThisPoll >= MAX_SENDS_PER_POLL || Date.now() >= deadline) break;
-    // A duplicated upstream session must not send twice within one poll either.
-    if (sql.exec<ReminderRow>('SELECT status, attempts, retry_at FROM gca_reminders WHERE session_key = ?', key).one().status !== 'pending') continue;
+    // Re-check the fresh row: a duplicated upstream session, or a candidate
+    // already retried earlier this same poll, must not send twice, and any
+    // retry_at/attempts set by that earlier attempt must not be ignored.
+    const fresh = sql.exec<ReminderRow>('SELECT status, attempts, retry_at FROM gca_reminders WHERE session_key = ?', key).one();
+    if (fresh.status !== 'pending' || fresh.retry_at > Date.now() || fresh.attempts >= MAX_ATTEMPTS) continue;
     const recipient = index.get(atc.userId);
     if (!recipient) {
       sql.exec("UPDATE gca_reminders SET status = 'unmapped' WHERE session_key = ?", key);
-      console.log(JSON.stringify({ event: 'gca_skipped_unmapped', userId: atc.userId }));
+      console.log(JSON.stringify({ event: 'gca_skipped_unmapped' }));
       continue;
     }
     // One durable ordinal per VID/connection, shared across all target regions.
@@ -384,7 +569,9 @@ async function sendMemberReminders(
       await storage.sync();
       messageAttempted = true;
       const message = await discordJson(limits, env.DISCORD_BOT_TOKEN, `/channels/${channelId}/messages`, payload) as { id?: string } | null;
-      if (!message?.id) throw new Error('Discord message response missing id');
+      // The POST itself returned 2xx: the DM was delivered even if the
+      // response body is unusable. Recording that as a retryable/failed
+      // delivery would both re-warn the member and skip their staff copy.
       storage.transactionSync(() => {
         sql.exec("UPDATE gca_reminders SET status = 'sent' WHERE session_key = ?", key);
         if (/^\d{17,20}$/.test(env.GCA_COPY_USER_ID ?? '') && env.GCA_COPY_USER_ID !== recipient) {
@@ -394,21 +581,19 @@ async function sendMemberReminders(
           JSON.stringify({ ...payload, content: `Copy of reminder sent to <@${recipient}> · VID ${atc.userId}` }));
         }
       });
-      console.log(JSON.stringify({ event: 'gca_dm_sent', userId: atc.userId, callsign: atc.callsign, occurrence }));
+      console.log(JSON.stringify({ event: message?.id ? 'gca_dm_sent' : 'gca_dm_sent_unconfirmed' }));
     } catch (err) {
-      const rateLimited = err instanceof DiscordRateLimitError;
-      const permanent = err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && !rateLimited;
-      // 429 is an explicit rejection, safe to retry after its requested delay.
-      // Timeouts/5xx after the message POST may have delivered: do not retry those.
-      const used = attempts + (rateLimited && !err.requestMade ? 0 : 1);
-      const retry = !permanent && (!messageAttempted || rateLimited) && used < MAX_ATTEMPTS;
-      const delay = err instanceof GcaDiscordError || rateLimited ? err.retryMs : 60_000;
+      const outcome = classifyDeliveryFailure(err, fresh.attempts, messageAttempted, Date.now());
       sql.exec('UPDATE gca_reminders SET status = ?, attempts = ?, retry_at = ? WHERE session_key = ?',
-        retry ? 'pending' : 'failed', used, Date.now() + delay, key);
-      console.warn(JSON.stringify({ event: 'gca_dm_failed', userId: atc.userId,
-        status: err instanceof GcaDiscordError || rateLimited ? err.status : 'unavailable', retry }));
-      if (rateLimited) {
-        await storage.put(BACKOFF_KEY, Date.now() + delay);
+        outcome.status, outcome.attempts, outcome.retryAt, key);
+      console.warn(JSON.stringify({ event: 'gca_dm_failed', status: outcome.statusCode, retry: outcome.status === 'pending' }));
+      // Only a genuinely global (or member-list) limit should widen the
+      // shared backoff: one recipient's DM-channel cooldown must not block
+      // unrelated members' reminders.
+      if (outcome.rateLimited) {
+        if (await isGlobalRateLimit(storage, err as DiscordRateLimitError)) {
+          await storage.put(BACKOFF_KEY, outcome.retryAt);
+        }
         break;
       }
     }
@@ -417,11 +602,11 @@ async function sendMemberReminders(
 
 type CopyRow = ReminderRow & { session_key: string; recipient_id: string; payload: string };
 
-async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits): Promise<void> {
+async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits, deadline: number): Promise<void> {
   if (!/^\d{17,20}$/.test(env.GCA_COPY_USER_ID ?? '') ||
       (await storage.get<number>(BACKOFF_KEY) ?? 0) > Date.now()) return;
   const sql = storage.sql;
-  const deadline = Date.now() + 25_000;
+  ensureGcaSchema(sql);
   const pending = sql.exec<CopyRow>(`SELECT * FROM gca_copies
     WHERE status = 'pending' AND recipient_id = ? AND retry_at <= ? AND attempts < ?
     ORDER BY rowid LIMIT ?`, env.GCA_COPY_USER_ID, Date.now(), MAX_ATTEMPTS, MAX_SENDS_PER_POLL).toArray();
@@ -436,21 +621,18 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits
       await storage.sync();
       messageAttempted = true;
       const message = await discordJson(limits, env.DISCORD_BOT_TOKEN, `/channels/${channelId}/messages`, payload) as { id?: string } | null;
-      if (!message?.id) throw new Error('Discord message response missing id');
+      // A 2xx POST delivered the copy even if the response body is unusable.
       sql.exec("UPDATE gca_copies SET status = 'sent', payload = '' WHERE session_key = ?", row.session_key);
-      console.log(JSON.stringify({ event: 'gca_copy_sent', sessionKey: row.session_key }));
+      console.log(JSON.stringify({ event: message?.id ? 'gca_copy_sent' : 'gca_copy_sent_unconfirmed' }));
     } catch (err) {
-      const rateLimited = err instanceof DiscordRateLimitError;
-      const permanent = err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && !rateLimited;
-      const used = row.attempts + (rateLimited && !err.requestMade ? 0 : 1);
-      const retry = !permanent && (!messageAttempted || rateLimited) && used < MAX_ATTEMPTS;
-      const delay = err instanceof GcaDiscordError || rateLimited ? err.retryMs : 60_000;
+      const outcome = classifyDeliveryFailure(err, row.attempts, messageAttempted, Date.now());
       sql.exec('UPDATE gca_copies SET status = ?, attempts = ?, retry_at = ?, payload = ? WHERE session_key = ?',
-        retry ? 'pending' : 'failed', used, Date.now() + delay, retry ? row.payload : '', row.session_key);
-      console.warn(JSON.stringify({ event: 'gca_copy_failed', sessionKey: row.session_key,
-        status: err instanceof GcaDiscordError || rateLimited ? err.status : 'unavailable', retry }));
-      if (rateLimited) {
-        await storage.put(BACKOFF_KEY, Date.now() + delay);
+        outcome.status, outcome.attempts, outcome.retryAt, outcome.status === 'pending' ? row.payload : '', row.session_key);
+      console.warn(JSON.stringify({ event: 'gca_copy_failed', status: outcome.statusCode, retry: outcome.status === 'pending' }));
+      if (outcome.rateLimited) {
+        if (await isGlobalRateLimit(storage, err as DiscordRateLimitError)) {
+          await storage.put(BACKOFF_KEY, outcome.retryAt);
+        }
         break;
       }
     }
@@ -460,18 +642,18 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits
 /** Serialized by the coordinator; copy failures never retry the member's DM. */
 export async function sendGcaReminders(
   env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number,
-  rateLimits?: DiscordRateLimits,
+  policy: GcaPolicy | null, labels: FirLabel[] = [], rateLimits?: DiscordRateLimits,
 ): Promise<void> {
   if (env.GCA_DM_ENABLED !== 'true') return;
   const limits = rateLimits ?? await DiscordRateLimits.load(storage);
-  storage.sql.exec(`CREATE TABLE IF NOT EXISTS gca_copies (
-    session_key TEXT PRIMARY KEY, recipient_id TEXT NOT NULL, payload TEXT NOT NULL,
-    status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
-  )`);
+  // Single shared deadline across both member reminders and staff copies:
+  // two independent 25s budgets could together delay the public online/
+  // offline cards that run after this by up to 50s.
+  const deadline = Date.now() + 25_000;
   try {
-    await sendMemberReminders(env, current, storage, now, limits);
+    await sendMemberReminders(env, current, storage, now, limits, policy, labels, deadline);
   } finally {
-    await sendPendingCopies(env, storage, limits).catch(() => {
+    await sendPendingCopies(env, storage, limits, deadline).catch(() => {
       console.warn(JSON.stringify({ event: 'gca_copy_poll_failed' }));
     });
   }

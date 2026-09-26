@@ -246,7 +246,7 @@ export async function runPoll(
 
   if (storage) {
     try {
-      await sendGcaReminders(env, current, storage, Date.parse(nowIso), limits);
+      await sendGcaReminders(env, current, storage, Date.parse(nowIso), gcaPolicy, labels, limits);
     } catch {
       // DM lookup/storage failures must not break the public ATC cards.
       console.error(JSON.stringify({ event: 'gca_poll_failed' }));

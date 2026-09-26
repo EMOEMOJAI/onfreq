@@ -59,7 +59,8 @@ let returnedRecipient: string;
 let timeoutMessage: boolean;
 
 function check(current: OnlineAtc[], config = settings()) {
-  return runInDurableObject(stub(), (_instance, ctx) => sendGcaReminders(config, current, ctx.storage, now));
+  return runInDurableObject(stub(), (_instance, ctx) =>
+    sendGcaReminders(config, current, ctx.storage, now, parseGcaPolicy(config), []));
 }
 
 async function statuses() {
@@ -252,6 +253,16 @@ describe('GCA policy configuration', () => {
     ['{"0":[]}', 'an invalid member id'],
   ])('refuses to run on %s approvals (%s)', (approvals) => {
     expect(parseGcaPolicy({ ...settings(), GCA_APPROVALS: String(approvals) })).toBeNull();
+  });
+
+  it.each([
+    ['GCA_REGIONS', '{"AA":{"name":"One","prefixes":["XA"]},"AA":{"name":"Two","prefixes":["XB"]}}', 'a duplicate top-level region'],
+    ['GCA_REGIONS', '{"AA":{"name":"Example","prefixes":["XA"],"prefixes":["XB"]}}', 'a duplicate nested key'],
+    ['GCA_APPROVALS', '{"610001":[{"region":"AA","level":1}],"610001":[{"region":"AC","level":1}]}', 'a duplicate VID'],
+    ['GCA_APPROVALS', '{"610001":[{"region":"AA","level":1,"level":2}]}', 'a duplicate nested key'],
+    ['GCA_HOME_OVERRIDES', '{"620001":"AC","620001":"AD"}', 'a duplicate VID'],
+  ])('rejects %s with %s instead of silently keeping only the last value', (key, value) => {
+    expect(parseGcaPolicy({ ...settings(), [key as string]: value })).toBeNull();
   });
 
   it.each(['not json', '{"620001":"Example West"}', '{"620001":1}'])(
@@ -451,6 +462,24 @@ describe('durable GCA delivery', () => {
     expect(sent).toHaveLength(1);
   });
 
+  it('only attempts a duplicated session once per poll, without bypassing its own retry_at afterward', async () => {
+    await check([]);
+    openStatus = 500; // transient failure before reservation
+    await check([atc(), atc({ callsign: 'QESS_APP' })]);
+    expect(sent).toHaveLength(0);
+    expect(network.mock.calls.filter(([url]) => String(url).endsWith('/users/@me/channels'))).toHaveLength(1);
+    expect((await statuses())[0]).toMatchObject({ status: 'pending', attempts: 1 });
+    openStatus = 200;
+    // Still within the 60s retry delay: appearing twice in this response must
+    // not let the second copy ignore retry_at and resend early with a stale
+    // attempts count.
+    await check([atc(), atc({ callsign: 'QESS_APP' })]);
+    expect(sent).toHaveLength(0);
+    now += 60_000;
+    await check([atc()]);
+    expect(sent).toHaveLength(1);
+  });
+
   it('waits for country/frequency data then sends on the next eligible poll', async () => {
     await check([]);
     await check([atc({ memberCountry: null })]);
@@ -629,6 +658,63 @@ describe('durable GCA delivery', () => {
     expect((await statuses())[0]).toMatchObject({ status: 'failed', attempts: 5 });
     expect(network.mock.calls.filter(([url]) => String(url).endsWith('/users/@me/channels'))).toHaveLength(5);
   });
+
+  it('backs off and logs a fixed reason after a non-HTTP member-list failure, instead of retrying every poll', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).includes('/members?')) return Response.json({ not: 'an array of members' });
+      return original(input, init);
+    });
+    await expect(check([atc()])).rejects.toThrow('Invalid Discord member list');
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'gca_member_list_failed' }));
+    const calls = network.mock.calls.length;
+    await check([atc({ sessionId: 2 })]);
+    expect(network).toHaveBeenCalledTimes(calls); // still backed off, no repeated member-list lookup
+  });
+
+  it('re-baselines sessions discovered after a long gap instead of warning them immediately', async () => {
+    await check([]);
+    await check([atc()]);
+    expect(sent).toHaveLength(1);
+    await evictDurableObject(stub());
+    now += 20 * 60_000; // well past a normal retry/backoff delay
+    await check([atc({ sessionId: 2, callsign: 'XFAA_APP' })]);
+    expect(sent).toHaveLength(1); // the newly-discovered session was baselined, not warned
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'baseline' });
+    now += 60_000;
+    await check([atc({ sessionId: 2, callsign: 'XFAA_APP' })]);
+    expect(sent).toHaveLength(1); // a baselined session never warns, even once settled in
+  });
+
+  it('does not let a single DM route\'s rate limit widen the shared backoff the way a global one does', async () => {
+    await check([]);
+    messageStatus = 429; // route-scoped: the mocked body carries no `global` flag
+    await check([atc()]);
+    expect(sent).toHaveLength(1); // attempted, but rejected
+    // A different member has their own DM channel, so this route-scoped 429
+    // must never bleed into it.
+    const OTHER_CHANNEL = '999999999999999999';
+    const OTHER_USER = '600000000000000002';
+    members = [member(), member(600002, OTHER_USER)];
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/users/@me/channels') && JSON.parse(String(init?.body)).recipient_id === OTHER_USER) {
+        return Response.json({ id: OTHER_CHANNEL, type: 1, recipients: [{ id: OTHER_USER }] });
+      }
+      if (url.endsWith(`/channels/${OTHER_CHANNEL}/messages`)) {
+        sent.push(JSON.parse(String(init?.body)));
+        return Response.json({ id: 'synthetic-other' });
+      }
+      return original(input, init);
+    });
+    // No time advance: a global (or member-list) rate limit would still gate
+    // the very next poll and skip it before even considering this other member.
+    await check([atc({ userId: 600002, sessionId: 2 })]);
+    expect(sent).toHaveLength(2);
+  });
 });
 
 describe('staff copies', () => {
@@ -785,6 +871,23 @@ describe('staff copies', () => {
     await check([], { ...config(), GCA_COPY_USER_ID: USER });
     expect(sent).toHaveLength(1);
     expect(copies).toHaveLength(0);
+    await check([], config());
+    expect(copies).toHaveLength(1);
+  });
+
+  it('records a 2xx response with a missing id as sent, not failed, and still queues a copy', async () => {
+    await check([], config());
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).endsWith(`/channels/${CHANNEL}/messages`)) {
+        sent.push(JSON.parse(String(init?.body)));
+        return Response.json({}, { status: 200 }); // 2xx, but no `id`
+      }
+      return original(input, init);
+    });
+    await check([atc()], config());
+    expect(sent).toHaveLength(1);
+    expect((await statuses())[0]).toMatchObject({ status: 'sent', attempts: 1 });
     await check([], config());
     expect(copies).toHaveLength(1);
   });
