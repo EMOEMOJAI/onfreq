@@ -250,11 +250,15 @@ async function announceOffline(
             // Every first card carries its session's start time.
             Date.parse(message.embeds[0].timestamp ?? '') === Date.parse(job.event.since));
       } catch (err) {
-        // Without message history access, fall back to the re-post below.
+        // Without message history access (a 4xx), a channel without a tracked
+        // card falls back to the re-post below; one with a tracked card has
+        // nothing more to try.
         if (!countsAgainstBudget(err)) throw err;
+        logFailure('offline_recover_lookup_failed', job.event.callsign, channelId, err);
       }
       if (!found.length && window.closeOnly) {
-        // No stray copy of a tracked card: nothing is left to close here.
+        // No stray copy of a tracked card could be found: nothing is left to
+        // close here.
         delivered++;
         continue;
       }
