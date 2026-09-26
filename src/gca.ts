@@ -13,6 +13,10 @@ const MAX_POLICY_URL_LENGTH = 2048;
 const names = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none' });
 const INITIALIZED_KEY = 'gca-initialized-v1'; // gitleaks:allow — storage key name, not a credential
 const BACKOFF_KEY = 'gca-discord-backoff-v1';
+// Gates only the member-list fetch, separately from the shared BACKOFF_KEY:
+// a member-list-specific failure (a route 429, a malformed page) must not
+// also block unrelated staff-copy sends, which only check BACKOFF_KEY.
+const MEMBER_LIST_BACKOFF_KEY = 'gca-member-list-backoff-v1';
 const LAST_ACTIVE_KEY = 'gca-last-active-v1';
 const RETENTION_MS = 7 * 86_400_000;
 const MAX_SENDS_PER_POLL = 3;
@@ -54,7 +58,7 @@ function parseJsonRejectDuplicateKeys(text: string): unknown {
   let i = 0;
   const len = text.length;
   const fail = (): never => { throw new SyntaxError('invalid or duplicate-key JSON'); };
-  const skipWs = () => { while (i < len && /[\s]/.test(text[i]!)) i++; };
+  const skipWs = () => { while (i < len && /[ \t\n\r]/.test(text[i]!)) i++; };
   function parseValue(): unknown {
     skipWs();
     const c = text[i];
@@ -127,8 +131,20 @@ function parseJsonRejectDuplicateKeys(text: string): unknown {
   return value;
 }
 
+// `String.prototype.trim()` strips a much wider Unicode whitespace set (NBSP,
+// BOM, U+2028, etc.) than JSON's own whitespace grammar (space, tab, LF, CR).
+// Trimming with it would let policy text bracketed by those characters look
+// valid when strict JSON would reject it as leading/trailing garbage.
+function trimJsonWhitespace(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && /[ \t\n\r]/.test(text[start]!)) start++;
+  while (end > start && /[ \t\n\r]/.test(text[end - 1]!)) end--;
+  return text.slice(start, end);
+}
+
 function parseJsonObject(raw: string | undefined): Record<string, unknown> | null {
-  const text = raw?.trim();
+  const text = raw === undefined ? undefined : trimJsonWhitespace(raw);
   if (!text) return null;
   try {
     const parsed = parseJsonRejectDuplicateKeys(text);
@@ -336,7 +352,10 @@ async function discordJson(limits: DiscordRateLimits, token: string, path: strin
     const seconds = Number(response.headers.get('retry-after'));
     throw new GcaDiscordError(response.status, Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 60_000);
   }
-  return response.json();
+  // A 2xx response with an empty or non-JSON body (e.g. a 204-style empty
+  // reply) is still a success: treat it as "no body" rather than a failure,
+  // so callers still record sent/sent_unconfirmed instead of a retry.
+  return response.json().catch(() => null);
 }
 
 async function openDm(limits: DiscordRateLimits, token: string, recipient: string): Promise<string> {
@@ -425,6 +444,7 @@ function ensureGcaSchema(sql: SqlStorage): void {
     session_key TEXT PRIMARY KEY, recipient_id TEXT NOT NULL, payload TEXT NOT NULL,
     status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
   )`);
+  sql.exec('CREATE INDEX IF NOT EXISTS gca_copies_pending_idx ON gca_copies (status, retry_at)');
 }
 
 /** One-time migration from before per-VID occurrence counters existed. */
@@ -460,9 +480,9 @@ function updateSessionsAndCollectCandidates(
         !Number.isSafeInteger(atc.sessionId) || atc.sessionId <= 0 ||
         !/^[A-Z0-9_]{3,40}$/.test(atc.callsign)) continue;
     const key = `${atc.userId}:${atc.sessionId}`;
-    sql.exec(`INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)
-      ON CONFLICT(session_key) DO UPDATE SET last_seen = excluded.last_seen`, key, baselineNow ? 'baseline' : 'pending', now);
-    const row = sql.exec<ReminderRow>('SELECT status, attempts, retry_at FROM gca_reminders WHERE session_key = ?', key).one();
+    const row = sql.exec<ReminderRow>(`INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)
+      ON CONFLICT(session_key) DO UPDATE SET last_seen = excluded.last_seen
+      RETURNING status, attempts, retry_at`, key, baselineNow ? 'baseline' : 'pending', now).one();
     const mismatch = gcaMismatch(atc, policy);
     if (row.status === 'pending' && row.retry_at <= now && row.attempts < MAX_ATTEMPTS && mismatch) {
       candidates.set(key, { atc, key, mismatch });
@@ -512,13 +532,24 @@ async function sendMemberReminders(
     return;
   }
   if (stale) console.log(JSON.stringify({ event: 'gca_rebaselined', sessions: current.length }));
-  if (!candidates.size || (await storage.get<number>(BACKOFF_KEY) ?? 0) > now) return;
+  if (!candidates.size) return;
+  const globalBackoff = await storage.get<number>(BACKOFF_KEY) ?? 0;
+  const memberListBackoff = await storage.get<number>(MEMBER_LIST_BACKOFF_KEY) ?? 0;
+  if (Math.max(globalBackoff, memberListBackoff) > now) return;
   const members = await fetchMembers(limits, env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
-    // Any member-list failure — HTTP, rate limit, or a malformed/incomplete
-    // page — must back off: otherwise the same lookup is retried on every
-    // poll indefinitely instead of roughly every few minutes.
+    // Running out of the poll deadline is not a Discord failure: the same
+    // lookup should simply be retried next poll, with no backoff recorded.
+    if (err instanceof Error && err.message === 'Discord member lookup exceeded poll budget') throw err;
+    // Any other member-list failure — HTTP or a malformed/incomplete page —
+    // must back off, but only the member-list lookup itself; otherwise the
+    // same lookup is retried on every poll indefinitely instead of roughly
+    // every few minutes. Only a genuinely global rate limit also widens the
+    // shared BACKOFF_KEY that gates unrelated staff copies.
     const retryMs = err instanceof GcaDiscordError || err instanceof DiscordRateLimitError ? err.retryMs : 5 * 60_000;
-    await storage.put(BACKOFF_KEY, Date.now() + retryMs);
+    await storage.put(MEMBER_LIST_BACKOFF_KEY, Date.now() + retryMs);
+    if (err instanceof DiscordRateLimitError && err.global) {
+      await storage.put(BACKOFF_KEY, Date.now() + retryMs);
+    }
     console.warn(JSON.stringify({ event: 'gca_member_list_failed' }));
     throw err;
   });
