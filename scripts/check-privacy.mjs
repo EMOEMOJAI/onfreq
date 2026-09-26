@@ -6,7 +6,8 @@ export function privatePath(file) {
     /^(?:\.env|\.dev\.vars)(?:\..*)?$/.test(name) && !['.env.example', '.dev.vars.example'].includes(name) ||
     /(?:\.local\.(?:sh|jsonc?|md)|\.(?:pem|key|p12|pfx|log)|-secret(?:\.txt)?)$/i.test(name) ||
     /^(?:secrets\.json|poll-secret|poll-endpoint|settings\.local\.json|gitleaks-report\..*)$/.test(name) ||
-    /^(?:wrangler\.local\..*|\.npmrc)$/.test(name);
+    /^(?:wrangler\.local\..*|\.npmrc|\.DS_Store)$/.test(name) ||
+    /^docs\/pr-audit-[^/]*\.md$/.test(file);
 }
 
 /** Validate every tracked Wrangler config without printing its values; TOML cannot be checked. */

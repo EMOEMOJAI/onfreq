@@ -1,17 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { imagePrivacy, privateCommitEmails, privatePath, publicConfig, wranglerConfigErrors } from './check-privacy.mjs';
 import { checkExternalLinks, checkLocalLinks, documentLinks } from './check-links.mjs';
-import { testDeployGuard, validateHooks, validateSetup } from './check-setup.mjs';
+import { isolatedEnv, testDeployGuard, validateHooks, validateSetup } from './check-setup.mjs';
 import { jsonc } from './repo-files.mjs';
 
 test('rejects private paths independently of gitignore, allowing public templates', () => {
   for (const file of ['.dev.vars', '.env.production', 'nested/.dev.vars.preview', 'wrangler.local.jsonc',
     'wrangler.local.json', 'wrangler.local.toml', 'nested/wrangler.local.yaml', '.npmrc', 'nested/.npmrc',
     'set-secrets.local.sh', '.local/report.txt', '.wrangler/state.db', 'poll-secret', 'poll-endpoint',
-    'key.pem', 'private.key', 'trace.log', '.claude/settings.local.json']) assert.equal(privatePath(file), true, file);
-  for (const file of ['.dev.vars.example', '.env.example', 'wrangler.jsonc', 'config/optional-secrets.example']) {
+    'key.pem', 'private.key', 'trace.log', '.claude/settings.local.json', '.DS_Store', 'assets/.DS_Store',
+    'docs/pr-audit-2026-09.md', 'docs/pr-audit-.md']) assert.equal(privatePath(file), true, file);
+  for (const file of ['.dev.vars.example', '.env.example', 'wrangler.jsonc', 'config/optional-secrets.example',
+    'docs/setup.md', 'docs/pr-audit.md', 'nested/docs/pr-audit-notes.md', 'docs/pr-audit-notes.txt']) {
     assert.equal(privatePath(file), false, file);
   }
 });
@@ -145,8 +150,47 @@ test('public deploy permits a fresh template and blocks private configuration, e
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   testDeployGuard(readFileSync(new URL('./check-deploy.mjs', import.meta.url)), pkg.scripts.deploy);
   // Regression: the former predeploy-only script reached deployment under ignore-scripts.
-  assert.throws(() => testDeployGuard(readFileSync(new URL('./check-deploy.mjs', import.meta.url)), 'wrangler deploy'),
-    /Private installation must refuse public deployment/);
+  assert.throws(() => testDeployGuard(readFileSync(new URL('./check-deploy.mjs', import.meta.url)),
+    'wrangler deploy --config wrangler.jsonc'), /Private installation must refuse public deployment/);
+  // Regression (S19-13): without --config, Wrangler may prefer wrangler.json/toml or a redirect.
+  assert.throws(() => testDeployGuard(readFileSync(new URL('./check-deploy.mjs', import.meta.url)),
+    'node scripts/check-deploy.mjs && wrangler deploy'), /pin --config wrangler\.jsonc/);
+  assert.throws(() => validateSetup(
+    jsonc(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8')),
+    { ...pkg, scripts: { ...pkg.scripts, deploy: 'node scripts/check-deploy.mjs && wrangler deploy' } },
+    readFileSync(new URL('../.dev.vars.example', import.meta.url), 'utf8')));
+});
+
+test('public deploy guard also sees private config in the main checkout of a Git worktree', (t) => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-worktree-')));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const main = join(base, 'main');
+  const linked = join(base, 'linked');
+  const env = isolatedEnv();
+  const git = (cwd, ...args) => {
+    const result = spawnSync('git', ['-c', 'user.name=Synthetic', '-c', 'user.email=synthetic@example.test',
+      '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, env, encoding: 'utf8' });
+    assert.equal(result.status, 0, `git ${args[0]} failed`);
+  };
+  mkdirSync(join(main, 'scripts'), { recursive: true });
+  copyFileSync(new URL('./check-deploy.mjs', import.meta.url), join(main, 'scripts/check-deploy.mjs'));
+  git(main, 'init', '--quiet');
+  git(main, 'add', 'scripts/check-deploy.mjs');
+  git(main, 'commit', '--quiet', '--no-verify', '-m', 'synthetic');
+  git(main, 'worktree', 'add', '--quiet', '--detach', linked);
+  const guard = (cwd) => spawnSync(process.execPath, ['scripts/check-deploy.mjs'], { cwd, env, encoding: 'utf8' });
+  assert.equal(guard(linked).status, 0);
+  for (const name of ['wrangler.local.jsonc', 'wrangler.local.json', 'wrangler.local.toml']) {
+    writeFileSync(join(main, name), '{}');
+    for (const cwd of [main, linked]) {
+      const result = guard(cwd);
+      assert.equal(result.status, 1, `${name} from ${cwd === main ? 'main' : 'linked'}`);
+      assert.match(result.stderr, /Private deployment config detected/);
+    }
+    rmSync(join(main, name));
+  }
+  // Removing the private config allows the public deployment again.
+  assert.equal(guard(linked).status, 0);
 });
 
 test('parses Markdown references, nested badge images, HTML and duplicate heading anchors', () => {

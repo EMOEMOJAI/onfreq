@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "node scripts/check-deploy.mjs && wrangler deploy",
+    "deploy": "node scripts/check-deploy.mjs && wrangler deploy --config wrangler.jsonc",
     "types": "wrangler types --strict-vars=false --env-interface CloudflareBindings --env-file .dev.vars.example",
     "typecheck": "npm run types && tsc --noEmit",
     "test": "vitest run && node --test scripts/test-*.mjs",

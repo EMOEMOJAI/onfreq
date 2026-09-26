@@ -43,7 +43,7 @@ npx wrangler secret put POLL_SECRET --config wrangler.local.jsonc
 npm run deploy:local
 ```
 
-The public `npm run deploy` command uses `wrangler.jsonc`. It stops, even with npm scripts ignored, if a private `wrangler.local.jsonc`, `.json` or `.toml` exists; use `deploy:local` for that installation. Keep an existing button installation's generated resource IDs when managing its copied repository.
+The public `npm run deploy` command runs `wrangler deploy --config wrangler.jsonc`. It stops, even with npm scripts ignored, if a private `wrangler.local.jsonc`, `.json` or `.toml` exists in the checkout or, for a Git worktree, in its main checkout; use `deploy:local` for that installation. It also refuses a root `wrangler.json`, `wrangler.toml` or `.wrangler/deploy/config.json`. Keep an existing button installation's generated resource IDs when managing its copied repository.
 
 **Upgrading:** set `FIR_PREFIXES`, and migrate any custom labels to private `FIR_LABELS` before deploying. Preserve the existing Worker, KV namespace, Durable Object class and migration tag in your private config. If its coordinator object name differs from `onfreq`, set the `COORDINATOR_NAME` secret to the exact existing name **before deploying**. Changing identity disconnects stored state. Do not restart an old KV-only deployment against stale state.
 
@@ -80,11 +80,13 @@ The Mac helper reads private files under `~/.onfreq` and logs `FAIL permissions`
 install -d -m 700 ~/.onfreq
 ```
 
-Store your HTTPS `/poll` URL in `~/.onfreq/poll-endpoint` and the URL-safe token in `~/.onfreq/poll-secret` using a local editor. Then:
+Store your HTTPS `/poll` URL in `~/.onfreq/poll-endpoint` and the URL-safe token in `~/.onfreq/poll-secret` using a local editor. Then install, or upgrade, the agent; `bootout` first unloads any existing agent:
 
 ```sh
 chmod 600 ~/.onfreq/poll-endpoint ~/.onfreq/poll-secret
+launchctl bootout "gui/$(id -u)/com.onfreq.poll" 2>/dev/null || true
 mkdir -p ~/Library/Logs ~/Library/LaunchAgents
+[ ! -f ~/Library/Logs/onfreq-poll.err.log ] || chmod 600 ~/Library/Logs/onfreq-poll.err.log
 cp scripts/poll-trigger.sh ~/.onfreq/
 chmod 700 ~/.onfreq/poll-trigger.sh
 sed "s|__HOME__|$HOME|g" scripts/com.onfreq.poll.plist > "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
@@ -92,7 +94,7 @@ chmod 600 "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
 ```
 
-The agent runs every minute with `/bin/sh` while the Mac is awake and logged in. Before reinstalling or moving files, unload the existing agent with `launchctl bootout`; preserve the endpoint and secret and avoid loading duplicate pollers.
+The agent runs every minute with `/bin/sh` while the Mac is awake and logged in. The files must be owned by your account, with no group or other access and, on macOS, no ACL entries (check with `ls -le`). Rerun the whole block to upgrade or move files; it preserves the endpoint and secret and avoids loading duplicate pollers.
 
 For failures, check `npm run tail`. A 401 means the token is wrong; a 403 from Discord usually means channel permissions are missing. Never post unredacted logs publicly.
 
