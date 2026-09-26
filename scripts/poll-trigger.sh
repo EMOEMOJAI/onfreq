@@ -20,7 +20,7 @@ log() {
 endpoint=${POLL_ENDPOINT:-$(cat "$poll_dir/poll-endpoint" 2>/dev/null || true)}
 secret=$(cat "$poll_dir/poll-secret" 2>/dev/null || true)
 
-# Use the same literal URL and URL-safe token rules as the health monitor.
+# Require a literal HTTPS /poll URL and a URL-safe token.
 valid=true
 case "$endpoint" in https://*/poll) ;; *) valid=false ;; esac
 authority=${endpoint#https://}

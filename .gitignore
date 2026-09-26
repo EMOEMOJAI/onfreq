@@ -23,6 +23,7 @@ secrets.json
 *-secret
 *-secret.txt
 poll-secret
+poll-endpoint
 
 # Local, operator-specific helper scripts (may contain real IDs)
 *.local.sh
