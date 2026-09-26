@@ -1,5 +1,7 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { configuredSecret, extractBearer, MIN_SECRET_LENGTH, secretsMatch } from '../src/auth';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  configuredSecret, extractBearer, logConfigInvalidOnce, MIN_SECRET_LENGTH, resetConfigInvalidLogForTests, secretsMatch,
+} from '../src/auth';
 
 describe('extractBearer', () => {
   it('reads the token from a Bearer header', () => {
@@ -39,6 +41,7 @@ describe('secretsMatch', () => {
 });
 
 describe('configuredSecret', () => {
+  beforeEach(resetConfigInvalidLogForTests);
   afterEach(() => vi.restoreAllMocks());
 
   it('treats a secret shorter than 32 characters as unset and logs only its name', () => {
@@ -52,6 +55,24 @@ describe('configuredSecret', () => {
       { event: 'config_invalid', reason: 'HISTORY_SECRET_too_short' },
     ]);
     expect(JSON.stringify(log.mock.calls)).not.toContain('w'.repeat(MIN_SECRET_LENGTH - 1));
+  });
+
+  it('S8-3: logs each invalid secret name at most once per isolate', () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    for (let i = 0; i < 5; i++) {
+      expect(configuredSecret('short', 'POLL_SECRET')).toBe('');
+      expect(configuredSecret('also-short', 'HISTORY_SECRET')).toBe('');
+    }
+    logConfigInvalidOnce('HISTORY_SECRET_reuses_POLL_SECRET');
+    logConfigInvalidOnce('HISTORY_SECRET_reuses_POLL_SECRET');
+    expect(log.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      { event: 'config_invalid', reason: 'POLL_SECRET_too_short' },
+      { event: 'config_invalid', reason: 'HISTORY_SECRET_too_short' },
+      { event: 'config_invalid', reason: 'HISTORY_SECRET_reuses_POLL_SECRET' },
+    ]);
+    resetConfigInvalidLogForTests();
+    configuredSecret('short', 'POLL_SECRET');
+    expect(log).toHaveBeenCalledTimes(4);
   });
 
   it('accepts a trimmed secret of at least 32 characters', () => {

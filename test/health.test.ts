@@ -1,12 +1,14 @@
 import { env } from 'cloudflare:workers';
 import { SELF, reset, runInDurableObject, evictDurableObject } from 'cloudflare:test';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { POLL_SNAPSHOT_KEY, COORDINATOR_NAME } from '../src/config';
+import { resetConfigInvalidLogForTests } from '../src/auth';
 import { AUTH_HEADERS } from './helpers';
 
 const headers = AUTH_HEADERS;
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
+beforeEach(resetConfigInvalidLogForTests);
 afterEach(async () => { vi.restoreAllMocks(); await reset(); });
 
 it('requires authentication, disables without a secret, and never caches health', async () => {
@@ -93,11 +95,25 @@ it('S1-1: a short POLL_SECRET disables /poll and /health even when the token mat
   const health = await callPollRoute('/health', 'GET', almost, { POLL_SECRET: ` ${almost} ` });
   expect(health.status).toBe(503);
   expect(await health.json()).toEqual({ error: 'endpoint disabled' });
+  // S8-3: logged once per isolate, not once per request.
   expect(log.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
-    { event: 'config_invalid', reason: 'POLL_SECRET_too_short' },
     { event: 'config_invalid', reason: 'POLL_SECRET_too_short' },
   ]);
   expect(JSON.stringify(log.mock.calls)).not.toContain(almost);
   const exact = 'p'.repeat(32);
   expect(await (await callPollRoute('/health', 'GET', exact, { POLL_SECRET: exact })).json()).toMatchObject({ ok: false, maxAgeSeconds: 300 });
+});
+
+it('S8-3: unauthenticated requests cannot multiply config_invalid log lines', async () => {
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const weak = 'short-poll-secret-thirty-one-ch';
+  expect(weak).toHaveLength(31);
+  for (let i = 0; i < 20; i++) {
+    const [path, method] = i % 2 ? ['/health', 'GET'] : ['/poll', 'POST'];
+    const response = await callPollRoute(path, method, `attacker-${i}`, { POLL_SECRET: weak });
+    expect(response.status).toBe(503);
+  }
+  expect(log).toHaveBeenCalledOnce();
+  expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual({ event: 'config_invalid', reason: 'POLL_SECRET_too_short' });
+  expect(JSON.stringify(log.mock.calls)).not.toContain(weak);
 });

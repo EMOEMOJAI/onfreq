@@ -72,7 +72,7 @@ GCA coverage is private configuration, with no built-in region list. Set `GCA_RE
 
 ## Health and optional Mac fallback
 
-`GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters count as unset: their endpoints return 503.
+`GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters count as unset: their endpoints return 503. When upgrading, rotate a shorter `POLL_SECRET` and set a distinct `HISTORY_SECRET` before deploying.
 
 The Mac helper reads private files under `~/.onfreq` and logs `FAIL permissions` without polling if other accounts can access them. Create the directory:
 
@@ -98,6 +98,6 @@ For failures, check `npm run tail`. A 401 means the token is wrong; a 403 from D
 
 ## Private history maintenance
 
-`GET /gca-history` and `/gca-history/cleanup` require `Authorization: Bearer <HISTORY_SECRET>`, a separate secret of at least 32 characters; `POLL_SECRET` does not grant access. Without it these endpoints return 503. History is private member data; keep this token off monitors and the Mac helper.
+`GET /gca-history` and `/gca-history/cleanup` require `Authorization: Bearer <HISTORY_SECRET>`, a separate secret of at least 32 characters; `POLL_SECRET` does not grant access. Without it, or when it equals `POLL_SECRET`, these endpoints return 503. History is private member data; keep this token off monitors and the Mac helper.
 
 Preview old staff-copy cleanup with `GET /gca-history/cleanup`. Applying it requires `POST` plus `X-Onfreq-Confirm: delete-old-copies`; it removes at most 500 eligible copies older than 30 days, plus unsent copies addressed to an account other than the current valid `GCA_COPY_USER_ID`, and may cancel pending copies. Nothing runs it automatically: run it periodically and after changing `GCA_COPY_USER_ID`. A 409 means a poll is running. It preserves reminder/occurrence ledgers and does not erase Discord messages or all member data.

@@ -21,9 +21,9 @@ export default defineConfig({
         GCA_POLICY_URL: '',
         IVAO_CLIENT_ID: '',
         IVAO_CLIENT_SECRET: '',
-        POLL_SECRET: 'synthetic-test-secret-for-vitest-only',
-        // Same synthetic value so shared AUTH_HEADERS reach every route; separation is tested explicitly.
-        HISTORY_SECRET: 'synthetic-test-secret-for-vitest-only',
+        // Distinct synthetic values: a HISTORY_SECRET equal to POLL_SECRET disables history routes.
+        POLL_SECRET: 'synthetic-poll-secret-for-vitest-only',
+        HISTORY_SECRET: 'synthetic-history-secret-for-vitest-only',
         FIR_PREFIXES: 'XA,QC,QE,QF,QG,QH',
         FIR_LABELS: '',
         OFFLINE_GRACE_POLLS: '2',
