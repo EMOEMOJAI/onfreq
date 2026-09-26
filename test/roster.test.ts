@@ -136,3 +136,14 @@ it('records when a post may have landed unseen, but not for a definite rejection
   result = await syncRosterMessages(TOKEN, [], [target], new DiscordRateLimits());
   expect(result.postAttempts[0]?.maybePostedFrom).toBeUndefined();
 });
+
+it('logs roster failures by configured channel index, never channel or message IDs', async () => {
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  stubDiscord(() => Response.json({ code: 50013 }, { status: 403 }));
+  await syncRosterMessages(TOKEN, [{ channelId: 'chan', parentMessageId: 'old-parent', page: 0, messageId: 'page-id' }],
+    [], new DiscordRateLimits(), [dropped()], ['other', 'chan']);
+  const logs = error.mock.calls.map((call) => String(call[0]));
+  expect(logs).toContainEqual(expect.stringContaining('"event":"roster_continuation_failed","operation":"delete","channelIndex":1'));
+  expect(logs).toContainEqual(expect.stringContaining('"event":"roster_orphan_sweep_failed","channelIndex":1'));
+  expect(logs.filter((line) => /"chan"|old-parent|page-id/.test(line))).toEqual([]);
+});

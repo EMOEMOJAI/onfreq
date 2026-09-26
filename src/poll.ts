@@ -23,7 +23,7 @@ import {
 import { diffState, newestCardedSession, stripLegacyRoster } from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
 import { gcaMismatch, parseGcaPolicy, sendGcaReminders, type GcaPolicy } from './gca';
-import { syncRosterMessages, type RosterTarget } from './roster';
+import { channelIndex, syncRosterMessages, type RosterTarget } from './roster';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import { countsAgainstBudget } from './types';
 import type {
@@ -39,6 +39,27 @@ function parseGracePolls(raw: string | undefined): number {
 
 /** Extra polls an undeliverable offline update is retried for before it is dropped. */
 const OFFLINE_RETRY_POLLS = 10;
+/** Pending closeouts older than this, or beyond this many (oldest first), are dropped. */
+const OFFLINE_JOB_MAX_AGE_MS = 24 * 3_600_000;
+const MAX_OFFLINE_JOBS = 200;
+const DEFAULT_MENTION_COOLDOWN_MINUTES = 10;
+
+/** The role pinged for new cards, or undefined when unset or not a Discord ID. */
+function parseMentionRole(raw: string | undefined): string | undefined {
+  const text = raw?.trim();
+  if (!text) return undefined;
+  if (/^\d{17,20}$/.test(text)) return text;
+  console.error(JSON.stringify({ event: 'mention_config_invalid', reason: 'role' }));
+  return undefined;
+}
+
+/** Minimum time between role pings in one channel; 0 limits pings to one per channel per poll. */
+function parseMentionCooldownMs(raw: string | undefined): number {
+  const text = raw?.trim();
+  const valid = !!text && /^\d{1,4}$/.test(text);
+  if (text && !valid) console.error(JSON.stringify({ event: 'mention_config_invalid', reason: 'cooldown' }));
+  return Math.min(valid ? Number(text) : DEFAULT_MENTION_COOLDOWN_MINUTES, 1440) * 60_000;
+}
 
 function highlightMismatch(atc: OnlineAtc, policy: GcaPolicy | null): boolean {
   if (!policy) return false;
@@ -47,8 +68,8 @@ function highlightMismatch(atc: OnlineAtc, policy: GcaPolicy | null): boolean {
   return Boolean(onlineCountry && memberCountry && onlineCountry !== memberCountry && gcaMismatch(atc, policy));
 }
 
-function logFailure(event: string, callsign: string, channelId: string, err: unknown): void {
-  console.error(JSON.stringify({ event, callsign, channelId, error: String(err) }));
+function logFailure(event: string, callsign: string, channelIds: string[], channelId: string, err: unknown): void {
+  console.error(JSON.stringify({ event, callsign, channelIndex: channelIndex(channelIds, channelId), error: String(err) }));
 }
 
 /**
@@ -64,9 +85,16 @@ function onlineNonce(atc: TrackedAtc, channelId: string): string {
 interface PollContext {
   env: Env;
   labels: FirLabel[];
-  gcaPolicy: GcaPolicy | null;
+  /** Drives the public mismatch marker: null unless reminders are enabled with a valid policy. */
+  highlightPolicy: GcaPolicy | null;
   limits: DiscordRateLimits;
   nowIso: string;
+  /** Configured destinations; logs name a channel only by its index here. */
+  channelIds: string[];
+  mentionRoleId: string | undefined;
+  /** Last role ping per channel (epoch ms) still within its cooldown; updated in place. */
+  rolePings: Record<string, number>;
+  mentionCooldownMs: number;
 }
 
 /**
@@ -83,8 +111,8 @@ async function announceOnline(
   holderChannels: Set<string>,
   retry: boolean,
 ): Promise<{ posted: PostedMessage[]; failed: Map<string, unknown>; unconfirmed: Set<string> }> {
-  const { env, labels, gcaPolicy, limits, nowIso } = ctx;
-  const mismatch = highlightMismatch(atc, gcaPolicy);
+  const { env, labels, highlightPolicy, limits, nowIso, channelIds: configured, mentionRoleId, rolePings } = ctx;
+  const mismatch = highlightMismatch(atc, highlightPolicy);
   const plain = buildOnlineEmbed(atc, current, labels, mismatch);
   // The expected roster holder posts its first roster page directly, matching
   // what syncOnlineCards renders, so the new card needs no follow-up edit.
@@ -98,11 +126,17 @@ async function announceOnline(
   const unconfirmed = new Set<string>();
   for (const channelId of channelIds) {
     // At most one role ping per channel per poll, however many controllers
-    // connected at once.
+    // connected at once, and none again within the channel's cooldown, so
+    // reconnecting cannot spam the role.
     const content =
-      env.MENTION_ROLE_ID && !mentionedChannels.has(channelId)
-        ? `<@&${env.MENTION_ROLE_ID}>`
+      mentionRoleId && !mentionedChannels.has(channelId) && rolePings[channelId] === undefined
+        ? `<@&${mentionRoleId}>`
         : undefined;
+    const recordPing = () => {
+      if (!content) return;
+      mentionedChannels.add(channelId);
+      if (ctx.mentionCooldownMs > 0) rolePings[channelId] = Date.parse(nowIso);
+    };
     const embed = holderChannels.has(channelId) ? holder : plain;
     try {
       // A POST whose 5xx hid a success is re-sent next poll; its nonce lets
@@ -112,17 +146,21 @@ async function announceOnline(
       // On a retry the nonce may have returned the earlier, possibly older
       // message: leave its content unknown so the next reconcile edits it.
       posted.push({ channelId, messageId, postedAt: nowIso, ...(retry ? {} : { onlineEmbed: JSON.stringify(embed) }) });
-      if (content) mentionedChannels.add(channelId);
+      recordPing();
     } catch (err) {
       // A 2xx without a usable message id: never retried (it could only
       // duplicate the card); recorded as uncertain below so the session's
       // end finds the card and closes it.
       if (err instanceof DiscordUnconfirmedPostError) {
-        console.error(JSON.stringify({ event: 'online_post_unconfirmed', callsign: atc.callsign, channelId }));
+        console.error(JSON.stringify({
+          event: 'online_post_unconfirmed', callsign: atc.callsign, channelIndex: channelIndex(configured, channelId),
+        }));
+        // Discord accepted the message, ping included.
+        recordPing();
         unconfirmed.add(channelId);
         continue;
       }
-      logFailure('online_post_failed', atc.callsign, channelId, err);
+      logFailure('online_post_failed', atc.callsign, configured, channelId, err);
       failed.set(channelId, err);
     }
   }
@@ -133,7 +171,7 @@ async function announceOnline(
 async function syncOnlineCards(
   ctx: PollContext, next: StateMap, current: OnlineAtc[],
 ): Promise<{ targets: RosterTarget[]; failed: boolean }> {
-  const { env, labels, gcaPolicy, limits } = ctx;
+  const { env, labels, highlightPolicy, limits, channelIds } = ctx;
   const coverage = current.map((atc) => next[atc.callsign] ?? atc);
   let targets: RosterTarget[];
   let failed = false;
@@ -152,10 +190,12 @@ async function syncOnlineCards(
       // Sessions still awaiting a frequency have no card to reconcile.
       if (session.pending) continue;
       for (const ref of [...(session.messages ?? [])]) {
+        // A channel removed from DISCORD_CHANNEL_IDS is never written to again.
+        if (!channelIds.includes(ref.channelId)) continue;
         const isHolder = callsign === holders.get(ref.channelId);
         const others = isHolder ? coverage.filter((atc) => atc.callsign !== callsign) : [];
         const [embed, ...continuations] = buildOnlineEmbeds(
-          session, others, coverage, labels, highlightMismatch(session, gcaPolicy),
+          session, others, coverage, labels, highlightMismatch(session, highlightPolicy),
         );
         const rendered = JSON.stringify(embed);
         let updated = ref.onlineEmbed === rendered;
@@ -165,7 +205,7 @@ async function syncOnlineCards(
             ref.onlineEmbed = rendered;
             updated = true;
           } catch (err) {
-            logFailure('roster_edit_failed', callsign, ref.channelId, err);
+            logFailure('roster_edit_failed', callsign, channelIds, ref.channelId, err);
             if (err instanceof DiscordApiError && err.isGone) {
               session.messages = session.messages?.filter((message) => message !== ref);
               // Every card for this session is now gone (deleted channel/message).
@@ -195,7 +235,9 @@ async function syncOnlineCards(
 /** Close only unresolved destinations; successful deliveries are never repeated. */
 async function announceOffline(
   env: Env, job: PendingOffline, labels: FirLabel[], limits: DiscordRateLimits, trackedIds: Set<string>,
+  channelIds: string[],
 ): Promise<{ delivered: number; failed: boolean }> {
+  const index = (channelId: string) => channelIndex(channelIds, channelId);
   const endedEmbed = buildSessionEndedEmbed(job.event, labels);
   const fallbackEmbed = buildOfflineEmbed(job.event, labels);
   const remaining: PostedMessage[] = [];
@@ -211,7 +253,7 @@ async function announceOffline(
     if (err instanceof DiscordUnconfirmedPostError) {
       // Discord accepted the fallback without returning its id: it was
       // delivered, and posting again could only duplicate it.
-      console.error(JSON.stringify({ event: 'offline_post_unconfirmed', callsign: job.event.callsign, channelId }));
+      console.error(JSON.stringify({ event: 'offline_post_unconfirmed', callsign: job.event.callsign, channelIndex: index(channelId) }));
       delivered++;
       delete attempts[channelId];
       return false;
@@ -224,7 +266,7 @@ async function announceOffline(
       return true;
     }
     delete attempts[channelId];
-    console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign, channelId }));
+    console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign, channelIndex: index(channelId) }));
     return false;
   };
   // Keyed on the tracked session (callsign and stable `since`), not the
@@ -254,7 +296,7 @@ async function announceOffline(
         // card falls back to the re-post below; one with a tracked card has
         // nothing more to try.
         if (!countsAgainstBudget(err)) throw err;
-        logFailure('offline_recover_lookup_failed', job.event.callsign, channelId, err);
+        logFailure('offline_recover_lookup_failed', job.event.callsign, channelIds, channelId, err);
       }
       if (!found.length && window.closeOnly) {
         // No stray copy of a tracked card could be found: nothing is left to
@@ -270,11 +312,13 @@ async function announceOffline(
     } catch (err) {
       if (err instanceof DiscordUnconfirmedPostError) {
         // The card exists but still cannot be edited: announce the end instead.
-        console.error(JSON.stringify({ event: 'offline_recover_unconfirmed', callsign: job.event.callsign, channelId }));
+        console.error(JSON.stringify({
+          event: 'offline_recover_unconfirmed', callsign: job.event.callsign, channelIndex: index(channelId),
+        }));
         if (!job.channelIds.includes(channelId)) job.channelIds.push(channelId);
         continue;
       }
-      logFailure('offline_recover_failed', job.event.callsign, channelId, err);
+      logFailure('offline_recover_failed', job.event.callsign, channelIds, channelId, err);
       if (keepForRetry(channelId, err)) recovering[channelId] = window;
     }
   }
@@ -287,7 +331,7 @@ async function announceOffline(
       delete attempts[ref.channelId];
       continue;
     } catch (err) {
-      logFailure('offline_edit_failed', job.event.callsign, ref.channelId, err);
+      logFailure('offline_edit_failed', job.event.callsign, channelIds, ref.channelId, err);
       if (!(err instanceof DiscordApiError && err.isGone)) {
         if (keepForRetry(ref.channelId, err)) remaining.push(ref);
         continue;
@@ -299,7 +343,9 @@ async function announceOffline(
       delivered++;
       delete attempts[ref.channelId];
     } catch (err) {
-      if (!(err instanceof DiscordUnconfirmedPostError)) logFailure('offline_post_failed', job.event.callsign, ref.channelId, err);
+      if (!(err instanceof DiscordUnconfirmedPostError)) {
+        logFailure('offline_post_failed', job.event.callsign, channelIds, ref.channelId, err);
+      }
       if (keepForRetry(ref.channelId, err)) remaining.push(ref);
     }
   }
@@ -312,7 +358,9 @@ async function announceOffline(
       delivered++;
       delete attempts[channelId];
     } catch (err) {
-      if (!(err instanceof DiscordUnconfirmedPostError)) logFailure('offline_post_failed', job.event.callsign, channelId, err);
+      if (!(err instanceof DiscordUnconfirmedPostError)) {
+        logFailure('offline_post_failed', job.event.callsign, channelIds, channelId, err);
+      }
       if (keepForRetry(channelId, err)) remainingChannels.push(channelId);
     }
   }
@@ -328,6 +376,8 @@ export interface PollOutcome {
   /** Budget for continuation pages that have never once posted successfully. */
   rosterPostAttempts: RosterPostAttempt[];
   pendingOffline: PendingOffline[];
+  /** Last role ping per channel (epoch ms), kept while its cooldown runs. */
+  rolePings: Record<string, number>;
   error?: string;
 }
 
@@ -336,6 +386,7 @@ export interface RunPollOptions {
   previousRosterMessages?: RosterMessage[];
   previousRosterPostAttempts?: RosterPostAttempt[];
   previousPendingOffline?: PendingOffline[];
+  previousRolePings?: Record<string, number>;
 }
 
 /** Called only by the coordinator; all network and notification work is one poll. */
@@ -344,6 +395,7 @@ export async function runPoll(
 ): Promise<PollOutcome> {
   const {
     storage, previousRosterMessages = [], previousRosterPostAttempts = [], previousPendingOffline = [],
+    previousRolePings = {},
   } = options;
   const channelIds = [...new Set(parseChannelIds(env.DISCORD_CHANNEL_IDS))];
   if (!channelIds.length || !env.DISCORD_BOT_TOKEN?.trim()) {
@@ -427,7 +479,7 @@ export async function runPoll(
     for (const session of Object.values(next)) session.pendingChannelIds ??= [];
     return {
       state: next, rosterMessages: previousRosterMessages, rosterPostAttempts: previousRosterPostAttempts,
-      pendingOffline: previousPendingOffline,
+      pendingOffline: previousPendingOffline, rolePings: previousRolePings,
     };
   }
 
@@ -442,9 +494,25 @@ export async function runPoll(
   // same poll are never shown online before their predecessor's closeout.
   // A retried job created while a channel was still configured must not keep
   // targeting it after that channel is removed from DISCORD_CHANNEL_IDS.
-  const jobs: PendingOffline[] = structuredClone(previousPendingOffline)
+  const nowMs = Date.parse(nowIso);
+  // A job whose end time cannot be read is treated as current, never expired.
+  const endedMs = (job: PendingOffline) => {
+    const ended = Date.parse(job.event.endedAt);
+    return Number.isFinite(ended) ? ended : nowMs;
+  };
+  // A long outage must not grow the snapshot without bound: a closeout still
+  // undelivered after a day is given up on.
+  const unexpired = previousPendingOffline.filter((job) => nowMs - endedMs(job) <= OFFLINE_JOB_MAX_AGE_MS);
+  if (unexpired.length < previousPendingOffline.length) {
+    console.error(JSON.stringify({
+      event: 'offline_jobs_dropped', reason: 'expired', count: previousPendingOffline.length - unexpired.length,
+    }));
+  }
+  const jobs: PendingOffline[] = structuredClone(unexpired)
     .map((job) => {
-      const messages = job.messages.filter((ref) => channelIds.includes(ref.channelId));
+      // Card content and post times are never needed to close a card.
+      const messages = job.messages.filter((ref) => channelIds.includes(ref.channelId))
+        .map(({ channelId, messageId }) => ({ channelId, messageId }));
       const jobChannelIds = job.channelIds.filter((id) => channelIds.includes(id));
       const recoverPosts = Object.fromEntries(Object.entries(job.recoverPosts ?? {})
         .filter(([id]) => channelIds.includes(id)));
@@ -486,24 +554,46 @@ export async function runPoll(
       .map(([id, window]): [string, PostWindow] => messages.some((ref) => ref.channelId === id)
         ? [id, { ...window, closeOnly: true }] : [id, window]));
     jobs.push({
-      event, messages, channelIds: messages.length || pendingIds ? [] : [...channelIds],
+      event,
+      // Only configured channels are written to, and card content and post
+      // times are never needed to close a card; the fallback decision below
+      // still sees every card the session had.
+      messages: messages.filter((ref) => channelIds.includes(ref.channelId))
+        .map(({ channelId, messageId }) => ({ channelId, messageId })),
+      channelIds: messages.length || pendingIds ? [] : [...channelIds],
       ...(Object.keys(recoverPosts).length ? { recoverPosts } : {}),
     });
   }
-  const pendingOffline: PendingOffline[] = [];
+  let pendingOffline: PendingOffline[] = [];
   const trackedIds = new Set([
     ...Object.values(next).flatMap((session) => (session.messages ?? []).map((ref) => ref.messageId)),
     ...jobs.flatMap((job) => job.messages.map((ref) => ref.messageId)),
   ]);
   for (const job of jobs) {
     attempted += job.messages.length + job.channelIds.length + Object.keys(job.recoverPosts ?? {}).length;
-    const result = await announceOffline(env, job, labels, limits, trackedIds);
+    const result = await announceOffline(env, job, labels, limits, trackedIds, channelIds);
     delivered += result.delivered;
     deliveryFailed ||= result.failed;
     if (job.messages.length || job.channelIds.length || Object.keys(job.recoverPosts ?? {}).length) pendingOffline.push(job);
   }
+  if (pendingOffline.length > MAX_OFFLINE_JOBS) {
+    const dropped = new Set([...pendingOffline].sort((x, y) => endedMs(x) - endedMs(y))
+      .slice(0, pendingOffline.length - MAX_OFFLINE_JOBS));
+    pendingOffline = pendingOffline.filter((job) => !dropped.has(job));
+    console.error(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'limit', count: dropped.size }));
+  }
 
-  const ctx: PollContext = { env, labels, gcaPolicy, limits, nowIso };
+  const mentionCooldownMs = parseMentionCooldownMs(env.MENTION_COOLDOWN_MINUTES);
+  // Keep only configured channels still within their cooldown.
+  const rolePings = Object.fromEntries(Object.entries(previousRolePings).filter(([id, at]) =>
+    channelIds.includes(id) && typeof at === 'number' && nowMs - at < mentionCooldownMs));
+  const ctx: PollContext = {
+    env, labels, limits, nowIso, channelIds, rolePings, mentionCooldownMs,
+    mentionRoleId: parseMentionRole(env.MENTION_ROLE_ID),
+    // The public marker reveals private approval records: shown only while
+    // reminders themselves are enabled with a valid policy.
+    highlightPolicy: env.GCA_DM_ENABLED === 'true' ? gcaPolicy : null,
+  };
   for (const atc of wentOnline) next[atc.callsign]!.pendingChannelIds = channelIds;
   const announcements = Object.values(next)
     .filter((entry) => !entry.pending && entry.missed === 0 && entry.pendingChannelIds)
@@ -565,7 +655,9 @@ export async function runPoll(
         attempts[id] = used;
         kept.push(id);
       } else {
-        console.error(JSON.stringify({ event: 'online_post_abandoned', callsign: entry.callsign, channelId: id }));
+        console.error(JSON.stringify({
+          event: 'online_post_abandoned', callsign: entry.callsign, channelIndex: channelIndex(channelIds, id),
+        }));
       }
     }
     if (Object.keys(attempts).length) entry.onlineAttemptsByChannel = attempts;
@@ -581,11 +673,17 @@ export async function runPoll(
   }
 
   const cards = await syncOnlineCards(ctx, next, current);
+  // Pages and markers in a channel removed from DISCORD_CHANNEL_IDS are kept
+  // untouched (never edited, deleted or swept) in case it is configured again.
+  const configured = (ref: { channelId: string }) => channelIds.includes(ref.channelId);
   const roster = await syncRosterMessages(
-    env.DISCORD_BOT_TOKEN, previousRosterMessages, cards.targets, limits, previousRosterPostAttempts,
+    env.DISCORD_BOT_TOKEN, previousRosterMessages.filter(configured), cards.targets, limits,
+    previousRosterPostAttempts.filter(configured), channelIds,
   );
-  const rosterMessages = roster.messages;
-  const rosterPostAttempts = roster.postAttempts;
+  const rosterMessages = [...roster.messages, ...previousRosterMessages.filter((ref) => !configured(ref))];
+  const rosterPostAttempts = [
+    ...roster.postAttempts, ...previousRosterPostAttempts.filter((entry) => !configured(entry)),
+  ];
   const rosterFailed = cards.failed || roster.failed;
 
   if (attempted > 0) {
@@ -608,6 +706,7 @@ export async function runPoll(
     rosterMessages,
     rosterPostAttempts,
     pendingOffline,
+    rolePings,
     ...(deliveryFailed && delivered > 0 ? { error: 'some Discord notifications failed' } :
       attempted > 0 && delivered === 0 ? { error: 'all Discord notifications failed' } :
       rosterFailed ? { error: 'some Discord roster updates failed' } : {}),

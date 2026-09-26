@@ -1,11 +1,13 @@
 /** Optional features never require credentials during first-run setup. */
 type OptionalSecrets = {
   MENTION_ROLE_ID?: string;
+  MENTION_COOLDOWN_MINUTES?: string;
   FIR_LABELS?: string;
   EXCLUDED_CALLSIGNS?: string;
   GCA_DM_ENABLED?: string;
   GCA_DISCORD_GUILD_ID?: string;
   GCA_MEMBER_ROLE_ID?: string;
+  GCA_VERIFIED_ROLE_ID?: string;
   GCA_COPY_USER_ID?: string;
   GCA_REGIONS?: string;
   GCA_APPROVALS?: string;

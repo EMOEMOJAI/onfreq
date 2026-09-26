@@ -54,17 +54,18 @@ The public `npm run deploy` command uses `wrangler.jsonc`. It stops if a private
 | Setting | Purpose |
 | --- | --- |
 | `FIR_LABELS`, `EXCLUDED_CALLSIGNS` | Optional private roster labels and excluded positions |
-| `MENTION_ROLE_ID` | Optional online-notification ping |
+| `MENTION_ROLE_ID`, `MENTION_COOLDOWN_MINUTES` | Optional role ID pinged for new cards, at most once per channel per cooldown (default 10 minutes; `0` means once per poll) |
 | `IVAO_CLIENT_ID`, `IVAO_CLIENT_SECRET` | IVAO API authentication and member-country lookups |
 | `GCA_DM_ENABLED` | Enables optional reminders when set to `true` |
 | `GCA_DISCORD_GUILD_ID`, `GCA_MEMBER_ROLE_ID` | Limits reminders to eligible members; enable Discord **Server Members Intent** |
+| `GCA_VERIFIED_ROLE_ID` | Recommended staff-only role a member must also hold before their nickname VID is trusted |
 | `GCA_REGIONS` | Private region names, callsign prefixes and home-country groups |
 | `GCA_APPROVALS`, `GCA_HOME_OVERRIDES` | Operator-maintained approvals and home-region corrections |
 | `GCA_COPY_USER_ID`, `GCA_POLICY_URL` | Optional staff copies and policy link |
 
-GCA coverage is private configuration, with no built-in region list. Set `GCA_REGIONS` before upgrading an existing reminder deployment. Malformed or absent coverage or approval records disable reminders; `{}` explicitly means no approvals. These records are not an authoritative registry. A first enabled poll baselines existing connections. Possible DM deliveries are not repeated, so ambiguous failures can mean a missed reminder. See [data retention](../SECURITY.md#data-retention) before enabling this feature.
+GCA coverage is private configuration, with no built-in region list. Set `GCA_REGIONS` before upgrading an existing reminder deployment. Malformed or absent coverage or approval records, or a set but invalid `GCA_POLICY_URL` or `GCA_VERIFIED_ROLE_ID`, disable reminders; `{}` explicitly means no approvals. These records are not an authoritative registry. Public cards show the red country-mismatch marker, which reveals these private records, only while `GCA_DM_ENABLED` is `true` and this policy is valid. A first enabled poll baselines existing connections. Possible DM deliveries are not repeated, so ambiguous failures can mean a missed reminder. See [data retention](../SECURITY.md#data-retention) before enabling this feature.
 
-**Recipient setup:** staff must verify each member's VID and assign the member role. The server nickname must contain exactly one six-digit VID, for example `Example (600001)`, with no other numbers. Duplicate VIDs anywhere in the server are skipped; restrict nickname changes to keep this mapping trustworthy. Supply a known home country through IVAO API credentials or `GCA_HOME_OVERRIDES`; unknown codes such as `ZZ` are invalid. Test a new connection after setup: existing connections are baselined, and fixing an unmapped nickname does not retry that same connection.
+**Recipient setup:** staff must verify each member's VID and assign the member role. The server nickname must contain exactly one VID (5–10 digits, no leading zero), for example `Example (600001)`, with no other numbers. Duplicate VIDs anywhere in the server are skipped. Members can edit their own nicknames, so set `GCA_VERIFIED_ROLE_ID` to a role only staff assign after verification, and restrict nickname changes. Supply a known home country through IVAO API credentials or `GCA_HOME_OVERRIDES`; unknown codes such as `ZZ` are invalid. Test a new connection after setup: existing connections are baselined, and fixing an unmapped nickname does not retry that same connection.
 
 `OFFLINE_GRACE_POLLS` is the only plain Wrangler variable; the default is two missed polls. Public cards retry failed destinations without resetting connection times. Card posts carry a Discord nonce keyed to the session being announced, so a re-send after a crash between Discord acceptance and storage is deduped by Discord within its own nonce window (a few minutes); crashes outside that window can still cause duplicates.
 
@@ -91,4 +92,4 @@ For failures, check `npm run tail`. A 401 means the token is wrong; a 403 from D
 
 `POLL_SECRET` also grants access to `GET /gca-history`. This is private member data; do not give the token to third-party uptime monitors.
 
-Preview old staff-copy cleanup with `GET /gca-history/cleanup`. Applying it requires `POST` plus `X-Onfreq-Confirm: delete-old-copies`; it removes at most 500 eligible copies older than 30 days and may cancel pending copies. A 409 means a poll is running. It preserves reminder/occurrence ledgers and does not erase Discord messages or all member data.
+Preview old staff-copy cleanup with `GET /gca-history/cleanup`. Applying it requires `POST` plus `X-Onfreq-Confirm: delete-old-copies`; it removes at most 500 eligible copies older than 30 days, plus unsent copies addressed to an account other than the current valid `GCA_COPY_USER_ID`, and may cancel pending copies. Nothing runs it automatically: run it periodically and after changing `GCA_COPY_USER_ID`. A 409 means a poll is running. It preserves reminder/occurrence ledgers and does not erase Discord messages or all member data.
