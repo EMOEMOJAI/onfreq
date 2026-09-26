@@ -46,7 +46,7 @@ Public delivery is at least once; retries can occasionally produce duplicate car
 
 Share a small, anonymized example so others can reproduce the problem. Maintainer changes go directly to main after checks; please do not open pull requests.
 
-Working on the code? Start with [AGENTS.md](AGENTS.md) for the source map and checks. AI tools can use the [documentation index](llms.txt); shared instructions also have entry points for Claude, Gemini and GitHub Copilot.
+Working on the code? Start with [AGENTS.md](AGENTS.md) for the source map and checks. [Versioned Git hooks](scripts/hooks/) scan commits with Gitleaks and run privacy and setup checks before pushes; if `git config --get core.hooksPath` is unset, enable them with `git config core.hooksPath scripts/hooks`. AI tools can use the [documentation index](llms.txt); shared instructions also have entry points for Claude, Gemini and GitHub Copilot.
 
 [Security & privacy](SECURITY.md) · [MIT license](LICENSE)
 

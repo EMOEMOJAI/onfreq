@@ -16,9 +16,11 @@
     <key>Label</key>
     <string>com.onfreq.poll</string>
 
+    <!-- POSIX sh, as tested; zsh would source ~/.zshenv (proxy or TLS
+         logging settings) before the token is sent. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/zsh</string>
+        <string>/bin/sh</string>
         <string>__HOME__/.onfreq/poll-trigger.sh</string>
     </array>
 
@@ -34,6 +36,10 @@
     <string>__HOME__/Library/Logs/onfreq-poll.err.log</string>
     <key>StandardErrorPath</key>
     <string>__HOME__/Library/Logs/onfreq-poll.err.log</string>
+
+    <!-- 63 = octal 077: log files launchd creates are private (0600). -->
+    <key>Umask</key>
+    <integer>63</integer>
 
     <key>ProcessType</key>
     <string>Background</string>

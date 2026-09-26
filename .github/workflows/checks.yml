@@ -49,7 +49,7 @@ jobs:
         run: gitleaks git . --log-opts=HEAD --redact --no-banner
 
       - name: Check POSIX shell scripts
-        run: shellcheck scripts/poll-trigger.sh scripts/pre-commit
+        run: shellcheck scripts/poll-trigger.sh scripts/pre-commit scripts/hooks/pre-commit scripts/hooks/pre-push
 
       - name: Check GitHub Actions workflows
         run: actionlint
@@ -70,8 +70,10 @@ jobs:
       - name: Validate launchd plists and shell syntax
         run: |
           plutil -lint scripts/com.onfreq.poll.plist
-          zsh -n scripts/poll-trigger.sh
+          sh -n scripts/poll-trigger.sh
           sh -n scripts/pre-commit
+          sh -n scripts/hooks/pre-commit
+          sh -n scripts/hooks/pre-push
 
       # The test harness uses temporary files and mocked curl.
       # It never installs agents or calls production.

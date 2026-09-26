@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, chmodSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, chmodSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -8,8 +8,8 @@ import { spawnSync } from 'node:child_process';
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), 'onfreq-poll-test-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  writeFileSync(join(dir, 'poll-endpoint'), 'https://example.test/poll');
-  writeFileSync(join(dir, 'poll-secret'), 'synthetic-poll-token');
+  writeFileSync(join(dir, 'poll-endpoint'), 'https://example.test/poll', { mode: 0o600 });
+  writeFileSync(join(dir, 'poll-secret'), 'synthetic-poll-token', { mode: 0o600 });
   writeFileSync(join(dir, '.curlrc'), 'verbose\n');
   writeFileSync(join(dir, 'curl'), `#!/bin/sh
 printf '%s\\n' "$@" > "$ONFREQ_POLL_DIR/arguments"
@@ -92,4 +92,32 @@ test('restricts existing logs and keeps rotated logs private and bounded', (t) =
   assert.equal(f.read('poll.log').trim().split('\n').length, 500);
   assert.equal(statSync(log).mode & 0o777, 0o600);
   assert.equal(existsSync(join(f.dir, 'poll.log.tmp')), false);
+});
+
+test('refuses to read credentials that other local accounts can access, without contacting curl', (t) => {
+  const f = fixture(t);
+  const cases = [['poll-secret', 0o644], ['poll-secret', 0o640], ['poll-secret', 0o604],
+    ['poll-endpoint', 0o644], ['poll-endpoint', 0o620], ['.', 0o750], ['.', 0o701], ['.', 0o755]];
+  for (const [name, mode] of cases) {
+    chmodSync(join(f.dir, name), mode);
+    const result = f.run();
+    chmodSync(join(f.dir, name), name === '.' ? 0o700 : 0o600);
+    assert.equal(result.status, 1, `${name} ${mode.toString(8)}`);
+    assert.equal(existsSync(join(f.dir, 'arguments')), false);
+  }
+  // A symlink could point at a readable file elsewhere, whatever its own mode.
+  const target = join(f.dir, 'elsewhere');
+  writeFileSync(target, 'synthetic-poll-token', { mode: 0o644 });
+  unlinkSync(join(f.dir, 'poll-secret'));
+  symlinkSync(target, join(f.dir, 'poll-secret'));
+  assert.equal(f.run().status, 1);
+  assert.equal(existsSync(join(f.dir, 'arguments')), false);
+  const lines = f.read('poll.log').trim().split('\n');
+  assert.equal(lines.length, cases.length + 1);
+  assert.ok(lines.every((line) => / FAIL permissions$/.test(line)));
+  assert.doesNotMatch(lines.join('\n'), /synthetic-poll-token|example.test/);
+  // Restoring private modes allows polling again.
+  unlinkSync(join(f.dir, 'poll-secret'));
+  writeFileSync(join(f.dir, 'poll-secret'), 'synthetic-poll-token', { mode: 0o600 });
+  assert.equal(f.run().status, 0);
 });

@@ -17,6 +17,26 @@ log() {
   fi
 }
 
+# Other local accounts must not read the token or replace the endpoint. Accept
+# only a real directory/regular file with no group or other permission bits
+# (symlinks are refused). `ls -ld` is portable across BSD and GNU; its first ten
+# characters are the type and mode, whatever flags (@, +) follow.
+private_path() {
+  mode=$(ls -ld -- "$2" 2>/dev/null) || return 1
+  case "$mode" in "$1"???------*) return 0 ;; *) return 1 ;; esac
+}
+private=true
+if [ -e "$poll_dir" ] || [ -L "$poll_dir" ]; then
+  private_path d "$poll_dir" || private=false
+fi
+for file in "$poll_dir/poll-secret" "$poll_dir/poll-endpoint"; do
+  if [ -e "$file" ] || [ -L "$file" ]; then private_path - "$file" || private=false; fi
+done
+if [ "$private" != true ]; then
+  log 'FAIL permissions'
+  exit 1
+fi
+
 endpoint=${POLL_ENDPOINT:-$(cat "$poll_dir/poll-endpoint" 2>/dev/null || true)}
 secret=$(cat "$poll_dir/poll-secret" 2>/dev/null || true)
 

@@ -5,7 +5,17 @@ export function privatePath(file) {
   return /(^|\/)(?:\.local|\.wrangler|node_modules)(\/|$)/.test(file) ||
     /^(?:\.env|\.dev\.vars)(?:\..*)?$/.test(name) && !['.env.example', '.dev.vars.example'].includes(name) ||
     /(?:\.local\.(?:sh|jsonc?|md)|\.(?:pem|key|p12|pfx|log)|-secret(?:\.txt)?)$/i.test(name) ||
-    /^(?:secrets\.json|poll-secret|poll-endpoint|settings\.local\.json|gitleaks-report\..*)$/.test(name);
+    /^(?:secrets\.json|poll-secret|poll-endpoint|settings\.local\.json|gitleaks-report\..*)$/.test(name) ||
+    /^(?:wrangler\.local\..*|\.npmrc)$/.test(name);
+}
+
+/** Validate every tracked Wrangler config without printing its values; TOML cannot be checked. */
+export function wranglerConfigErrors(file, data) {
+  if (!/(^|\/)wrangler[^/]*\.(?:jsonc?|toml)$/.test(file)) return [];
+  if (file.endsWith('.toml')) return [`${file}: Wrangler TOML configuration is not allowed; use wrangler.jsonc`];
+  let config;
+  try { config = jsonc(data.toString()); } catch { return [`${file}: invalid Wrangler configuration`]; }
+  return publicConfig(config).map((error) => `${file}: ${error}`);
 }
 
 export function publicConfig(config) {
@@ -106,9 +116,7 @@ export function checkPrivacy() {
       const error = imagePrivacy(file, data);
       if (error) errors.push(`${file}: ${error}`);
     }
-    if (/^wrangler.*\.jsonc?$/.test(file)) {
-      errors.push(...publicConfig(jsonc(data.toString())).map((error) => `${file}: ${error}`));
-    }
+    errors.push(...wranglerConfigErrors(file, data));
   }
   if (git('rev-parse', '--is-shallow-repository').toString().trim() === 'true') {
     errors.push('Full reachable history is required; fetch with depth 0');
