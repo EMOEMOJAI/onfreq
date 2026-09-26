@@ -170,9 +170,10 @@ export interface TrackedAtc extends OnlineAtc {
   /**
    * Channels whose first-card POST may have landed without the bot learning
    * its id (a 5xx, a timeout, or a 2xx without an id) and that have no
-   * tracked card yet. At close the card is recovered and closed out.
+   * tracked card yet, with when those attempts happened. At close the card is
+   * looked up in that window and closed out.
    */
-  uncertainChannelIds?: string[];
+  uncertainPosts?: Record<string, PostWindow>;
   /**
    * Connected, but the feed has not published a frequency yet (0.000 MHz).
    * Tracked so the start time is right, but not announced and never given
@@ -197,16 +198,23 @@ export interface OfflineEvent extends TrackedAtc {
 }
 
 /** Ended sessions retry independently of any replacement at the same callsign. */
+/** Epoch ms of the first and latest attempts in a series of uncertain posts. */
+export interface PostWindow {
+  from: number;
+  to: number;
+}
+
 export interface PendingOffline {
   event: OfflineEvent;
   messages: PostedMessage[];
   channelIds: string[];
   /**
-   * Channels whose first ONLINE card may exist unseen. The card is re-posted
-   * with its original nonce, so Discord returns the hidden one, and then
-   * closed like any other card.
+   * Channels whose first ONLINE card may exist unseen. The card is looked up
+   * among the bot's messages from that window and closed; if none is found it
+   * is re-posted with its original nonce, which returns the hidden card only
+   * within Discord's nonce window (a few minutes), and closed.
    */
-  recoverChannelIds?: string[];
+  recoverPosts?: Record<string, PostWindow>;
   /** Legacy shared counter, imported when a destination next needs retrying. */
   attempts?: number;
   /** Failed delivery polls per destination; cooldown waits do not count. */

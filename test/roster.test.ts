@@ -109,8 +109,22 @@ it.each([
   { status: 403, kept: false },
 ])('keeps sweeping after a transient failure but gives up on a 4xx (%j)', async ({ status, kept }) => {
   stubDiscord(() => Response.json({ code: 0 }, { status }));
-  const result = await syncRosterMessages(TOKEN, [], [], new DiscordRateLimits(), [dropped()]);
-  expect(result.postAttempts).toEqual(kept ? [dropped()] : []);
+  const result = await syncRosterMessages(TOKEN, [], [], new DiscordRateLimits(), [dropped({ abandoned: true })]);
+  // Only the time window is kept, so a returning parent posts the page fresh.
+  expect(result.postAttempts).toEqual(kept ? [dropped({ nonceKey: undefined })].map(({ nonceKey: _n, ...rest }) => rest) : []);
+});
+
+it('keeps a sweep-only marker when a page posts after an uncertain attempt', async () => {
+  const target = { channelId: 'chan', parentMessageId: 'parent', embeds: [{ title: 'Synthetic page 0' }] };
+  stubDiscord(() => Response.json({ id: idAt(NOW) }));
+  const result = await syncRosterMessages(TOKEN, [], [target], new DiscordRateLimits(), [
+    dropped({ parentMessageId: 'parent' }),
+  ]);
+  expect(result.messages.map((ref) => ref.messageId)).toEqual([idAt(NOW)]);
+  expect(result.postAttempts).toEqual([{
+    channelId: 'chan', parentMessageId: 'parent', page: 0, attempts: 0,
+    maybePostedFrom: WINDOW.from, maybePostedTo: WINDOW.to,
+  }]);
 });
 
 it('records when a post may have landed unseen, but not for a definite rejection', async () => {

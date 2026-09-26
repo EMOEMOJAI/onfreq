@@ -61,7 +61,7 @@ export function diffState(
     // fields has neither, and is treated as already announced.
     // A channel where a first card may have landed unseen still gets closed.
     if (tracked.pending || (tracked.pendingChannelIds && !tracked.messages?.length &&
-      !tracked.uncertainChannelIds?.length)) return;
+      !Object.keys(tracked.uncertainPosts ?? {}).length)) return;
     const durationSeconds = Math.max(0, Math.round(
       (Date.parse(endedAt) - Date.parse(tracked.since)) / 1000,
     ));

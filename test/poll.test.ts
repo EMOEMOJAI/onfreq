@@ -1046,6 +1046,42 @@ describe('polling through the Durable Object', () => {
     },
   );
 
+  it('finds and closes an unseen first card from its post window instead of re-posting it', async () => {
+    const botId = '100000000000000009';
+    const hiddenId = ((BigInt(START - 1_420_070_400_000) << 22n) + 1n).toString();
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if ((init?.method ?? 'GET') === 'GET' && url.includes('/channels/test-channel/messages?after=')) {
+        return Response.json([{ id: hiddenId, author: { id: botId }, embeds: [{ title: `🟢 ${a} is now ONLINE` }] }]);
+      }
+      if (init?.method === 'PATCH' && url.endsWith(`/messages/${hiddenId}`)) {
+        const embed = (JSON.parse(String(init.body)) as { embeds: DiscordEmbed[] }).embeds[0]!;
+        sent.push({ channelId: 'test-channel', method: 'PATCH', id: hiddenId, embed });
+        return Response.json({ id: hiddenId });
+      }
+      return original(input, init);
+    });
+    const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
+      ...env, DISCORD_BOT_TOKEN: `${btoa(botId)}.synthetic.token`,
+    }).poll().catch(() => undefined));
+    await seed({});
+    feed = [entry(a)];
+    failures.add('POST');
+    failureStatus = 503;
+    await run();
+    failures.clear();
+    feed = [];
+    for (let i = 0; i < 3; i++) {
+      now += 60_000;
+      await run();
+    }
+    expect(sent.filter((message) => message.method === 'PATCH' && message.id === hiddenId).at(-1)?.embed.title)
+      .toContain('is OFFLINE');
+    expect(sent.filter((message) => message.method === 'POST')).toHaveLength(1);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
   it('does not try to recover a first card that Discord definitely rejected', async () => {
     await seed({});
     feed = [entry(a)];

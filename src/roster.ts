@@ -162,7 +162,16 @@ export async function syncRosterMessages(
         // its nonce: leave its content unknown so the next poll edits it.
         messages.push({ channelId: target.channelId, parentMessageId: target.parentMessageId,
           page, messageId, ...(retryKey ? {} : { onlineEmbed: rendered }) });
-        postAttemptsByKey.delete(key);
+        // An earlier attempt may have left a copy outside Discord's nonce
+        // window: keep only its time window, so it is swept once the parent goes.
+        const previous = postAttemptsByKey.get(key);
+        if (previous?.maybePostedFrom === undefined) postAttemptsByKey.delete(key);
+        else {
+          postAttemptsByKey.set(key, {
+            channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: 0,
+            maybePostedFrom: previous.maybePostedFrom, maybePostedTo: previous.maybePostedTo,
+          });
+        }
       } catch (err) {
         if (err instanceof DiscordUnconfirmedPostError) {
           // Discord accepted the page but returned no id to track it by:
@@ -215,7 +224,11 @@ export async function syncRosterMessages(
       }
     } catch (err) {
       console.error(JSON.stringify({ event: 'roster_orphan_sweep_failed', channelId, parentMessageId, error: String(err) }));
-      if (!countsAgainstBudget(err)) postAttempts.push(...entries);
+      // Keep only the time windows: should the parent be shown again, its
+      // pages post fresh rather than stay frozen with stale content.
+      if (!countsAgainstBudget(err)) {
+        postAttempts.push(...entries.map(({ abandoned: _abandoned, nonceKey: _nonceKey, ...rest }) => rest));
+      }
     }
   }
   return { messages, postAttempts, failed };

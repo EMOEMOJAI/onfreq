@@ -499,15 +499,23 @@ function snowflakeTime(id: string): number {
   return Number(BigInt(id) >> 22n) + DISCORD_EPOCH_MS;
 }
 
+/** The fields of a fetched Discord message this bot inspects. */
+export interface FetchedMessage {
+  id: string;
+  author?: { id?: unknown };
+  message_reference?: { message_id?: unknown };
+  embeds?: { title?: string }[];
+}
+
 /**
- * Ids of this bot's replies to a message, so roster pages whose POST
- * succeeded without the bot learning their id can be found and removed.
- * Scans up to 500 messages posted within the given time window (a minute of
- * slack either side). Returns nothing when the bot's own id is unknown.
+ * Ids of this bot's messages matching `match`, among up to 500 messages
+ * posted within the given time window (a minute of slack either side). Used
+ * to find messages whose POST succeeded without the bot learning their id.
+ * Returns nothing when the bot's own id is unknown.
  */
-export async function findBotReplies(
-  botToken: string, channelId: string, parentMessageId: string,
-  window: { from: number; to: number }, limits: DiscordRateLimits,
+export async function findBotMessages(
+  botToken: string, channelId: string, window: { from: number; to: number }, limits: DiscordRateLimits,
+  match: (message: FetchedMessage) => boolean,
 ): Promise<string[]> {
   const botId = botUserId(botToken);
   if (!botId) return [];
@@ -519,15 +527,24 @@ export async function findBotReplies(
     const list = await res.json().catch(() => null) as unknown;
     if (!Array.isArray(list)) throw new Error('Discord returned an invalid message list');
     let newest = after;
-    for (const item of list as { id?: unknown; author?: { id?: unknown }; message_reference?: { message_id?: unknown } }[]) {
+    for (const item of list as Partial<FetchedMessage>[]) {
       if (typeof item?.id !== 'string' || !/^\d+$/.test(item.id)) continue;
       if (BigInt(item.id) > BigInt(newest)) newest = item.id;
-      if (item.author?.id === botId && item.message_reference?.message_id === parentMessageId) found.push(item.id);
+      if (item.author?.id === botId && match(item as FetchedMessage)) found.push(item.id);
     }
     if (list.length < 100 || newest === after || snowflakeTime(newest) > window.to + 60_000) break;
     after = newest;
   }
   return found;
+}
+
+/** Ids of this bot's replies to a message within the given time window. */
+export function findBotReplies(
+  botToken: string, channelId: string, parentMessageId: string,
+  window: { from: number; to: number }, limits: DiscordRateLimits,
+): Promise<string[]> {
+  return findBotMessages(botToken, channelId, window, limits,
+    (message) => message.message_reference?.message_id === parentMessageId);
 }
 
 /** Remove an obsolete roster continuation; already-deleted messages are clean. */
