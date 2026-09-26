@@ -3,10 +3,31 @@ import { fetchBuffered } from './http';
 const KEY = 'discord-rate-limits-v1'; // gitleaks:allow — storage key name, not a credential
 const GLOBAL = '*';
 
+/**
+ * `rate_limit`: a real Discord 429. `soft`: an in-memory cooldown inferred
+ * from a 2xx response's rate-limit headers. `outage`: this route/instance
+ * recently exhausted its 5xx retry budget and is failing fast instead.
+ */
+export type DiscordRateLimitReason = 'rate_limit' | 'soft' | 'outage';
+
+function messageFor(reason: DiscordRateLimitReason): string {
+  switch (reason) {
+    case 'outage': return 'Discord request deferred (outage cooldown)';
+    case 'soft': return 'Discord request deferred (soft cooldown from response headers)';
+    default: return 'Discord API 429: delivery deferred until cooldown expires';
+  }
+}
+
 export class DiscordRateLimitError extends Error {
+  /** Kept for compatibility with callers that only branch on status; use `reason` for diagnostics. */
   readonly status = 429;
-  constructor(readonly retryAt: number, readonly requestMade: boolean, readonly global = false) {
-    super('Discord API 429: delivery deferred until cooldown expires');
+  constructor(
+    readonly retryAt: number,
+    readonly requestMade: boolean,
+    readonly global = false,
+    readonly reason: DiscordRateLimitReason = 'rate_limit',
+  ) {
+    super(messageFor(reason));
     this.name = 'DiscordRateLimitError';
   }
   get retryMs(): number { return Math.max(0, this.retryAt - Date.now()); }
@@ -24,6 +45,8 @@ export class DiscordRateLimits {
   private outageUntil = 0;
   /** In-memory only per-route soft cooldowns inferred from 2xx rate headers. */
   private readonly softDeadlines: Record<string, number> = {};
+  /** Consecutive POST 5xx/timeout failures on this instance since the last success. */
+  private postFailureStreak = 0;
 
   constructor(
     private readonly storage?: DurableObjectStorage,
@@ -45,16 +68,32 @@ export class DiscordRateLimits {
     this.outageUntil = Math.max(this.outageUntil, Date.now() + ms);
   }
 
+  /**
+   * Record a POST failure (5xx or a thrown fetch error) that this request
+   * never retried in-request. Returns true once this is the second such
+   * failure in a row, meaning the caller should now declare an outage.
+   */
+  notePostFailure(): boolean {
+    this.postFailureStreak += 1;
+    return this.postFailureStreak >= 2;
+  }
+
+  /** A successful POST breaks any failure streak. */
+  notePostSuccess(): void {
+    this.postFailureStreak = 0;
+  }
+
   async fetch(path: string, init: RequestInit): Promise<Response> {
     const route = routeKey(path);
-    const blockedUntil = Math.max(
-      this.deadlines[GLOBAL] ?? 0,
-      this.deadlines[route] ?? 0,
-      this.softDeadlines[route] ?? 0,
-      this.outageUntil,
-    );
+    const globalDeadline = this.deadlines[GLOBAL] ?? 0;
+    const routeDeadline = this.deadlines[route] ?? 0;
+    const softDeadline = this.softDeadlines[route] ?? 0;
+    const blockedUntil = Math.max(globalDeadline, routeDeadline, softDeadline, this.outageUntil);
     if (blockedUntil > Date.now()) {
-      throw new DiscordRateLimitError(blockedUntil, false, blockedUntil === this.deadlines[GLOBAL]);
+      const reason: DiscordRateLimitReason =
+        blockedUntil === globalDeadline || blockedUntil === routeDeadline ? 'rate_limit' :
+        blockedUntil === this.outageUntil ? 'outage' : 'soft';
+      throw new DiscordRateLimitError(blockedUntil, false, blockedUntil === globalDeadline, reason);
     }
 
     const response = await fetchBuffered(`https://discord.com/api/v10${path}`, init);

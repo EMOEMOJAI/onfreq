@@ -127,3 +127,31 @@ it('marks route-scoped cooldowns as not global', async () => {
   await expect(request('/channels/a/messages')).rejects.toMatchObject({ requestMade: true, global: false });
   await expect(request('/channels/a/messages')).rejects.toMatchObject({ requestMade: false, global: false });
 });
+
+it.each([
+  { body: { retry_after: 30, global: true }, headers: new Headers() },
+  { body: { retry_after: 30 }, headers: new Headers({ 'x-ratelimit-global': 'true' }) },
+  { body: { retry_after: 30 }, headers: new Headers({ 'x-ratelimit-scope': 'global' }) },
+])('pre-checks a persisted global cooldown from %j right after DiscordRateLimits.load(), before any network call', async ({ body, headers }) => {
+  const network = vi.fn(async () => Response.json(body, { status: 429, headers }));
+  vi.stubGlobal('fetch', network);
+  await expect(request('/channels/a/messages')).rejects.toMatchObject({ global: true });
+  expect(network).toHaveBeenCalledTimes(1);
+
+  // A fresh instance loaded from the same storage must block an unrelated
+  // route immediately, without ever calling fetch.
+  network.mockClear();
+  await runInDurableObject(stub(), async (_, ctx) => {
+    const limits = await DiscordRateLimits.load(ctx.storage);
+    await expect(limits.fetch('/guilds/example/members?after=0', { method: 'GET' }))
+      .rejects.toMatchObject({ requestMade: false, global: true, reason: 'rate_limit' });
+  });
+  expect(network).not.toHaveBeenCalled();
+});
+
+it('reports requestMade: false and reason: outage on a fail-fast request after an outage is marked', async () => {
+  const limits = new DiscordRateLimits();
+  limits.markOutage(30_000);
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+    .rejects.toMatchObject({ requestMade: false, reason: 'outage', global: false });
+});

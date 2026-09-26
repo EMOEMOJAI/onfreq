@@ -37,9 +37,14 @@ export function formatDuration(totalSeconds: number): string {
   return `${totalSeconds}s`;
 }
 
-/** Escape characters Discord treats as markdown, so IVAO-derived text can't break embed formatting. */
-function escapeMarkdown(text: string): string {
-  return text.replace(/([\\*_~`|[\]])/g, '\\$1');
+/**
+ * Escape characters Discord treats as markdown or mentions, so IVAO-derived
+ * text can't break embed formatting or invoke `<@&123>`-style pings. Runs of
+ * CR/LF are collapsed to a single space so injected newlines can't fake extra
+ * embed lines.
+ */
+export function escapeMarkdown(text: string): string {
+  return text.replace(/[\r\n]+/g, ' ').replace(/([\\*_~`|[\]<>])/g, '\\$1');
 }
 
 function stationLine(atc: TrackedAtc): string | undefined {
@@ -98,6 +103,11 @@ const FIR_NAME_WIDTH = 12;
 /** A flag emoji occupies roughly two cells in Discord's monospace block. */
 const FIR_COL_WIDTH = 2 + 1 + FIR_NAME_WIDTH;
 
+/** A backtick inside a roster cell would otherwise prematurely close the code block. */
+function stripBackticks(text: string): string {
+  return text.replace(/`/g, "'");
+}
+
 /**
  * Render the "also online now" roster, grouped by FIR.
  *
@@ -109,10 +119,6 @@ const FIR_COL_WIDTH = 2 + 1 + FIR_NAME_WIDTH;
  * that have not tuned a frequency yet are left out — they are not announced
  * anywhere else either, so listing them here would be inconsistent.
  */
-/** A backtick inside a roster cell would otherwise prematurely close the code block. */
-function stripBackticks(text: string): string {
-  return text.replace(/`/g, "'");
-}
 
 export function formatRoster(others: OnlineAtc[], labels: FirLabel[] = []): string | undefined {
   const usable = others.filter(hasFrequency);
@@ -349,7 +355,10 @@ function sleep(ms: number): Promise<void> {
  *
  * POST is never retried on a 5xx: a successful-but-unacknowledged POST would
  * otherwise be resent, posting a duplicate card and re-pinging a role. The
- * next poll re-delivers instead. PATCH/DELETE are idempotent and keep retrying.
+ * next poll re-delivers instead — duplicates across polls are deduped by
+ * Discord only within its own nonce window (a few minutes), via the optional
+ * `enforce_nonce` payload built from `messageNonce`. PATCH/DELETE are
+ * idempotent and keep retrying.
  */
 async function discordRequest(
   botToken: string,
@@ -367,22 +376,59 @@ async function discordRequest(
       },
       body: JSON.stringify(payload),
     }).catch((err: unknown) => {
-      // A zero-second rejection permits a bounded immediate retry.
-      if (err instanceof DiscordRateLimitError && err.requestMade &&
-          err.retryAt <= Date.now() && attempt < MAX_ATTEMPTS) return null;
+      if (err instanceof DiscordRateLimitError) {
+        // A zero-second rejection permits a bounded immediate retry.
+        if (err.requestMade && err.retryAt <= Date.now() && attempt < MAX_ATTEMPTS) return null;
+        throw err;
+      }
+      // A thrown fetch error (timeout, network failure, TypeError) never
+      // gets an in-request retry — there is no response to retry against.
+      // For POST, only mark an outage after a second consecutive failure so
+      // one blip doesn't defer the rest of the poll; PATCH/DELETE mark
+      // immediately since a thrown error already exhausts their only attempt.
+      if (method !== 'POST' || limits.notePostFailure()) limits.markOutage(OUTAGE_COOLDOWN_MS);
       throw err;
     });
     if (!res) continue;
-    if (res.ok) return res;
+    if (res.ok) {
+      if (method === 'POST') limits.notePostSuccess();
+      return res;
+    }
 
     const body = await res.text();
     const retryable = method !== 'POST' && res.status >= 500;
     if (!retryable || attempt >= MAX_ATTEMPTS) {
-      if (res.status >= 500) limits.markOutage(OUTAGE_COOLDOWN_MS);
+      if (res.status >= 500) {
+        // PATCH/DELETE have exhausted their real retry budget here; POST
+        // never retries in-request, so it instead needs a second consecutive
+        // 5xx/timeout before an outage is declared.
+        if (method !== 'POST' || limits.notePostFailure()) limits.markOutage(OUTAGE_COOLDOWN_MS);
+      }
       throw new DiscordApiError(res.status, body);
     }
     await sleep(500 * 2 ** (attempt - 1));
   }
+}
+
+/**
+ * A deterministic, ≤25-char nonce for `enforce_nonce`: the same session and
+ * channel always produce the same value, so a re-post of the same card
+ * (e.g. after a POST 5xx whose success/failure was never learned) is deduped
+ * by Discord itself — but only within its own nonce window (a few minutes).
+ */
+export function messageNonce(sessionKey: string, channelId: string): string {
+  const input = `${sessionKey}:${channelId}`;
+  // Two independent 32-bit FNV-1a-style hashes combined into ~64 bits give
+  // enough spread to avoid collisions without a hashing library.
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b);
+  }
+  const combined = (BigInt(h1 >>> 0) << 32n) | BigInt(h2 >>> 0);
+  return combined.toString(36).slice(0, 25);
 }
 
 /** Post a message and return its ID so it can be edited later. */
@@ -393,12 +439,14 @@ export async function postMessage(
   content: string | undefined,
   replyTo: string | undefined,
   limits: DiscordRateLimits,
+  nonce?: string,
 ): Promise<string> {
   const res = await discordRequest(botToken, 'POST', `/channels/${channelId}/messages`, {
     content,
     embeds: [embed],
     allowed_mentions: { parse: ['roles'], replied_user: false },
     ...(replyTo ? { message_reference: { message_id: replyTo, fail_if_not_exists: false } } : {}),
+    ...(nonce ? { nonce, enforce_nonce: true } : {}),
   }, limits);
   const message = (await res.json()) as { id?: string };
   if (!message.id) throw new Error('Discord API returned a message without an id');

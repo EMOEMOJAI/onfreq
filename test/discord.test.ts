@@ -7,10 +7,12 @@ import {
   buildSessionEndedEmbed,
   DiscordApiError,
   deleteMessage,
+  escapeMarkdown,
   formatRoster,
   editMessage,
   formatDuration,
   formatFrequency,
+  messageNonce,
   parseChannelIds,
   postMessage,
 } from '../src/discord';
@@ -177,6 +179,16 @@ describe('embeds', () => {
     expect(embed.description).toContain('\\*Evil\\* \\_\\_Tower\\_\\_');
     expect(embed.description).toContain('\\`injected\\` \\[link\\](http://example.test)');
     expect(embed.description).not.toContain('**Evil**');
+  });
+
+  it('escapes angle brackets so an IVAO-supplied role mention cannot ping', () => {
+    const embed = buildOnlineEmbed({ ...sample, station: '<@&123>' }, undefined, LABELS);
+    expect(embed.description).toContain('\\<@&123\\>');
+    expect(embed.description).not.toContain('<@&123>');
+  });
+
+  it('collapses embedded newlines to a single space instead of adding embed lines', () => {
+    expect(escapeMarkdown('line one\nline two\r\nline three')).toBe('line one line two line three');
   });
 });
 
@@ -361,6 +373,25 @@ describe('also-online roster', () => {
   });
 });
 
+describe('messageNonce', () => {
+  it('is deterministic for the same session and channel', () => {
+    expect(messageNonce('session-1', 'channel-1')).toBe(messageNonce('session-1', 'channel-1'));
+  });
+
+  it('differs across sessions and channels', () => {
+    expect(messageNonce('session-1', 'channel-1')).not.toBe(messageNonce('session-2', 'channel-1'));
+    expect(messageNonce('session-1', 'channel-1')).not.toBe(messageNonce('session-1', 'channel-2'));
+  });
+
+  it('stays within Discord\'s 25-char nonce limit', () => {
+    for (const [session, channel] of [['s', 'c'], ['a-very-long-session-key-1234567890', '9999999999999999']]) {
+      const nonce = messageNonce(session!, channel!);
+      expect(nonce.length).toBeLessThanOrEqual(25);
+      expect(nonce.length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('REST calls', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -381,6 +412,22 @@ describe('REST calls', () => {
     expect(url).toBe('https://discord.com/api/v10/channels/123/messages');
     expect(init.method).toBe('POST');
     expect(JSON.parse(init.body).content).toBe('<@&role>');
+  });
+
+  it('includes a nonce and enforce_nonce when a nonce is supplied', async () => {
+    const fetchMock = stubFetch(Response.json({ id: '999' }));
+    await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, new DiscordRateLimits(), 'abc123');
+    const payload = JSON.parse(fetchMock.mock.calls[0]![1].body);
+    expect(payload.nonce).toBe('abc123');
+    expect(payload.enforce_nonce).toBe(true);
+  });
+
+  it('omits nonce and enforce_nonce when no nonce is supplied', async () => {
+    const fetchMock = stubFetch(Response.json({ id: '999' }));
+    await postMessage('token', '123', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, new DiscordRateLimits());
+    const payload = JSON.parse(fetchMock.mock.calls[0]![1].body);
+    expect(payload.nonce).toBeUndefined();
+    expect(payload.enforce_nonce).toBeUndefined();
   });
 
   it('posts continuations as replies without pinging the parent author', async () => {
@@ -452,8 +499,27 @@ describe('REST calls', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('makes later requests in the same poll fail fast after a request exhausts its 5xx retries', async () => {
-    // POST never retries a 5xx (see above), so this exhausts its budget on the first attempt.
+  it('keeps retrying a PATCH/DELETE on a 5xx, and marks an outage as soon as its retry budget is exhausted', async () => {
+    const fetchMock = stubFetch(
+      ...Array.from({ length: 4 }, () => Response.json({ message: 'server error' }, { status: 503 })),
+    );
+    const limits = new DiscordRateLimits();
+    await expect(
+      editMessage('token', '123', '999', buildSessionEndedEmbed(endedEvent, LABELS), limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    // A single PATCH/DELETE exhausting its own retry budget is already an
+    // outage: a later request in the same poll must not spend its own budget
+    // against a service that just proved to be down.
+    const err = await postMessage('token', '456', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
+    expect(err).toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not mark an outage after a single POST 5xx, only after a second consecutive one', async () => {
+    // POST never retries a 5xx in-request (see above), so a lone blip must
+    // not defer the rest of the poll — only two in a row should.
     const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     const limits = new DiscordRateLimits();
     await expect(
@@ -461,12 +527,67 @@ describe('REST calls', () => {
     ).rejects.toBeInstanceOf(DiscordApiError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    // A later call in the same poll must not spend its own retry budget on a
-    // service that just proved to be down, and must not consume a "real"
-    // rate-limit attempt (requestMade stays false).
-    const err = await postMessage('token', '456', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
-    expect(err).toMatchObject({ status: 429, requestMade: false });
+    // A different destination in the same poll still gets its own attempt.
+    const fetchMock2 = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '456', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+    expect(fetchMock2).toHaveBeenCalledTimes(1);
+
+    // The second consecutive POST failure now declares an outage; a third
+    // destination fails fast without spending a network call.
+    const err = await postMessage('token', '789', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
+    expect(err).toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
+  });
+
+  it('resets the POST failure streak after a success, so a lone blip afterward does not immediately declare an outage', async () => {
+    const limits = new DiscordRateLimits();
+    stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
+
+    stubFetch(Response.json({ id: '999' }));
+    await expect(
+      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).resolves.toBe('999');
+
+    const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
+    await expect(
+      postMessage('token', '3', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(DiscordApiError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks an outage before rethrowing a thrown fetch error (timeout/network) for PATCH/DELETE', async () => {
+    const network = vi.fn().mockRejectedValueOnce(new TypeError('upstream request timed out'));
+    vi.stubGlobal('fetch', network);
+    const limits = new DiscordRateLimits();
+    await expect(
+      editMessage('token', '123', '999', buildOnlineEmbed(sample, undefined, LABELS), limits),
+    ).rejects.toBeInstanceOf(TypeError);
+    expect(network).toHaveBeenCalledTimes(1);
+
+    // A later request in the same poll fails fast instead of hanging again.
+    const err = await editMessage('token', '456', '999', buildOnlineEmbed(sample, undefined, LABELS), limits).catch((e) => e);
+    expect(err).toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires a second consecutive thrown-fetch-error before marking an outage for POST', async () => {
+    const network = vi.fn().mockRejectedValue(new TypeError('network error'));
+    vi.stubGlobal('fetch', network);
+    const limits = new DiscordRateLimits();
+    await expect(
+      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(TypeError);
+    await expect(
+      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+    ).rejects.toBeInstanceOf(TypeError);
+
+    const err = await postMessage('token', '3', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
+    expect(err).toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
+    expect(network).toHaveBeenCalledTimes(2);
   });
 
   it('does not mask a rate-limit error with a message that carries a response body', async () => {
