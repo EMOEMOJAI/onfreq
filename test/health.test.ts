@@ -59,3 +59,45 @@ it('returns a generic failure if storage is unavailable', async () => {
   expect(response.status).toBe(503);
   expect(await response.json()).toEqual({ error: 'coordinator unavailable' });
 });
+
+// POLL_SECRET-gated routes. Synthetic, distinct secrets prove separation from HISTORY_SECRET.
+const POLL_ONLY = 'synthetic-poll-only-secret-0123456789';
+const HISTORY_ONLY = 'synthetic-history-only-secret-01234567';
+const callPollRoute = (path: string, method: string, token: string, overrides: Partial<Env>) => worker.fetch(
+  new Request(`https://example.com${path}`, { method, headers: { authorization: `Bearer ${token}` } }),
+  { ...env, ...overrides }, {} as ExecutionContext);
+
+it('S2-1: HISTORY_SECRET does not authorize /health or /poll', async () => {
+  const overrides = { POLL_SECRET: POLL_ONLY, HISTORY_SECRET: HISTORY_ONLY };
+  expect((await callPollRoute('/health', 'GET', HISTORY_ONLY, overrides)).status).toBe(401);
+  expect((await callPollRoute('/poll', 'POST', HISTORY_ONLY, overrides)).status).toBe(401);
+  expect(await (await callPollRoute('/health', 'GET', POLL_ONLY, overrides)).json()).toMatchObject({ ok: false, lastSuccessfulPollAt: null });
+});
+
+it('S14-1: disabled poll and health responses do not name the secret', async () => {
+  const poll = await callPollRoute('/poll', 'POST', 'anything', { POLL_SECRET: '' });
+  expect(poll.status).toBe(503);
+  expect(await poll.json()).toEqual({ ok: false, error: 'poll endpoint disabled' });
+  const health = await callPollRoute('/health', 'GET', 'anything', { POLL_SECRET: undefined });
+  expect(health.status).toBe(503);
+  expect(await health.json()).toEqual({ error: 'endpoint disabled' });
+});
+
+it('S1-1: a short POLL_SECRET disables /poll and /health even when the token matches', async () => {
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const weak = 'a';
+  const poll = await callPollRoute('/poll', 'POST', weak, { POLL_SECRET: weak });
+  expect(poll.status).toBe(503);
+  expect(await poll.json()).toEqual({ ok: false, error: 'poll endpoint disabled' });
+  const almost = 'p'.repeat(31);
+  const health = await callPollRoute('/health', 'GET', almost, { POLL_SECRET: ` ${almost} ` });
+  expect(health.status).toBe(503);
+  expect(await health.json()).toEqual({ error: 'endpoint disabled' });
+  expect(log.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+    { event: 'config_invalid', reason: 'POLL_SECRET_too_short' },
+    { event: 'config_invalid', reason: 'POLL_SECRET_too_short' },
+  ]);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(almost);
+  const exact = 'p'.repeat(32);
+  expect(await (await callPollRoute('/health', 'GET', exact, { POLL_SECRET: exact })).json()).toMatchObject({ ok: false, maxAgeSeconds: 300 });
+});

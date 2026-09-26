@@ -6,6 +6,24 @@
  * the poll over HTTP instead.
  */
 
+/** Shorter bearer secrets are too guessable for an unthrottled endpoint. */
+export const MIN_SECRET_LENGTH = 32;
+
+/**
+ * Return the configured secret, or '' when it is unset or too short.
+ *
+ * A too-short secret disables its endpoints (fail closed) and logs the
+ * variable name only, never the value.
+ */
+export function configuredSecret(value: string | undefined, name: string): string {
+  const secret = value?.trim() ?? '';
+  if (secret && secret.length < MIN_SECRET_LENGTH) {
+    console.error(JSON.stringify({ event: 'config_invalid', reason: `${name}_too_short` }));
+    return '';
+  }
+  return secret;
+}
+
 /** Pull the token out of an `Authorization: Bearer <token>` header. */
 export function extractBearer(header: string | null): string {
   if (!header) return '';

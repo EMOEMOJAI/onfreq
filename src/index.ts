@@ -1,22 +1,26 @@
-import { extractBearer, secretsMatch } from './auth';
+import { configuredSecret, extractBearer, secretsMatch } from './auth';
 import { getCoordinator } from './config';
 
 export { PollCoordinator } from './coordinator';
 
 /**
- * Shared bearer-secret gate for every POLL_SECRET-protected endpoint.
+ * Shared bearer-secret gate. POLL_SECRET protects /poll and /health;
+ * HISTORY_SECRET alone protects the private /gca-history routes.
  *
  * Returns a disabled/unauthorized Response to short-circuit the caller, or
  * `null` when the request is authenticated and handling should continue.
+ * Unset or too-short secrets disable the endpoint; bodies never name the
+ * variable.
  */
-async function requirePollSecret(
+async function requireSecret(
   request: Request,
   env: Env,
+  name: 'POLL_SECRET' | 'HISTORY_SECRET',
   disabledBody: Record<string, unknown>,
   unauthorizedBody: Record<string, unknown>,
   headers: Record<string, string> = {},
 ): Promise<Response | null> {
-  const expected = env.POLL_SECRET?.trim();
+  const expected = configuredSecret(env[name], name);
   if (!expected) return Response.json(disabledBody, { status: 503, headers });
   const provided = extractBearer(request.headers.get('authorization'));
   if (!(await secretsMatch(provided, expected))) {
@@ -31,13 +35,14 @@ async function requirePollSecret(
  * Runs exactly the same logic as the scheduled handler, so an external
  * scheduler can stand in for the cron without any behavioural difference.
  * Requires `Authorization: Bearer <POLL_SECRET>`; disabled entirely when
- * that secret is unset, so it can never be triggered anonymously.
+ * that secret is unset or too short, so it can never be triggered anonymously.
  */
 async function handlePollRequest(request: Request, env: Env): Promise<Response> {
-  const denied = await requirePollSecret(
+  const denied = await requireSecret(
     request,
     env,
-    { ok: false, error: 'poll endpoint disabled: POLL_SECRET is not set' },
+    'POLL_SECRET',
+    { ok: false, error: 'poll endpoint disabled' },
     { ok: false, error: 'unauthorized' },
   );
   if (denied) return denied;
@@ -66,7 +71,8 @@ export default {
       if (!allowed.includes(request.method)) {
         return new Response('Method not allowed', { status: 405, headers: { ...headers, allow: allowed.join(', ') } });
       }
-      const denied = await requirePollSecret(request, env, { error: 'endpoint disabled' }, { error: 'unauthorized' }, headers);
+      const secret = cleanup ? 'HISTORY_SECRET' : 'POLL_SECRET';
+      const denied = await requireSecret(request, env, secret, { error: 'endpoint disabled' }, { error: 'unauthorized' }, headers);
       if (denied) return denied;
       if (cleanup && request.method === 'POST' && request.headers.get('x-onfreq-confirm') !== 'delete-old-copies') {
         return Response.json({ error: 'preview with GET, then confirm with X-Onfreq-Confirm: delete-old-copies' }, { status: 400, headers });
@@ -95,7 +101,7 @@ export default {
     if (url.pathname === '/gca-history') {
       const headers = { 'cache-control': 'no-store' };
       if (request.method !== 'GET') return new Response('Use GET', { status: 405, headers: { ...headers, allow: 'GET' } });
-      const denied = await requirePollSecret(request, env, { error: 'history endpoint disabled' }, { error: 'unauthorized' }, headers);
+      const denied = await requireSecret(request, env, 'HISTORY_SECRET', { error: 'history endpoint disabled' }, { error: 'unauthorized' }, headers);
       if (denied) return denied;
       const after = url.searchParams.get('after') ?? '';
       if (after && !/^\d{1,16}:\d{1,16}$/.test(after)) {
