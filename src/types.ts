@@ -86,6 +86,8 @@ export interface RosterMessage extends PostedMessage {
   page: number;
   /** Failed delete attempts (e.g. a permanently forbidden channel); rate-limit deferrals don't count. */
   deleteAttempts?: number;
+  /** Failed edit/post attempts for this page; rate-limit deferrals don't count. */
+  pageAttempts?: number;
 }
 
 /** An ATC position we are tracking across polls. */

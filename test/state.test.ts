@@ -78,6 +78,14 @@ describe('diffState', () => {
     expect(result.next['QESS_APP']).not.toHaveProperty('missingSince');
   });
 
+  it('strips a legacy roster field from a resumed session', () => {
+    const prev: StateMap = {
+      QESS_APP: { ...tracked('QESS_APP', { missed: 1 }), roster: true } as TrackedAtc,
+    };
+    const result = diffState(prev, [atc('QESS_APP')], NOW, 2);
+    expect(result.next['QESS_APP']).not.toHaveProperty('roster');
+  });
+
   it('reports offline once the grace window is exhausted', () => {
     const prev: StateMap = { QESS_APP: tracked('QESS_APP', { missed: 1 }) };
     const result = diffState(prev, [], NOW, 2);

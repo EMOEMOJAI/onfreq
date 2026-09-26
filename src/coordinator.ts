@@ -111,14 +111,20 @@ export class PollCoordinator extends DurableObject<Env> {
       // A config/precondition throw never reached the outcome object below,
       // so record the same lastPollStartedAt/error shape by hand: otherwise
       // a misconfigured bot bypasses MIN_POLL_INTERVAL on every invocation.
-      await this.ctx.storage.put(POLL_SNAPSHOT_KEY, {
-        state: snapshot.state,
-        ...(snapshot.pendingOffline?.length ? { pendingOffline: snapshot.pendingOffline } : {}),
-        ...(snapshot.rosterMessages?.length ? { rosterMessages: snapshot.rosterMessages } : {}),
-        lastPollStartedAt: startedAt,
-        ...(snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt }),
-        error: err instanceof Error ? err.message : String(err),
-      } satisfies PollSnapshot);
+      // A failure while recording that shape must never mask the original
+      // runPoll error — log it (without bodies) and rethrow `err` regardless.
+      try {
+        await this.ctx.storage.put(POLL_SNAPSHOT_KEY, {
+          state: snapshot.state,
+          ...(snapshot.pendingOffline?.length ? { pendingOffline: snapshot.pendingOffline } : {}),
+          ...(snapshot.rosterMessages?.length ? { rosterMessages: snapshot.rosterMessages } : {}),
+          lastPollStartedAt: startedAt,
+          ...(snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt }),
+          error: err instanceof Error ? err.message : String(err),
+        } satisfies PollSnapshot);
+      } catch (putErr) {
+        console.error(JSON.stringify({ event: 'poll_snapshot_put_failed', error: String(putErr) }));
+      }
       throw err;
     }
     // One durable write commits the state, cadence, and outcome together.

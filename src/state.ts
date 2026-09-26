@@ -57,7 +57,10 @@ export function diffState(
       if (existing.missed !== 0 || existing.missingSince !== undefined) changed = true;
       // `missingSince` is dropped rather than overwritten so a resumed
       // session doesn't carry a stale end time. `messages` is preserved.
-      const { missingSince: _resumed, pending: _held, ...kept } = existing;
+      // `roster` is a legacy field removed from `TrackedAtc`; strip it from
+      // any session loaded from storage before an older deploy wrote it.
+      const { missingSince: _resumed, pending: _held, roster: _legacyRoster, ...kept } =
+        existing as TrackedAtc & { roster?: boolean };
       const entry: TrackedAtc = {
         ...kept,
         ...atc,

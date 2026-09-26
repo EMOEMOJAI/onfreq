@@ -97,10 +97,9 @@ async function announceOnline(
 
 /** Reconcile displayed cards, retrying only messages whose last edit failed. */
 async function syncOnlineCards(
-  env: Env, next: StateMap, current: OnlineAtc[], gracePolls: number, labels: FirLabel[],
-  gcaPolicy: GcaPolicy | null,
-  limits: DiscordRateLimits,
+  ctx: PollContext, next: StateMap, current: OnlineAtc[],
 ): Promise<{ targets: RosterTarget[]; failed: boolean }> {
+  const { env, labels, gcaPolicy, limits } = ctx;
   const coverage = current.map((atc) => next[atc.callsign] ?? atc);
   let targets: RosterTarget[];
   let failed = false;
@@ -116,7 +115,7 @@ async function syncOnlineCards(
       (session.messages ?? []).map((ref) => ref.channelId)));
     const holders = new Map([...channels].map((channel) => [channel, newestCardedSession(next, channel)]));
     for (const [callsign, session] of Object.entries(next)) {
-      // An ended session retained solely for offline retries must never turn green again.
+      // Sessions still awaiting a frequency have no card to reconcile.
       if (session.pending) continue;
       for (const ref of [...(session.messages ?? [])]) {
         const isHolder = callsign === holders.get(ref.channelId);
@@ -135,6 +134,11 @@ async function syncOnlineCards(
             logFailure('roster_edit_failed', callsign, ref.channelId, err);
             if (err instanceof DiscordApiError && err.isGone) {
               session.messages = session.messages?.filter((message) => message !== ref);
+              // Every card for this session is now gone (deleted channel/message).
+              // Without a pending marker, `close()` would treat that as an
+              // unannounced session and fire a fallback OFFLINE to every
+              // configured channel; mark it as already-resolved instead.
+              if (!session.messages?.length) session.pendingChannelIds ??= [];
               removedMessage = true;
               continue;
             }
@@ -265,10 +269,14 @@ export async function runPoll(
     if (isExcludedCallsign(callsign, excluded)) {
       const tracked = prev[callsign]!;
       if (!tracked.pending && tracked.messages?.length) {
+        // A session already missing (grace window) keeps the poll it went
+        // missing as its end time, matching `diffState`'s `close()`, instead
+        // of stretching the duration to this poll.
+        const endedAt = tracked.missingSince ?? nowIso;
         const durationSeconds = Math.max(0, Math.round(
-          (Date.parse(nowIso) - Date.parse(tracked.since)) / 1000,
+          (Date.parse(endedAt) - Date.parse(tracked.since)) / 1000,
         ));
-        excludedClosures.push({ ...tracked, missed: 0, missingSince: nowIso, endedAt: nowIso, durationSeconds });
+        excludedClosures.push({ ...tracked, missed: 0, missingSince: endedAt, endedAt, durationSeconds });
       }
       delete prev[callsign];
     }
@@ -323,14 +331,29 @@ export async function runPoll(
   // A retried job created while a channel was still configured must not keep
   // targeting it after that channel is removed from DISCORD_CHANNEL_IDS.
   const jobs: PendingOffline[] = structuredClone(previousPendingOffline)
-    .map((job) => ({
-      ...job,
-      messages: job.messages.filter((ref) => channelIds.includes(ref.channelId)),
-      channelIds: job.channelIds.filter((id) => channelIds.includes(id)),
-    }))
+    .map((job) => {
+      const messages = job.messages.filter((ref) => channelIds.includes(ref.channelId));
+      const jobChannelIds = job.channelIds.filter((id) => channelIds.includes(id));
+      // A retry counter for a destination no longer in either list (removed
+      // channel, or already resolved) is stale bookkeeping.
+      const remaining = new Set([...messages.map((ref) => ref.channelId), ...jobChannelIds]);
+      const prunedAttempts = job.attemptsByChannel && Object.fromEntries(
+        Object.entries(job.attemptsByChannel).filter(([id]) => remaining.has(id)),
+      );
+      const { attemptsByChannel: _oldAttempts, ...rest } = job;
+      return {
+        ...rest,
+        messages,
+        channelIds: jobChannelIds,
+        ...(prunedAttempts && Object.keys(prunedAttempts).length ? { attemptsByChannel: prunedAttempts } : {}),
+      };
+    })
     .filter((job) => job.messages.length || job.channelIds.length);
   for (const offline of [...wentOffline, ...excludedClosures]) {
-    const { messages = [], pendingChannelIds: _pending, ...event } = offline;
+    // Both fields only track retry state for the still-open ONLINE card and
+    // are meaningless once a session has ended; strip them so a closed-out
+    // session doesn't carry stale online-card bookkeeping.
+    const { messages = [], pendingChannelIds: _pending, onlineAttemptsByChannel: _onlineAttempts, ...event } = offline;
     jobs.push({ event, messages, channelIds: messages.length ? [] : [...channelIds] });
   }
   const pendingOffline: PendingOffline[] = [];
@@ -356,7 +379,11 @@ export async function runPoll(
   for (const { entry, targets } of announcements) {
     attempted += targets.length;
     const holderChannels = new Set(targets.filter((id) => lastPoster.get(id) === entry));
-    const { posted, failed } = await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels);
+    // No destination left needing a first card: skip building/posting
+    // embeds and just run the bookkeeping below.
+    const { posted, failed } = targets.length
+      ? await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels)
+      : { posted: [] as PostedMessage[], failed: new Map<string, unknown>() };
     delivered += posted.length;
     if (failed.size) deliveryFailed = true;
     if (posted.length) {
@@ -365,19 +392,25 @@ export async function runPoll(
     }
     // A destination that keeps failing to receive the first card is dropped
     // after the same retry budget as an offline closeout's fallback post
-    // (which likewise has no message to discover "gone"): a rate-limit
-    // deferral doesn't count towards it.
-    const attempts = entry.onlineAttemptsByChannel ?? {};
+    // (which likewise has no message to discover "gone"). Only a definite
+    // Discord-side rejection (4xx, excluding the 429 rate-limit deferral)
+    // counts towards that budget; a 5xx outage, a timeout/network error, or
+    // a rate-limit deferral is transient and retried indefinitely instead.
+    // Rebuilt from `targets` only (not copied wholesale) so a destination
+    // that fell out of `targets` (channel removed, or its card finally
+    // landed) never leaves a stale counter behind.
+    const previousAttempts = entry.onlineAttemptsByChannel ?? {};
+    const attempts: Record<string, number> = {};
     const kept: string[] = [];
     for (const id of targets) {
-      if (posted.some((ref) => ref.channelId === id)) { delete attempts[id]; continue; }
-      const rateLimited = failed.get(id) instanceof DiscordRateLimitError;
-      const used = (attempts[id] ?? 0) + (rateLimited ? 0 : 1);
-      if (rateLimited || used <= OFFLINE_RETRY_POLLS) {
+      if (posted.some((ref) => ref.channelId === id)) continue;
+      const err = failed.get(id);
+      const countsAgainstBudget = err instanceof DiscordApiError && err.status >= 400 && err.status <= 499;
+      const used = (previousAttempts[id] ?? 0) + (countsAgainstBudget ? 1 : 0);
+      if (!countsAgainstBudget || used <= OFFLINE_RETRY_POLLS) {
         attempts[id] = used;
         kept.push(id);
       } else {
-        delete attempts[id];
         console.error(JSON.stringify({ event: 'online_post_abandoned', callsign: entry.callsign, channelId: id }));
       }
     }
@@ -390,7 +423,7 @@ export async function runPoll(
     // cannot manufacture an offline notice after destinations are removed.
   }
 
-  const cards = await syncOnlineCards(env, next, current, gracePolls, labels, gcaPolicy, limits);
+  const cards = await syncOnlineCards(ctx, next, current);
   const roster = await syncRosterMessages(env.DISCORD_BOT_TOKEN, previousRosterMessages, cards.targets, limits);
   const rosterMessages = roster.messages;
   const rosterFailed = cards.failed || roster.failed;

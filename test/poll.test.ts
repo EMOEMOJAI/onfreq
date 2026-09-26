@@ -347,6 +347,20 @@ describe('polling through the Durable Object', () => {
     expect(sent[1]!.embed.title).toContain(`${b} is now ONLINE`);
   });
 
+  it('backdates an excluded closeout to when the session actually went missing, not the exclusion poll', async () => {
+    await seed({ [a]: session(a) });
+    feed = [];
+    await nextPoll();
+    const missingAt = now;
+    expect((await stub().getState())?.[a]?.missingSince).toBe(new Date(missingAt).toISOString());
+    now += 5 * 60_000; // time passes before the exclusion takes effect
+    const sentBefore = sent.length;
+    await expect(configuredPoll({ EXCLUDED_CALLSIGNS: a })).resolves.toEqual({ skipped: false });
+    const closeout = sent.slice(sentBefore).find((message) => message.method === 'PATCH' && message.id === a);
+    expect(closeout?.embed.timestamp).toBe(new Date(missingAt).toISOString());
+    expect(closeout?.embed.title).toContain('OFFLINE');
+  });
+
   it('closes out a carded session\'s card once its callsign becomes excluded', async () => {
     await seed({ [a]: session(a) });
     feed = [entry(a)];
@@ -981,6 +995,30 @@ describe('polling through the Durable Object', () => {
     expect(sent).toHaveLength(count);
   });
 
+  it('suppresses a fallback OFFLINE post once every card for a session is discovered gone', async () => {
+    await seed({ [a]: session(a) });
+    feed = [entry(a)];
+    await poll();
+    failures.add(a);
+    failureStatus = 404;
+    cards.delete(a);
+    // A frequency change makes the card discover the 404 on its next edit.
+    feed = [entry(a, 121.7)];
+    await nextPoll();
+    expect((await stub().getState())?.[a]?.messages).toEqual([]);
+    expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual([]);
+    failures.clear();
+    const postsBefore = sent.filter((message) => message.method === 'POST').length;
+    // The callsign now disconnects entirely (two polls to clear the grace window).
+    feed = [];
+    await nextPoll();
+    await nextPoll();
+    // Without a pending marker, this would fire a fallback OFFLINE post to
+    // every configured channel despite there being nothing left to edit.
+    expect(sent.filter((message) => message.method === 'POST')).toHaveLength(postsBefore);
+    expect((await stub().getState())?.[a]).toBeUndefined();
+  });
+
   it('abandons an online card destination after exhausting its retry budget', async () => {
     await seed({});
     feed = [entry(a)];
@@ -997,6 +1035,31 @@ describe('polling through the Durable Object', () => {
     await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).resolves.toEqual({ skipped: false });
     // Abandoned: no further attempt is made even once delivery would succeed.
     expect(sent).toHaveLength(attemptsBefore);
+    expect(cards.has(a)).toBe(false);
+  });
+
+  it('never abandons a first online card during a long 5xx outage, but still abandons after repeated 4xx rejections', async () => {
+    await seed({});
+    feed = [entry(a)];
+    failures.add('test-channel');
+    failureStatus = 503;
+    for (let i = 0; i < 12; i++) {
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow();
+      now += 60_000;
+    }
+    // A prolonged 5xx outage never counts against the online first-card
+    // budget: still pending after more polls than the retry budget allows.
+    expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual(['test-channel']);
+    expect(cards.has(a)).toBe(false);
+
+    failureStatus = 400;
+    for (let i = 0; i < 11; i++) {
+      await expect(configuredPoll({ DISCORD_CHANNEL_IDS: 'test-channel' })).rejects.toThrow();
+      now += 60_000;
+    }
+    // A genuine (non-429) 4xx rejection counts, and the card is abandoned
+    // once the same budget is exhausted.
+    expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual([]);
     expect(cards.has(a)).toBe(false);
   });
 
@@ -1157,6 +1220,20 @@ describe('polling through the Durable Object', () => {
       expect(replacement.messageId).not.toBe(page.messageId);
       expect(cards.get(replacement.messageId)?.fields?.some((field) => field.value.includes('122.800'))).toBe(true);
       expect(visibleCallsigns()).toHaveLength(121);
+    });
+
+    it('abandons a roster continuation page whose edit keeps failing (not merely a 404)', async () => {
+      await prepare();
+      await poll();
+      const page = (await snapshot())!.rosterMessages![0]!;
+      const atc = feed.find((item) => item.callsign === 'QE119_TWR')!;
+      atc.atcSession.frequency = 121.7;
+      failures.add(page.messageId);
+      failureStatus = 400;
+      for (let i = 0; i < 11; i++) {
+        expect((await nextPoll()).status).toBe(500);
+      }
+      expect((await snapshot())?.rosterMessages).toBeUndefined();
     });
 
     it('keeps continuations until a failed parent edit has succeeded', async () => {
@@ -1359,6 +1436,17 @@ describe('polling through the Durable Object', () => {
     // Discord has already accepted the message: coordination is not an atomic
     // transaction with Discord. The API must report failure, not false success.
     expect(sent.filter((message) => message.method === 'POST')).toHaveLength(1);
+  });
+
+  it('surfaces the original poll failure even when recording it also fails', async () => {
+    await seed({});
+    feedStatus = 503;
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      vi.spyOn(ctx.storage, 'put').mockRejectedValueOnce(new Error('storage unavailable'));
+    });
+    // A failing storage.put while recording the runPoll error must not mask
+    // that original error with the unrelated storage failure.
+    await expect(authenticatedPoll()).rejects.toThrow('IVAO API responded with 503');
   });
 
   it('rejects unauthorized or non-POST triggers before polling', async () => {
