@@ -6,6 +6,7 @@ import {
   buildSessionEndedEmbed,
   DiscordApiError,
   editMessage,
+  messageNonce,
   parseChannelIds,
   postMessage,
 } from './discord';
@@ -84,7 +85,10 @@ async function announceOnline(
         : undefined;
     const embed = holderChannels.has(channelId) ? holder : plain;
     try {
-      const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits);
+      // A POST whose 5xx hid a success is re-sent next poll; the stable nonce
+      // lets Discord return the original message instead of a duplicate card.
+      const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits,
+        messageNonce(`online:${atc.userId}:${atc.sessionId}`, channelId));
       posted.push({ channelId, messageId, postedAt: nowIso, onlineEmbed: JSON.stringify(embed) });
       if (content) mentionedChannels.add(channelId);
     } catch (err) {
@@ -180,6 +184,7 @@ async function announceOffline(
     console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign, channelId }));
     return false;
   };
+  const offlineKey = `offline:${job.event.userId}:${job.event.sessionId}`;
   for (const ref of job.messages) {
     try {
       await editMessage(env.DISCORD_BOT_TOKEN, ref.channelId, ref.messageId, endedEmbed, limits);
@@ -194,7 +199,8 @@ async function announceOffline(
       }
     }
     try {
-      await postMessage(env.DISCORD_BOT_TOKEN, ref.channelId, fallbackEmbed, undefined, undefined, limits);
+      await postMessage(env.DISCORD_BOT_TOKEN, ref.channelId, fallbackEmbed, undefined, undefined, limits,
+        messageNonce(offlineKey, ref.channelId));
       delivered++;
       delete attempts[ref.channelId];
     } catch (err) {
@@ -206,7 +212,8 @@ async function announceOffline(
   const remainingChannels: string[] = [];
   for (const channelId of job.channelIds) {
     try {
-      await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed, undefined, undefined, limits);
+      await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed, undefined, undefined, limits,
+        messageNonce(offlineKey, channelId));
       delivered++;
       delete attempts[channelId];
     } catch (err) {

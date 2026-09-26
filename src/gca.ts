@@ -1,5 +1,5 @@
 import { EMBED_FOOTER, firOf, type FirLabel } from './config';
-import type { DiscordEmbed } from './discord';
+import { escapeMarkdown, type DiscordEmbed } from './discord';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import { hasFrequency } from './ivao';
 import { countryCode } from './member-country';
@@ -286,7 +286,7 @@ export function buildGcaEmbed(
 ): DiscordEmbed {
   const regionName = mismatch.regionName;
   // IVAO text is external input: escape Discord formatting and cap its size.
-  const station = (atc.station ?? '').slice(0, 100).replace(/[\\`*_~|\[\]<>]/g, '\\$&').replace(/[\r\n]/g, ' ');
+  const station = escapeMarkdown((atc.station ?? '').slice(0, 100));
   const label = `${atc.callsign}${station ? ` — ${station}` : ''}, ${regionName}`;
   const lastTwo = occurrence % 100;
   const suffix = lastTwo >= 11 && lastTwo <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[occurrence % 10] ?? 'th');

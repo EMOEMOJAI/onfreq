@@ -40,7 +40,7 @@ function session(callsign: string, cardAt = START - 60_000): TrackedAtc {
   };
 }
 
-type Sent = { channelId?: string; method: string; id?: string; embed: DiscordEmbed; replyTo?: string };
+type Sent = { channelId?: string; method: string; id?: string; embed: DiscordEmbed; replyTo?: string; nonce?: string };
 let now: number;
 let feed: IvaoAtcSummaryEntry[];
 let sent: Sent[];
@@ -144,9 +144,12 @@ beforeEach(() => {
         cards.delete(id);
         return new Response(null, { status: 204 });
       }
-      const payload = JSON.parse(String(init?.body)) as { embeds: DiscordEmbed[]; message_reference?: { message_id: string } };
+      const payload = JSON.parse(String(init?.body)) as {
+        embeds: DiscordEmbed[]; message_reference?: { message_id: string }; nonce?: string; enforce_nonce?: boolean;
+      };
       const embed = payload.embeds[0]!;
-      sent.push({ channelId, method, id, embed, replyTo: payload.message_reference?.message_id });
+      if (payload.nonce && !payload.enforce_nonce) throw new Error('nonce sent without enforce_nonce');
+      sent.push({ channelId, method, id, embed, replyTo: payload.message_reference?.message_id, nonce: payload.nonce });
       const text = payload.embeds.flatMap((item) => [item.title ?? '', item.description ?? '', item.footer?.text ?? '',
         ...(item.fields ?? []).flatMap((field) => [field.name, field.value])]).join('');
       if (text.length > 6000 || payload.embeds.some((item) => (item.fields?.length ?? 0) > 25 ||
@@ -934,6 +937,20 @@ describe('polling through the Durable Object', () => {
     expect(posted[0]!.embed.fields?.find((field) => field.name.startsWith('Also online'))?.value).toContain(a);
     // Only the previous holder is edited; the new card is never patched.
     expect(sent.filter((message) => message.method === 'PATCH').map((message) => message.id)).toEqual([a]);
+  });
+
+  it('re-sends a failed ONLINE card with the same nonce so Discord can deduplicate it', async () => {
+    await seed({});
+    feed = [entry(a)];
+    failureStatus = 503;
+    failures.add('POST');
+    await poll();
+    failures.clear();
+    await nextPoll();
+    const posts = sent.filter((message) => message.method === 'POST');
+    expect(posts).toHaveLength(2);
+    expect(posts[0]!.nonce).toBeTruthy();
+    expect(posts[1]!.nonce).toBe(posts[0]!.nonce);
   });
 
   it('posts earlier cards of a simultaneous connection without a roster', async () => {
