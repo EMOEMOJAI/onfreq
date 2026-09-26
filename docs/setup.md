@@ -72,22 +72,20 @@ GCA coverage is private configuration, with no built-in region list. Set `GCA_RE
 
 `GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs.
 
-The Mac helpers read private files under `~/.onfreq`. Create that directory with mode 0700; store your HTTPS `/poll` URL in `poll-endpoint` and the URL-safe token in `poll-secret`, both mode 0600, using a local editor. Then:
+The Mac helper reads private files under `~/.onfreq`. Create that directory with mode 0700; store your HTTPS `/poll` URL in `poll-endpoint` and the URL-safe token in `poll-secret`, both mode 0600, using a local editor. Then:
 
 ```sh
 mkdir -p ~/Library/Logs ~/Library/LaunchAgents
-cp scripts/poll-trigger.sh scripts/health-monitor.sh ~/.onfreq/
-chmod 700 ~/.onfreq/*.sh
-for agent in com.onfreq.poll com.onfreq.health; do
-  sed "s|__HOME__|$HOME|g" "scripts/$agent.plist" > "$HOME/Library/LaunchAgents/$agent.plist"
-  chmod 600 "$HOME/Library/LaunchAgents/$agent.plist"
-  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$agent.plist"
-done
+cp scripts/poll-trigger.sh ~/.onfreq/
+chmod 700 ~/.onfreq/poll-trigger.sh
+sed "s|__HOME__|$HOME|g" scripts/com.onfreq.poll.plist > "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
+chmod 600 "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
 ```
 
-Both agents run every minute while the Mac is awake and logged in. Allow macOS notifications for alerts. Before reinstalling or moving files, unload existing agents with `launchctl bootout`; preserve the endpoint and secret and avoid loading duplicate pollers.
+The agent runs every minute while the Mac is awake and logged in. Before reinstalling or moving files, unload the existing agent with `launchctl bootout`; preserve the endpoint and secret and avoid loading duplicate pollers.
 
-For failures, check `npm run tail` and `~/Library/Logs/onfreq-health.log`. A 401 means the token is wrong; a 403 from Discord usually means channel permissions are missing. Never post unredacted logs publicly.
+For failures, check `npm run tail`. A 401 means the token is wrong; a 403 from Discord usually means channel permissions are missing. Never post unredacted logs publicly.
 
 ## Private history maintenance
 
