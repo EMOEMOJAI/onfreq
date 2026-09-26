@@ -118,8 +118,8 @@ export async function syncRosterMessages(
       // re-post after a gone copy, or after the roster shrank and grew again,
       // must never reuse an earlier post's key, or Discord could hand back
       // the deleted message instead of creating a new one.
-      const nonceKey = postAttemptsByKey.get(key)?.nonceKey ??
-        `roster:${target.parentMessageId}:${page}:${Date.now().toString(36)}`;
+      const retryKey = postAttemptsByKey.get(key)?.nonceKey;
+      const nonceKey = retryKey ?? `roster:${target.parentMessageId}:${page}:${Date.now().toString(36)}`;
       if (ref) {
         try {
           await editMessage(botToken, ref.channelId, ref.messageId, embed, limits);
@@ -139,8 +139,10 @@ export async function syncRosterMessages(
       try {
         const nonce = messageNonce(nonceKey, target.channelId);
         const messageId = await postMessage(botToken, target.channelId, embed, undefined, target.parentMessageId, limits, nonce);
+        // A retry may have been handed the earlier, possibly older copy by
+        // its nonce: leave its content unknown so the next poll edits it.
         messages.push({ channelId: target.channelId, parentMessageId: target.parentMessageId,
-          page, messageId, onlineEmbed: rendered });
+          page, messageId, ...(retryKey ? {} : { onlineEmbed: rendered }) });
         postAttemptsByKey.delete(key);
       } catch (err) {
         if (err instanceof DiscordUnconfirmedPostError) {

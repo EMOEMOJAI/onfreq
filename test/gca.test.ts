@@ -181,6 +181,15 @@ describe('GCA coverage', () => {
     expect(embed.color).toBe(0xfee75c);
   });
 
+  it('escapes emphasis-forming underscores in the callsign but keeps word-internal ones', () => {
+    const controller = atc({ callsign: 'XDAA__TWR' });
+    const embed = buildGcaEmbed(controller, gcaMismatch(controller, policy())!);
+    expect(embed.title).toContain('XDAA\\_\\_TWR');
+    expect(embed.description).toContain('**XDAA\\_\\_TWR');
+    const plain = atc({ callsign: 'XDAA_TWR' });
+    expect(buildGcaEmbed(plain, gcaMismatch(plain, policy())!).title).toContain('XDAA_TWR');
+  });
+
   it('truncates a station name to 100 code points without splitting a surrogate pair', () => {
     // An emoji is one code point but two UTF-16 code units: a naive
     // String.prototype.slice(0, 100) would cut it in half, leaving an

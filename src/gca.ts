@@ -287,12 +287,13 @@ export function buildGcaEmbed(
   const regionName = mismatch.regionName;
   // IVAO text is external input: escape Discord formatting and cap its size.
   const station = escapeMarkdown(Array.from(atc.station ?? '').slice(0, 100).join(''));
-  const label = `${atc.callsign}${station ? ` — ${station}` : ''}, ${regionName}`;
+  const callsign = escapeMarkdown(atc.callsign);
+  const label = `${callsign}${station ? ` — ${station}` : ''}, ${regionName}`;
   const lastTwo = occurrence % 100;
   const suffix = lastTwo >= 11 && lastTwo <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[occurrence % 10] ?? 'th');
   const occurrenceLabel = occurrence > 1 ? `[${occurrence}${suffix} occurrence] ` : '';
   return {
-    title: `⚠️ ${occurrenceLabel}${firOf(atc.callsign, labels).flag} ${atc.callsign} — GCA approval reminder`,
+    title: `⚠️ ${occurrenceLabel}${firOf(atc.callsign, labels).flag} ${callsign} — GCA approval reminder`,
     description: [
       'Hello,',
       `Our ATC monitor detected you online as **${label}**. Your recorded home region is **${mismatch.homeName}**, and our configured Guest Controller Approval (GCA) records do not show approval covering **${regionName} at ${mismatch.position} level**.`,

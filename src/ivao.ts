@@ -226,7 +226,11 @@ let tokenFailedUntil = 0;
  */
 const TOKEN_INVALIDATE_BACKOFF_MS = 30 * 60 * 1000;
 
-/** Epoch ms of the most recent production invalidation via `invalidateCachedToken`. */
+/**
+ * Epoch ms of the most recent production token invalidation, by
+ * `invalidateCachedToken` or a tracker-feed 401 in `fetchDivisionAtc`; gates
+ * `invalidateCachedToken`.
+ */
 let lastInvalidatedAt = 0;
 
 /**

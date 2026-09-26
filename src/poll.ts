@@ -69,6 +69,7 @@ async function announceOnline(
   mentionedChannels: Set<string>,
   current: OnlineAtc[],
   holderChannels: Set<string>,
+  retry: boolean,
 ): Promise<{ posted: PostedMessage[]; failed: Map<string, unknown>; unconfirmed: Set<string> }> {
   const { env, labels, gcaPolicy, limits, nowIso } = ctx;
   const mismatch = highlightMismatch(atc, gcaPolicy);
@@ -98,7 +99,9 @@ async function announceOnline(
       // return the original message instead of a duplicate card.
       const messageId = await postMessage(env.DISCORD_BOT_TOKEN, channelId, embed, content, undefined, limits,
         messageNonce(`online:${atc.userId}:${atc.callsign}:${atc.since}`, channelId));
-      posted.push({ channelId, messageId, postedAt: nowIso, onlineEmbed: JSON.stringify(embed) });
+      // On a retry the nonce may have returned the earlier, possibly older
+      // message: leave its content unknown so the next reconcile edits it.
+      posted.push({ channelId, messageId, postedAt: nowIso, ...(retry ? {} : { onlineEmbed: JSON.stringify(embed) }) });
       if (content) mentionedChannels.add(channelId);
     } catch (err) {
       // A 2xx without a usable message id: retrying would either accept a
@@ -242,7 +245,7 @@ async function announceOffline(
       delivered++;
       delete attempts[ref.channelId];
     } catch (err) {
-      logFailure('offline_post_failed', job.event.callsign, ref.channelId, err);
+      if (!(err instanceof DiscordUnconfirmedPostError)) logFailure('offline_post_failed', job.event.callsign, ref.channelId, err);
       if (keepForRetry(ref.channelId, err)) remaining.push(ref);
     }
   }
@@ -255,7 +258,7 @@ async function announceOffline(
       delivered++;
       delete attempts[channelId];
     } catch (err) {
-      logFailure('offline_post_failed', job.event.callsign, channelId, err);
+      if (!(err instanceof DiscordUnconfirmedPostError)) logFailure('offline_post_failed', job.event.callsign, channelId, err);
       if (keepForRetry(channelId, err)) remainingChannels.push(channelId);
     }
   }
@@ -440,7 +443,8 @@ export async function runPoll(
     // No destination left needing a first card: skip building/posting
     // embeds and just run the bookkeeping below.
     const { posted, failed, unconfirmed } = targets.length
-      ? await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels)
+      ? await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels,
+        !wentOnline.some((atc) => atc.callsign === entry.callsign))
       : { posted: [] as PostedMessage[], failed: new Map<string, unknown>(), unconfirmed: new Set<string>() };
     delivered += posted.length + unconfirmed.size;
     if (failed.size) deliveryFailed = true;

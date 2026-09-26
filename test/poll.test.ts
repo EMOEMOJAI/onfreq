@@ -254,8 +254,10 @@ describe('polling through the Durable Object', () => {
     await evictDurableObject(stub());
     now += 60_000;
     await expect(configuredPoll()).resolves.toEqual({ skipped: false });
+    // The retried POST at +120s is followed by one edit in the same poll: a
+    // retry's nonce may have returned an older copy, so its content is refreshed.
     expect(calls.filter((call) => call.channel === 'test-channel').map((call) => call.at))
-      .toEqual([START, START + 120_000]);
+      .toEqual([START, START + 120_000, START + 120_000]);
     expect((await snapshot())?.state?.[a]?.messages).toHaveLength(2);
   });
 
@@ -982,6 +984,21 @@ describe('polling through the Durable Object', () => {
     expect(posts[0]!.nonce).not.toBe(posts[1]!.nonce);
   });
 
+  it('refreshes a retried ONLINE card, since its nonce may have returned an older copy', async () => {
+    await seed({});
+    feed = [entry(a)];
+    failureStatus = 503;
+    failures.add('POST');
+    await poll();
+    failures.clear();
+    await nextPoll();
+    const posted = sent.filter((message) => message.method === 'POST').at(-1)!;
+    expect(sent.at(-1)).toMatchObject({ method: 'PATCH', id: posted.id });
+    const count = sent.length;
+    await nextPoll();
+    expect(sent).toHaveLength(count);
+  });
+
   it('does not retry an ONLINE card that Discord accepted without returning its id', async () => {
     await seed({});
     feed = [entry(a)];
@@ -1408,6 +1425,11 @@ describe('polling through the Durable Object', () => {
       expect((await nextPoll()).status).toBe(200);
       const retry = sent.filter((message) => message.method === 'POST').at(-1)!;
       expect(retry.nonce).toBe(failedRepost.nonce);
+      // The retried page's content is unknown (its nonce may have returned an
+      // older copy), so it is refreshed by an edit on the next poll.
+      expect((await snapshot())!.rosterMessages!.find((ref) => ref.messageId === retry.id)?.onlineEmbed).toBeUndefined();
+      expect((await nextPoll()).status).toBe(200);
+      expect(sent.at(-1)).toMatchObject({ method: 'PATCH', id: retry.id });
     });
 
     it('keeps continuations until a failed parent edit has succeeded', async () => {
