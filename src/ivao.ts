@@ -85,12 +85,20 @@ export function normalizeAtc(entry: IvaoAtcSummaryEntry): OnlineAtc {
 const MAX_CALLSIGN_LENGTH = 32;
 const MAX_TEXT_LENGTH = 128;
 const MAX_ICAO_LENGTH = 8;
-/** Callsigns are plain identifiers; anything else is rejected, not rewritten. */
-const CALLSIGN_PATTERN = /^[A-Za-z0-9_-]{2,32}$/;
-/** A decimal MHz value such as `118.1` or `121.500`; no hex, exponent or sign. */
-const FREQUENCY_STRING_PATTERN = /^\d{2,3}(\.\d{1,3})?$/;
+/**
+ * Callsigns are plain identifiers; anything else is rejected, not rewritten.
+ * A leading `__` is rejected too, so a callsign can never be `__proto__` or
+ * a similar special key in the callsign-keyed session map.
+ */
+const CALLSIGN_PATTERN = /^(?!__)[A-Za-z0-9_-]{2,32}$/;
+/** A decimal MHz value such as `118.1`, `121.500` or `0.000`; no hex, exponent or sign. */
+const FREQUENCY_STRING_PATTERN = /^\d{1,3}(\.\d{1,3})?$/;
+/** Frequencies at or above this many MHz are implausible and read as untuned. */
+const MAX_FREQUENCY_MHZ = 1000;
 /** The whole-network summary is large; everything else keeps the default cap. */
-const IVAO_ATC_SUMMARY_MAX_BYTES = 8 * 1024 * 1024;
+const IVAO_ATC_SUMMARY_MAX_BYTES = 2 * 1024 * 1024;
+/** More entries than this is not a real network snapshot; bounds sanitising work. */
+const IVAO_ATC_SUMMARY_MAX_ENTRIES = 20_000;
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -101,23 +109,45 @@ function isPositiveId(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 
-/** The feed occasionally reports frequency as a numeric string. */
+/**
+ * The feed occasionally reports frequency as a numeric string. Zero (`0`,
+ * `"0.000"`) and any implausible value (negative, or 1000 MHz and above) read
+ * as 0, i.e. connected but untuned, so the entry is kept: an established
+ * session keeps its last frequency and a new one waits, rather than the entry
+ * vanishing and producing a false OFFLINE. Only a non-numeric value, or a
+ * string that is not plain decimal, drops the entry.
+ */
 function coerceFrequency(value: unknown): number | null {
-  if (isFiniteNumber(value)) return value;
-  if (typeof value === 'string' && FREQUENCY_STRING_PATTERN.test(value.trim())) {
-    return Number(value.trim());
-  }
-  return null;
+  let frequency: number;
+  if (isFiniteNumber(value)) frequency = value;
+  else if (typeof value === 'string' && FREQUENCY_STRING_PATTERN.test(value.trim())) frequency = Number(value.trim());
+  else return null;
+  return frequency > 0 && frequency < MAX_FREQUENCY_MHZ ? frequency : 0;
 }
 
 /**
- * Control characters become spaces and invisible format characters (bidi
- * overrides, zero-width joiners) are removed, so feed text cannot forge
- * extra lines or reorder what Discord displays.
+ * The longest prefix of `text` within `maxUnits` UTF-16 code units that ends
+ * on a code-point boundary, so a surrogate pair is never split into invalid text.
+ */
+export function sliceCodePoints(text: string, maxUnits: number): string {
+  if (text.length <= maxUnits) return text;
+  let end = 0;
+  for (const char of text) {
+    if (end + char.length > maxUnits) break;
+    end += char.length;
+  }
+  return text.slice(0, end);
+}
+
+/**
+ * Control characters and Unicode line/paragraph separators become spaces and
+ * invisible format characters (bidi overrides, zero-width joiners) are
+ * removed, so feed text cannot forge extra lines or reorder what Discord
+ * displays. The cut never splits a surrogate pair.
  */
 function truncate(value: string, max: number): string {
-  const clean = value.replace(/\p{Cc}/gu, ' ').replace(/\p{Cf}/gu, '');
-  return clean.length > max ? clean.slice(0, max) : clean;
+  const clean = value.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ').replace(/\p{Cf}/gu, '');
+  return sliceCodePoints(clean, max);
 }
 
 function sanitizeAirport(raw: unknown): NonNullable<IvaoAtcSummaryEntry['atcPosition']>['airport'] {
@@ -448,6 +478,9 @@ export async function fetchDivisionAtc(
   const entries = (await res.json()) as unknown[];
   if (!Array.isArray(entries)) {
     throw new Error('IVAO API returned an unexpected payload');
+  }
+  if (entries.length > IVAO_ATC_SUMMARY_MAX_ENTRIES) {
+    throw new Error('IVAO API returned too many entries; treating as feed outage');
   }
   if (entries.length === 0) {
     throw new Error('IVAO API returned zero ATC worldwide; treating as feed outage');

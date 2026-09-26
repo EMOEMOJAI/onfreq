@@ -6,9 +6,10 @@ import {
   firOf,
   type FirLabel,
 } from './config';
-import { hasFrequency } from './ivao';
+import { hasFrequency, sliceCodePoints } from './ivao';
 import type { OfflineEvent, OnlineAtc, TrackedAtc } from './types';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
+import { ResponseTooLargeError } from './http';
 import { countryCode } from './member-country';
 
 export interface DiscordEmbed {
@@ -40,22 +41,24 @@ export function formatDuration(totalSeconds: number): string {
 /**
  * Escape characters Discord treats as markdown or mentions, so IVAO-derived
  * text can't break embed formatting or invoke `<@&123>`-style pings. Runs of
- * CR/LF are collapsed to a single space so injected newlines can't fake extra
- * embed lines. An underscore between two letters or digits (as in `EGLL_TWR`)
- * cannot start or end emphasis, so it is left readable.
+ * CR/LF and Unicode line/paragraph separators are collapsed to a single space
+ * so injected newlines can't fake extra embed lines. An underscore between
+ * two letters or digits (as in `EGLL_TWR`) cannot start or end emphasis, so it
+ * is left readable.
  *
  * Invisible format characters (bidi overrides, zero-width characters) are
- * removed; a leading `#` or `-` is escaped so it cannot start a header or list
- * item; `://` is written as `:\/\/`, which Discord displays as `://` without
- * turning the text into a clickable link.
+ * removed; a leading `#`, `-` or ordered-list marker (`1.`) is escaped so it
+ * cannot start a header or list item; `://` is written as `:\/\/`, which
+ * Discord displays as `://` without turning the text into a clickable link.
  */
 export function escapeMarkdown(text: string): string {
-  return text.replace(/\p{Cf}/gu, '').replace(/[\r\n]+/g, ' ')
+  return text.replace(/\p{Cf}/gu, '').replace(/[\r\n\u2028\u2029]+/g, ' ')
     .replace(/[\\*_~`|[\]<>]/g, (char, index: number, whole: string) =>
       char === '_' && /[A-Za-z0-9]/.test(whole[index - 1] ?? '') && /[A-Za-z0-9]/.test(whole[index + 1] ?? '')
         ? char : `\\${char}`)
     .replace(/:\/\//g, ':\\/\\/')
-    .replace(/^(\s*)([#-])/, '$1\\$2');
+    .replace(/^(\s*)([#-])/, '$1\\$2')
+    .replace(/^(\s*)(\d+)\.(?=\s)/, '$1$2\\.');
 }
 
 function stationLine(atc: TrackedAtc): string | undefined {
@@ -160,7 +163,8 @@ export function formatRoster(others: OnlineAtc[], labels: FirLabel[] = []): stri
       // rest are indented so the callsign column stays aligned.
       const label =
         i === 0 ? `${group.flag} ${group.name.padEnd(FIR_NAME_WIDTH)}` : ' '.repeat(FIR_COL_WIDTH);
-      const station = stripBackticks((atc.station ?? '').slice(0, stationWidth)).padEnd(stationWidth);
+      // Cut on a code-point boundary: a split surrogate pair is invalid text.
+      const station = stripBackticks(sliceCodePoints(atc.station ?? '', stationWidth)).padEnd(stationWidth);
       lines.push(
         `${label}${stripBackticks(atc.callsign).padEnd(callsignWidth)}  ${station}  ${atc.frequency.toFixed(3)}`,
       );
@@ -390,6 +394,44 @@ export class DiscordApiError extends Error {
   }
 }
 
+/**
+ * Discord answered with a body over the response cap (a channel scan whose
+ * messages were stuffed with large content, say). Discord is reachable, so
+ * this never marks an outage; it is classified as a definite 4xx-like
+ * rejection so every budgeted caller (`countsAgainstBudget`) gives up after
+ * its bounded retries instead of retrying every poll. The synthetic status
+ * never reaches Discord; `upstreamStatus` is the status of the discarded response.
+ */
+export class DiscordResponseTooLargeError extends DiscordApiError {
+  constructor(readonly upstreamStatus: number) {
+    super(413, '');
+    this.name = 'DiscordResponseTooLargeError';
+    this.message = 'Discord API response exceeded size limit';
+  }
+}
+
+/**
+ * A stored message id (from an older deploy, or corrupt storage) that is not
+ * a snowflake is never placed in a request path. No request is made; the
+ * message is reported as gone (it cannot be addressed), with a non-404 status
+ * so a delete of it is budgeted rather than silently treated as done.
+ */
+export class DiscordInvalidMessageIdError extends DiscordApiError {
+  constructor() {
+    super(400, '');
+    this.name = 'DiscordInvalidMessageIdError';
+    this.message = 'Stored Discord message id is not a snowflake; request skipped';
+  }
+
+  override get isGone(): boolean {
+    return true;
+  }
+}
+
+function assertMessageId(messageId: string): void {
+  if (!SNOWFLAKE_PATTERN.test(messageId)) throw new DiscordInvalidMessageIdError();
+}
+
 const MAX_ATTEMPTS = 4;
 
 /** How long later calls in the same poll fail fast after a request exhausts its 5xx retries. */
@@ -430,6 +472,13 @@ async function discordRequest(
         // A zero-second rejection permits a bounded immediate retry.
         if (err.requestMade && err.retryAt <= Date.now() && attempt < MAX_ATTEMPTS) return null;
         throw err;
+      }
+      if (err instanceof ResponseTooLargeError) {
+        // Discord responded, so this is neither an outage nor a POST failure.
+        if (err.status < 500) limits.noteDiscordResponded();
+        // An accepted POST created its message even though its id is unreadable.
+        if (method === 'POST' && err.status >= 200 && err.status < 300) throw new DiscordUnconfirmedPostError();
+        throw new DiscordResponseTooLargeError(err.status);
       }
       // A thrown fetch error (timeout, network failure, TypeError) never
       // gets an in-request retry — there is no response to retry against.
@@ -513,6 +562,7 @@ export async function editMessage(
   embed: DiscordEmbed,
   limits: DiscordRateLimits,
 ): Promise<void> {
+  assertMessageId(messageId);
   await discordRequest(botToken, 'PATCH', `/channels/${channelId}/messages/${messageId}`, {
     embeds: [embed],
   }, limits);
@@ -591,6 +641,7 @@ export function findBotReplies(
 /** Remove an obsolete roster continuation; already-deleted messages are clean. */
 export async function deleteMessage(botToken: string, channelId: string, messageId: string, limits: DiscordRateLimits): Promise<void> {
   try {
+    assertMessageId(messageId);
     await discordRequest(botToken, 'DELETE', `/channels/${channelId}/messages/${messageId}`, undefined, limits);
   } catch (err) {
     if (!(err instanceof DiscordApiError && err.status === 404)) throw err;
