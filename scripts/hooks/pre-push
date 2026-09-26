@@ -13,7 +13,34 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-# The checks never print matched private values; stdin (pushed refs) is unused.
+# The checks read the index and HEAD history, so they only cover what is pushed
+# when every pushed commit is HEAD and the index matches HEAD.
+if ! head=$(git rev-parse --verify --quiet HEAD); then
+  printf 'pre-push: BLOCKED — no HEAD commit to check.\n' >&2
+  exit 1
+fi
+blocked=false
+# stdin lines: <local ref> <local oid> <remote ref> <remote oid>. The -n test
+# also handles a final line without a newline.
+while read -r _local_ref local_oid _remote_ref _remote_oid || [ -n "${local_oid:-}" ]; do
+  case "$local_oid" in
+    '') ;;
+    *[!0]*) [ "$local_oid" = "$head" ] || blocked=true ;;
+    *) ;; # all zeros: a deletion pushes no content
+  esac
+done
+if [ "$blocked" = true ]; then
+  printf 'pre-push: BLOCKED — pushed commits must be the checked-out HEAD.\n' >&2
+  printf 'Check out the commit you want to publish, then push it from a clean checkout of HEAD.\n' >&2
+  exit 1
+fi
+if ! git diff --cached --quiet --no-ext-diff --no-textconv --ignore-submodules=none HEAD --; then
+  printf 'pre-push: BLOCKED — staged changes differ from HEAD, so the checks would not cover the pushed commit.\n' >&2
+  printf 'Commit or unstage them, then push from a clean checkout of HEAD.\n' >&2
+  exit 1
+fi
+
+# The checks never print matched private values.
 if ! npm run --silent check:privacy </dev/null || ! npm run --silent check:setup </dev/null; then
   printf '\npre-push: BLOCKED — privacy or deployment setup checks failed.\n' >&2
   printf 'Fix the reported files locally before pushing.\n' >&2

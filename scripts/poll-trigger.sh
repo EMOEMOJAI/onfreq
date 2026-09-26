@@ -18,12 +18,26 @@ log() {
 }
 
 # Other local accounts must not read the token or replace the endpoint. Accept
-# only a real directory/regular file with no group or other permission bits
-# (symlinks are refused). `ls -ld` is portable across BSD and GNU; its first ten
-# characters are the type and mode, whatever flags (@, +) follow.
+# only a real directory/regular file owned by this user with no group or other
+# permission bits (symlinks are refused). `ls -ldn` is portable across BSD and
+# GNU: its first ten characters are the type and mode, whatever flags (@, +)
+# follow, and its third field is the numeric owner. On macOS, `ls -e` prints
+# each ACL entry on its own line; any entry could grant another account access.
+uid=$(id -u)
 private_path() {
-  mode=$(ls -ld -- "$2" 2>/dev/null) || return 1
-  case "$mode" in "$1"???------*) return 0 ;; *) return 1 ;; esac
+  if [ "$(uname -s)" = Darwin ]; then
+    listing=$(/bin/ls -ldne -- "$2" 2>/dev/null) || return 1
+  else
+    listing=$(ls -ldn -- "$2" 2>/dev/null) || return 1
+  fi
+  case "$listing" in *'
+'*) return 1 ;; esac
+  case "$listing" in "$1"???------*) ;; *) return 1 ;; esac
+  set -f
+  # shellcheck disable=SC2086 # split the listing into its fields
+  set -- $listing
+  set +f
+  [ "$#" -ge 3 ] && [ "$3" = "$uid" ]
 }
 private=true
 if [ -e "$poll_dir" ] || [ -L "$poll_dir" ]; then

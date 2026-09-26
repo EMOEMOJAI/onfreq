@@ -121,3 +121,30 @@ test('refuses to read credentials that other local accounts can access, without 
   writeFileSync(join(f.dir, 'poll-secret'), 'synthetic-poll-token', { mode: 0o600 });
   assert.equal(f.run().status, 0);
 });
+
+test('refuses credentials owned by another account, without contacting curl', (t) => {
+  const f = fixture(t);
+  // chown needs root, so report a different current user instead.
+  writeFileSync(join(f.dir, 'id'), '#!/bin/sh\nprintf \'%s\\n\' "$TEST_UID"\n', { mode: 0o700 });
+  const result = f.run('200', { TEST_UID: String(process.getuid() + 1) });
+  assert.equal(result.status, 1);
+  assert.equal(existsSync(join(f.dir, 'arguments')), false);
+  assert.match(f.read('poll.log'), / FAIL permissions$/m);
+  assert.equal(f.run('200', { TEST_UID: String(process.getuid()) }).status, 0);
+});
+
+test('refuses macOS ACLs that grant other accounts access, without contacting curl',
+  { skip: process.platform !== 'darwin' && 'macOS ACLs only' }, (t) => {
+    const f = fixture(t);
+    for (const name of ['poll-secret', 'poll-endpoint', '.']) {
+      const path = join(f.dir, name);
+      assert.equal(spawnSync('/bin/chmod', ['+a', 'everyone allow read', path]).status, 0);
+      const result = f.run();
+      assert.equal(spawnSync('/bin/chmod', ['-N', path]).status, 0);
+      assert.equal(result.status, 1, name);
+      assert.equal(existsSync(join(f.dir, 'arguments')), false);
+    }
+    assert.equal(f.read('poll.log').trim().split('\n').length, 3);
+    assert.ok(f.read('poll.log').trim().split('\n').every((line) => / FAIL permissions$/.test(line)));
+    assert.equal(f.run().status, 0);
+  });

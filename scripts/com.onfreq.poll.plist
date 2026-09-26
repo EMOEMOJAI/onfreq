@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   launchd agent that triggers the bot's poll endpoint every 60s.
-  Replace __HOME__ with your home directory, then:
+  Replace __HOME__ with your home directory, then (see docs/setup.md):
 
+    launchctl bootout gui/$(id -u)/com.onfreq.poll 2>/dev/null || true
     cp com.onfreq.poll.plist ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.onfreq.poll.plist
 
