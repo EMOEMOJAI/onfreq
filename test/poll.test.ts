@@ -999,6 +999,20 @@ describe('polling through the Durable Object', () => {
     expect(sent).toHaveLength(count);
   });
 
+  it('refreshes the first card of a session that tuned its frequency after connecting', async () => {
+    await seed({});
+    feed = [entry(a, 0)];
+    await poll();
+    expect(sent).toHaveLength(0);
+    feed = [entry(a)];
+    await nextPoll();
+    // Its nonce inputs predate this poll, so an unsaved earlier attempt could
+    // have used it: the posted card is refreshed once, then left alone.
+    expect(sent.map((message) => message.method)).toEqual(['POST', 'PATCH']);
+    await nextPoll();
+    expect(sent).toHaveLength(2);
+  });
+
   it('does not retry an ONLINE card that Discord accepted without returning its id', async () => {
     await seed({});
     feed = [entry(a)];

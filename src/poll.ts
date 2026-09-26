@@ -444,7 +444,9 @@ export async function runPoll(
     // embeds and just run the bookkeeping below.
     const { posted, failed, unconfirmed } = targets.length
       ? await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels,
-        !wentOnline.some((atc) => atc.callsign === entry.callsign))
+        // A session first seen before this poll may have used its nonce in an
+        // earlier attempt, even one whose state was never saved.
+        entry.since !== nowIso)
       : { posted: [] as PostedMessage[], failed: new Map<string, unknown>(), unconfirmed: new Set<string>() };
     delivered += posted.length + unconfirmed.size;
     if (failed.size) deliveryFailed = true;

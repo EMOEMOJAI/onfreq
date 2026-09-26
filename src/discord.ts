@@ -373,7 +373,7 @@ function sleep(ms: number): Promise<void> {
  */
 async function discordRequest(
   botToken: string,
-  method: 'POST' | 'PATCH' | 'DELETE',
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
   path: string,
   payload: unknown,
   limits: DiscordRateLimits,
@@ -480,6 +480,37 @@ export async function editMessage(
 }
 
 /** Remove an obsolete roster continuation; already-deleted messages are clean. */
+/** The bot's user id, which Discord encodes as base64 in the token's first segment. */
+function botUserId(botToken: string): string | undefined {
+  try {
+    const id = atob(botToken.split('.')[0]!.replace(/-/g, '+').replace(/_/g, '/'));
+    return /^\d{17,20}$/.test(id) ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Ids of this bot's replies to a message among the 50 messages after it, so
+ * roster pages whose POST succeeded without the bot learning their id can be
+ * found and removed. Returns nothing when the bot's own id is unknown.
+ */
+export async function findBotReplies(
+  botToken: string, channelId: string, parentMessageId: string, limits: DiscordRateLimits,
+): Promise<string[]> {
+  const botId = botUserId(botToken);
+  if (!botId) return [];
+  const res = await discordRequest(botToken, 'GET',
+    `/channels/${channelId}/messages?after=${parentMessageId}&limit=50`, undefined, limits);
+  const list = await res.json().catch(() => null) as unknown;
+  if (!Array.isArray(list)) throw new Error('Discord returned an invalid message list');
+  return list.flatMap((item: unknown) => {
+    const message = item as { id?: unknown; author?: { id?: unknown }; message_reference?: { message_id?: unknown } };
+    return typeof message?.id === 'string' && message.author?.id === botId &&
+      message.message_reference?.message_id === parentMessageId ? [message.id] : [];
+  });
+}
+
 export async function deleteMessage(botToken: string, channelId: string, messageId: string, limits: DiscordRateLimits): Promise<void> {
   try {
     await discordRequest(botToken, 'DELETE', `/channels/${channelId}/messages/${messageId}`, undefined, limits);

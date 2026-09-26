@@ -1,5 +1,6 @@
 import {
-  deleteMessage, DiscordApiError, DiscordUnconfirmedPostError, editMessage, messageNonce, postMessage, type DiscordEmbed,
+  deleteMessage, DiscordApiError, DiscordUnconfirmedPostError, editMessage, findBotReplies, messageNonce, postMessage,
+  type DiscordEmbed,
 } from './discord';
 import { countsAgainstBudget, type RosterMessage, type RosterPostAttempt } from './types';
 import type { DiscordRateLimits } from './discord-rate-limit';
@@ -112,7 +113,7 @@ export async function syncRosterMessages(
         console.error(JSON.stringify({
           event: 'roster_page_abandoned', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
         }));
-        postAttemptsByKey.set(key, { ...entry, abandoned: true });
+        postAttemptsByKey.set(key, { ...entry, nonceKey, abandoned: true });
       };
       // Every fresh post gets its own nonce key, kept across its retries: a
       // re-post after a gone copy, or after the roster shrank and grew again,
@@ -152,7 +153,7 @@ export async function syncRosterMessages(
             event: 'roster_post_unconfirmed', channelId: target.channelId, parentMessageId: target.parentMessageId, page,
           }));
           postAttemptsByKey.set(key, {
-            channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: 0, abandoned: true,
+            channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: 0, nonceKey, abandoned: true,
           });
           continue;
         }
@@ -167,8 +168,27 @@ export async function syncRosterMessages(
   // or retry against.
   // A target whose parent edit failed this poll has unknown pages: keep all
   // of its entries, as its existing continuations are kept above.
-  const postAttempts = [...postAttemptsByKey.values()].filter((entry) => targets.some((target) =>
-    target.channelId === entry.channelId && target.parentMessageId === entry.parentMessageId &&
-    (target.embeds === undefined || entry.page < target.embeds.length)));
+  const postAttempts: RosterPostAttempt[] = [];
+  const orphanParents = new Map<string, { channelId: string; parentMessageId: string }>();
+  for (const entry of postAttemptsByKey.values()) {
+    const live = targets.some((target) =>
+      target.channelId === entry.channelId && target.parentMessageId === entry.parentMessageId &&
+      (target.embeds === undefined || entry.page < target.embeds.length));
+    if (live) postAttempts.push(entry);
+    // A dropped page that was ever posted may exist without its id being
+    // known (a 5xx hid the success, or Discord omitted the id).
+    else if (entry.nonceKey) orphanParents.set(`${entry.channelId}:${entry.parentMessageId}`, entry);
+  }
+  // Best effort: remove this bot's untracked replies to those parents once.
+  const tracked = new Set(messages.map((ref) => ref.messageId));
+  for (const { channelId, parentMessageId } of orphanParents.values()) {
+    try {
+      for (const id of await findBotReplies(botToken, channelId, parentMessageId, limits)) {
+        if (!tracked.has(id)) await deleteMessage(botToken, channelId, id, limits);
+      }
+    } catch (err) {
+      console.error(JSON.stringify({ event: 'roster_orphan_sweep_failed', channelId, parentMessageId, error: String(err) }));
+    }
+  }
   return { messages, postAttempts, failed };
 }
