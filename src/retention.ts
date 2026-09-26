@@ -13,6 +13,9 @@ export function cleanupGcaCopies(storage: DurableObjectStorage, apply: boolean, 
   return storage.transactionSync(() => {
     // Only terminal member reminders qualify: these cannot create a new copy.
     // Missing parent rows are retained because their age cannot be established.
+    // In practice only 'sent' is currently reachable here; 'reserved' and
+    // 'failed' are included defensively in case a future status transition
+    // ever leaves a reminder row in one of those states past its cutoff.
     const candidates = sql.exec<{ session_key: string }>(`SELECT c.session_key FROM gca_copies c
       JOIN gca_reminders r ON r.session_key = c.session_key
       WHERE r.last_seen < ? AND r.status IN ('sent', 'reserved', 'failed')
