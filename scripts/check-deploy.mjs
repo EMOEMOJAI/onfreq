@@ -1,6 +1,6 @@
 import { lstatSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // A copied public template must never silently replace an existing deployment.
@@ -25,13 +25,16 @@ function exists(path) {
 }
 
 // A Git worktree of a private checkout lacks the ignored private config, so also
-// check the main worktree (parent of the common Git directory). Without Git, or
-// outside a repository, only this checkout can be checked.
+// check the main worktree: the first `worktree` line Git lists. GIT_* variables
+// from hooks or npm could point Git at another repository, so they are removed.
+// Without Git, or outside a repository, only this checkout can be checked; with
+// a separate Git directory, Git lists that directory instead of the checkout.
 function mainWorktree() {
   try {
-    const common = execFileSync('git', ['rev-parse', '--git-common-dir'],
-      { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim();
-    return common ? dirname(resolve(root, common)) : null;
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+    const [first = ''] = execFileSync('git', ['worktree', 'list', '--porcelain'],
+      { cwd: root, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).split('\n');
+    return first.startsWith('worktree ') ? first.slice('worktree '.length) : null;
   } catch {
     return null;
   }

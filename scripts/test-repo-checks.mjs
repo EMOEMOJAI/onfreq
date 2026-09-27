@@ -4,7 +4,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { imagePrivacy, privateCommitEmails, privatePath, publicConfig, wranglerConfigErrors } from './check-privacy.mjs';
+import { imagePrivacy, privateCommitEmails, privatePath, publicConfig, rangeArgs, wranglerConfigErrors } from './check-privacy.mjs';
 import { checkExternalLinks, checkLocalLinks, documentLinks } from './check-links.mjs';
 import { isolatedEnv, testDeployGuard, validateHooks, validateSetup } from './check-setup.mjs';
 import { jsonc } from './repo-files.mjs';
@@ -52,6 +52,15 @@ test('rejects operator IDs and variables without revealing their values', () => 
     vars: { DISCORD_CHANNEL_IDS: 'synthetic-private-value' }, env: { production: {} } });
   assert.ok(failures.length >= 3);
   assert.doesNotMatch(failures.join(' '), /synthetic-private-value/);
+});
+
+test('pushed ranges exclude only known commits and the pushed remote; others check more history', () => {
+  const [local, known, unknown, zero] = ['a', 'b', 'c', '0'].map((c) => c.repeat(40));
+  const hasCommit = (hash) => hash === known;
+  assert.deepEqual(rangeArgs(local, [known, 'origin'], ['origin', 'private-history'], hasCommit),
+    [local, '--not', known, '--remotes=origin']);
+  assert.deepEqual(rangeArgs(local, [zero, unknown, 'https://example.test/x.git', '', '--all'], ['origin'], hasCommit), [local]);
+  for (const bad of [zero, 'HEAD', '--all', undefined]) assert.throws(() => rangeArgs(bad, [], [], hasCommit));
 });
 
 test('checks both raw commit emails and redacts rejected identities', () => {
@@ -191,6 +200,17 @@ test('public deploy guard also sees private config in the main checkout of a Git
   }
   // Removing the private config allows the public deployment again.
   assert.equal(guard(linked).status, 0);
+
+  // Inherited GIT_* variables must not redirect the lookup to another repository.
+  writeFileSync(join(main, 'wrangler.local.jsonc'), '{}');
+  const other = join(base, 'other');
+  mkdirSync(other);
+  git(other, 'init', '--quiet');
+  const redirected = spawnSync(process.execPath, ['scripts/check-deploy.mjs'],
+    { cwd: linked, env: { ...env, GIT_DIR: join(other, '.git'), GIT_WORK_TREE: other }, encoding: 'utf8' });
+  assert.equal(redirected.status, 1);
+  assert.match(redirected.stderr, /Private deployment config detected/);
+  rmSync(join(main, 'wrangler.local.jsonc'));
 });
 
 test('parses Markdown references, nested badge images, HTML and duplicate heading anchors', () => {

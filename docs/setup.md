@@ -94,7 +94,7 @@ chmod 600 "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
 ```
 
-The agent runs every minute with `/bin/sh` while the Mac is awake and logged in. The files must be owned by your account, with no group or other access and, on macOS, no ACL entries (check with `ls -le`). Rerun the whole block to upgrade or move files; it preserves the endpoint and secret and avoids loading duplicate pollers.
+The agent runs every minute with `/bin/sh` while the Mac is awake and logged in. The files must be owned by your account, with no group or other access and, on macOS, no ACL entries (check with `ls -lde ~/.onfreq; ls -le ~/.onfreq`). Rerun the whole block to upgrade or move files; it preserves the endpoint and secret and avoids loading duplicate pollers.
 
 For failures, check `npm run tail`. A 401 means the token is wrong; a 403 from Discord usually means channel permissions are missing. Never post unredacted logs publicly.
 

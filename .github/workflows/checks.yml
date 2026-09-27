@@ -80,6 +80,14 @@ jobs:
       - name: Test Mac polling
         run: node --test scripts/test-poll-trigger.mjs
 
+      # Hook tests import the repository checks, which need jsonc-parser.
+      - name: Install check dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      # Synthetic repositories and a fake npm; runs the hooks with macOS /bin/sh.
+      - name: Test Git hooks
+        run: node --test scripts/test-hooks.mjs
+
   checks:
     # Use disposable GitHub-hosted machines. Never attach a persistent/private
     # runner to this repository: pull requests can change workflow YAML.
