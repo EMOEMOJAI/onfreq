@@ -670,7 +670,8 @@ test('pre-commit Gitleaks scan cannot be emptied by configuration variables (S19
         const result = f.commitHook(options);
         const label = JSON.stringify(Object.keys(env)) + (options.path ? ' shim' : '') + (options.commit ? ' git commit' : '');
         assert.equal(result.status, 1, `${label}: ${result.stderr}`);
-        assert.match(result.stderr, /staged changes look like they contain a secret/, label);
+        assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret; see the output above/, label);
+        assert.doesNotMatch(result.stderr, /could not read the staged changes/, label);
         assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)), label);
       }
     }
@@ -718,5 +719,33 @@ test('pre-commit blocks when Git cannot read the staged changes (S19-31)', (t) =
   rmSync(join(f.repo, 'staged.txt'));
   const result = f.commitHook();
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /could not read the staged changes for the secret scan/);
+  assert.match(result.stderr, /pre-commit: BLOCKED — could not read the staged changes for the secret scan\.\n/);
+  assert.doesNotMatch(result.stderr, /or the scan failed|found a secret/);
+});
+
+test('pre-commit reports a Gitleaks that exits before reading a large staged diff as a scan or read failure (C62)', (t) => {
+  const f = fixture(t);
+  // Well beyond any pipe buffer, so Git fails on the closed pipe.
+  writeFileSync(join(f.repo, 'large.txt'), `${'synthetic filler line for the staged diff\n'.repeat(40000)}`);
+  f.git('add', 'large.txt');
+  const head = f.git('rev-parse', 'HEAD');
+  // Like Gitleaks on a bad configuration: fails without reading standard input.
+  writeFileSync(join(f.repo, '..', 'bin', 'gitleaks'), '#!/bin/sh\nprintf \'synthetic gitleaks error\\n\' >&2\nexit 1\n',
+    { mode: 0o700 });
+  for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+    const label = options.path ? 'shim' : options.commit ? 'git commit' : 'hook';
+    const result = f.commitHook(options);
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, /synthetic gitleaks error/, label);
+    assert.match(result.stderr,
+      /pre-commit: BLOCKED — could not read the staged changes for the secret scan, or the scan failed; see the output above/, label);
+    assert.doesNotMatch(result.stderr, /secret scan\.\n|found a secret/, label);
+  }
+  // A Gitleaks that reads everything and exits non-zero names only the scan.
+  writeFileSync(join(f.repo, '..', 'bin', 'gitleaks'), '#!/bin/sh\ncat >/dev/null\nexit 1\n', { mode: 0o700 });
+  const result = f.commitHook();
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret; see the output above/);
+  assert.doesNotMatch(result.stderr, /could not read the staged changes/);
+  assert.equal(f.git('rev-parse', 'HEAD'), head, 'no commit was made');
 });
