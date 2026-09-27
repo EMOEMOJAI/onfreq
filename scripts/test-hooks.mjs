@@ -749,3 +749,38 @@ test('pre-commit reports a Gitleaks that exits before reading a large staged dif
   assert.doesNotMatch(result.stderr, /could not read the staged changes/);
   assert.equal(f.git('rev-parse', 'HEAD'), head, 'no commit was made');
 });
+
+test('pre-commit passes a commit that removes a committed secret, but blocks an added one (C63)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    const secret = new RegExp(token.slice(4));
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = one\n`);
+    f.git('add', 'config.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret committed without the hook');
+    const run = (options) => [options.path ? 'shim' : options.commit ? 'git commit' : 'hook', f.commitHook(options)];
+    // Removing the secret, as the pre-push advice asks, leaves it as a removed line.
+    f.git('rm', '--quiet', '--force', 'config.txt');
+    let head = f.git('rev-parse', 'HEAD');
+    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+      const [label, result] = run(options);
+      assert.equal(result.status, 0, `removal ${label}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+    }
+    assert.notEqual(f.git('rev-parse', 'HEAD'), head, 'the removal was committed');
+    // Adding a secret is still blocked, including one on a line that replaces a removed one.
+    stageSyntheticKey(f);
+    f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret committed without the hook again');
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token} # replaced\n`);
+    writeFileSync(join(f.repo, 'other.txt'), `aws_access_key_id = ${token}\n`);
+    f.git('add', 'config.txt', 'other.txt');
+    head = f.git('rev-parse', 'HEAD');
+    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+      const [label, result] = run(options);
+      assert.equal(result.status, 1, `addition ${label}: ${result.stderr}`);
+      assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret; see the output above/, label);
+      assert.doesNotMatch(result.stderr, /could not read the staged changes/, label);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+    }
+    assert.equal(f.git('rev-parse', 'HEAD'), head, 'no commit was made');
+  });
