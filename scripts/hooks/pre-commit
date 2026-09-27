@@ -33,10 +33,11 @@ trap 'exit 1' HUP INT TERM
 # scripts/secret-scan.sh, context and removed lines are dropped, as is the
 # existing line Git appends to each hunk header (@@ -2 +2 @@ <line>), so a
 # commit that removes a leaked secret, or edits a line below one, is not blocked
-# by it. A failed Git or filter stage leaves a marker, so unreadable staged
-# changes block the commit.
+# by it; --inter-hunk-context=0 keeps diff.interHunkContext from merging nearby
+# hunks and adding existing lines back as context. A failed Git or filter stage
+# leaves a marker, so unreadable staged changes block the commit.
 status=0
-output=$({ git diff --cached -U0 --no-ext-diff --no-textconv --no-color --text </dev/null ||
+output=$({ git diff --cached -U0 --inter-hunk-context=0 --no-ext-diff --no-textconv --no-color --text </dev/null ||
     : >"$tmp/failed"; } |
   { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
   gitleaks stdin --no-banner --redact 2>&1) || status=$?
