@@ -460,7 +460,8 @@ async function discordRequest(
   limits: DiscordRateLimits,
 ): Promise<Response> {
   for (let attempt = 1; ; attempt++) {
-    const res = await limits.fetch(path, {
+    // A number stands for a 5xx response whose oversized body was discarded.
+    const res: Response | number | null = await limits.fetch(path, {
       method,
       headers: {
         authorization: `Bot ${botToken}`,
@@ -474,8 +475,13 @@ async function discordRequest(
         throw err;
       }
       if (err instanceof ResponseTooLargeError) {
+        // An oversized 5xx is an ordinary server error with its body dropped:
+        // it takes the normal 5xx path below (retries, outage marking, and a
+        // POST whose outcome is unknown). An oversized 429 never gets here;
+        // the rate limiter turns it into a conservative cooldown.
+        if (err.status >= 500) return err.status;
         // Discord responded, so this is neither an outage nor a POST failure.
-        if (err.status < 500) limits.noteDiscordResponded();
+        limits.noteDiscordResponded();
         // An accepted POST created its message even though its id is unreadable.
         if (method === 'POST' && err.status >= 200 && err.status < 300) throw new DiscordUnconfirmedPostError();
         throw new DiscordResponseTooLargeError(err.status);
@@ -488,24 +494,25 @@ async function discordRequest(
       if (method !== 'POST' || limits.notePostFailure()) limits.markOutage(OUTAGE_COOLDOWN_MS);
       throw err;
     });
-    if (!res) continue;
+    if (res === null) continue;
+    const status = typeof res === 'number' ? res : res.status;
     // Any non-5xx response — regardless of method — proves Discord is
     // reachable, so it resets the POST failure streak even when this call
     // was itself a PATCH/DELETE, or a POST that came back with a non-5xx
     // failure such as 404.
-    if (res.status < 500) limits.noteDiscordResponded();
-    if (res.ok) return res;
+    if (status < 500) limits.noteDiscordResponded();
+    if (typeof res !== 'number' && res.ok) return res;
 
-    const body = await res.text();
-    const retryable = method !== 'POST' && res.status >= 500;
+    const body = typeof res === 'number' ? '' : await res.text();
+    const retryable = method !== 'POST' && status >= 500;
     if (!retryable || attempt >= MAX_ATTEMPTS) {
-      if (res.status >= 500) {
+      if (status >= 500) {
         // PATCH/DELETE have exhausted their real retry budget here; POST
         // never retries in-request, so it instead needs a second consecutive
         // 5xx/timeout before an outage is declared.
         if (method !== 'POST' || limits.notePostFailure()) limits.markOutage(OUTAGE_COOLDOWN_MS);
       }
-      throw new DiscordApiError(res.status, body);
+      throw new DiscordApiError(status, body);
     }
     await sleep(500 * 2 ** (attempt - 1));
   }
@@ -588,6 +595,10 @@ function snowflakeTime(id: string): number {
   return Number(BigInt(id) >> 22n) + DISCORD_EPOCH_MS;
 }
 
+/** Messages requested per channel-scan page, and the smaller retry size for an oversized page. */
+const SCAN_PAGE_SIZE = 100;
+const SCAN_FALLBACK_PAGE_SIZE = 25;
+
 /** The fields of a fetched Discord message this bot inspects. */
 export interface FetchedMessage {
   id: string;
@@ -598,7 +609,8 @@ export interface FetchedMessage {
 
 /**
  * Ids of this bot's messages matching `match`, among up to 500 messages
- * posted within the given time window (a minute of slack either side). Used
+ * (fewer once an oversized page forces smaller pages) posted within the
+ * given time window (a minute of slack either side). Used
  * to find messages whose POST succeeded without the bot learning their id.
  * Returns nothing when the bot's own id is unknown.
  */
@@ -610,9 +622,20 @@ export async function findBotMessages(
   if (!botId) return [];
   const found: string[] = [];
   let after = snowflakeAt(window.from - 60_000);
+  let limit = SCAN_PAGE_SIZE;
   for (let page = 0; page < 5; page++) {
-    const res = await discordRequest(botToken, 'GET',
-      `/channels/${channelId}/messages?after=${after}&limit=100`, undefined, limits);
+    const path = () => `/channels/${channelId}/messages?after=${after}&limit=${limit}`;
+    let res: Response;
+    try {
+      res = await discordRequest(botToken, 'GET', path(), undefined, limits);
+    } catch (err) {
+      // Other users' messages can make a full page exceed the response cap.
+      // Retry the same page smaller once, and keep the smaller size for the
+      // rest of the scan, before reporting the lookup as failed.
+      if (!(err instanceof DiscordResponseTooLargeError) || limit === SCAN_FALLBACK_PAGE_SIZE) throw err;
+      limit = SCAN_FALLBACK_PAGE_SIZE;
+      res = await discordRequest(botToken, 'GET', path(), undefined, limits);
+    }
     const list = await res.json().catch(() => null) as unknown;
     if (!Array.isArray(list)) throw new Error('Discord returned an invalid message list');
     let newest = after;
@@ -623,7 +646,7 @@ export async function findBotMessages(
       if (at < window.from - 60_000 || at > window.to + 60_000) continue;
       if (item.author?.id === botId && match(item as FetchedMessage)) found.push(item.id);
     }
-    if (list.length < 100 || newest === after || snowflakeTime(newest) > window.to + 60_000) break;
+    if (list.length < limit || newest === after || snowflakeTime(newest) > window.to + 60_000) break;
     after = newest;
   }
   return found;

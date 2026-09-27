@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { COLOR_ENDED, COLOR_OFFLINE, COLOR_ONLINE, parseFirLabels } from '../src/config';
 import {
   buildOfflineEmbed,
@@ -820,6 +820,8 @@ describe('REST calls', () => {
     const at = 1_800_000_000_000;
     const fetchMock = stubFetch(
       new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
+      // The smaller retry of the same page is oversized too, so the scan gives up.
+      new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
       Response.json({ id: '100000000000000999' }),
     );
     const limits = new DiscordRateLimits();
@@ -831,7 +833,109 @@ describe('REST calls', () => {
     expect((err as DiscordApiError).isGone).toBe(false);
     expect((err as DiscordResponseTooLargeError).upstreamStatus).toBe(200);
     expect((err as Error).message).toBe('Discord API response exceeded size limit');
+    expect(fetchMock.mock.calls.map(([url]) => new URL(String(url)).searchParams.get('limit'))).toEqual(['100', '25']);
     // No outage was marked: the next post in the same poll is still sent.
+    await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
+      .resolves.toBe('100000000000000999');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries an oversized channel scan page with 25 messages and keeps that size for the rest of the scan', async () => {
+    const botId = '100000000000000009';
+    const token = `${btoa(botId)}.synthetic.token`;
+    const at = 1_800_000_000_000;
+    const idAt = (n: number) => ((BigInt(at - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
+    const page = Array.from({ length: 25 }, (_, n) => ({ id: idAt(n + 1), author: { id: n === 7 ? botId : '100000000000000001' } }));
+    const fetchMock = stubFetch(
+      new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
+      Response.json(page),
+      Response.json([{ id: idAt(100), author: { id: botId } }]),
+    );
+    await expect(findBotMessages(token, '100000000000000123', { from: at, to: at }, new DiscordRateLimits(), () => true))
+      .resolves.toEqual([idAt(8), idAt(100)]);
+    const requested = fetchMock.mock.calls.map(([url]) => new URL(String(url)).searchParams);
+    expect(requested.map((params) => params.get('limit'))).toEqual(['100', '25', '25']);
+    // The smaller retry covers the same page; the next page continues after its newest message.
+    expect(requested[1]!.get('after')).toBe(requested[0]!.get('after'));
+    expect(requested[2]!.get('after')).toBe(idAt(25));
+  });
+
+  it('does not shrink a channel scan page for a failure other than an oversized response', async () => {
+    const botId = '100000000000000009';
+    const token = `${btoa(botId)}.synthetic.token`;
+    const at = 1_800_000_000_000;
+    const fetchMock = stubFetch(Response.json({ message: 'Missing Access', code: 50001 }, { status: 403 }));
+    const err = await findBotMessages(token, '100000000000000123', { from: at, to: at }, new DiscordRateLimits(), () => true)
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 403 });
+    expect(err).not.toBeInstanceOf(DiscordResponseTooLargeError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats an oversized POST 5xx as an ordinary 5xx: unknown outcome, never a definite rejection', async () => {
+    const oversized5xx = () => new Response('x', { status: 503, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } });
+    const limits = new DiscordRateLimits();
+    const fetchMock = stubFetch(oversized5xx(), oversized5xx());
+    const first = await postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, limits)
+      .catch((e: unknown) => e);
+    expect(first).toBeInstanceOf(DiscordApiError);
+    expect(first).not.toBeInstanceOf(DiscordResponseTooLargeError);
+    expect(first).toMatchObject({ status: 503, body: '' });
+    // Not budgeted as a permanent failure: the card may have been posted.
+    expect(countsAgainstBudget(first)).toBe(false);
+    // A second consecutive POST 5xx declares an outage, exactly as for a readable 5xx.
+    await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
+      .rejects.toMatchObject({ status: 503 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(postMessage('token', '100000000000000789', { title: 'Synthetic' }, undefined, undefined, limits))
+      .rejects.toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries an oversized PATCH 5xx like any 5xx and marks an outage once its budget is exhausted', async () => {
+    const oversized5xx = () => new Response('x', { status: 502, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } });
+    const fetchMock = stubFetch(...Array.from({ length: 4 }, oversized5xx));
+    const limits = new DiscordRateLimits();
+    const err = await editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, limits)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DiscordApiError);
+    expect(err).not.toBeInstanceOf(DiscordResponseTooLargeError);
+    expect(err).toMatchObject({ status: 502 });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
+      .rejects.toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('recovers when an oversized PATCH 5xx is followed by a success', async () => {
+    const fetchMock = stubFetch(
+      new Response('x', { status: 500, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
+      Response.json({ id: '100000000000000999' }),
+    );
+    await expect(editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, new DiscordRateLimits()))
+      .resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats an oversized 429 as a 60 s route cooldown instead of a definite rejection', async () => {
+    const now = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    onTestFinished(() => clock.mockRestore());
+    const fetchMock = stubFetch(
+      new Response('x', { status: 429, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
+      Response.json({ id: '100000000000000999' }),
+    );
+    const limits = new DiscordRateLimits();
+    const err = await postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, limits)
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: 'DiscordRateLimitError', status: 429, requestMade: true, global: false,
+      reason: 'rate_limit', retryAt: now + 60_000 });
+    expect(err).not.toBeInstanceOf(DiscordApiError);
+    expect(countsAgainstBudget(err)).toBe(false);
+    // The same channel route now waits without another request; other channels do not.
+    await expect(postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, limits))
+      .rejects.toMatchObject({ requestMade: false, reason: 'rate_limit', retryAt: now + 60_000 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
       .resolves.toBe('100000000000000999');
     expect(fetchMock).toHaveBeenCalledTimes(2);

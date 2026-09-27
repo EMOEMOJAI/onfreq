@@ -85,6 +85,8 @@ export function normalizeAtc(entry: IvaoAtcSummaryEntry): OnlineAtc {
 const MAX_CALLSIGN_LENGTH = 32;
 const MAX_TEXT_LENGTH = 128;
 const MAX_ICAO_LENGTH = 8;
+/** An airport ICAO/IATA-style code; anything else drops the airport, not the entry. */
+const AIRPORT_ICAO_PATTERN = /^[A-Z0-9]{3,4}$/;
 /**
  * Callsigns are plain identifiers; anything else is rejected, not rewritten.
  * A leading `__` is rejected too, so a callsign can never be `__proto__` or
@@ -111,18 +113,22 @@ function isPositiveId(value: unknown): value is number {
 
 /**
  * The feed occasionally reports frequency as a numeric string. Zero (`0`,
- * `"0.000"`) and any implausible value (negative, or 1000 MHz and above) read
- * as 0, i.e. connected but untuned, so the entry is kept: an established
- * session keeps its last frequency and a new one waits, rather than the entry
- * vanishing and producing a false OFFLINE. Only a non-numeric value, or a
- * string that is not plain decimal, drops the entry.
+ * `"0.000"`) reads as 0, i.e. connected but untuned. Anything unusable — an
+ * implausible number (negative, or 1000 MHz and above), a missing or
+ * non-numeric value, or a string that is not plain decimal — is coerced to 0
+ * too, so the entry is kept: an established session keeps its last frequency
+ * and a new one waits, rather than the entry vanishing and producing a false
+ * OFFLINE. `coerced` reports whether the raw value was unusable.
  */
-function coerceFrequency(value: unknown): number | null {
+function coerceFrequency(value: unknown): { frequency: number; coerced: boolean } {
   let frequency: number;
   if (isFiniteNumber(value)) frequency = value;
   else if (typeof value === 'string' && FREQUENCY_STRING_PATTERN.test(value.trim())) frequency = Number(value.trim());
-  else return null;
-  return frequency > 0 && frequency < MAX_FREQUENCY_MHZ ? frequency : 0;
+  else return { frequency: 0, coerced: true };
+  if (frequency === 0) return { frequency: 0, coerced: false };
+  return frequency > 0 && frequency < MAX_FREQUENCY_MHZ
+    ? { frequency, coerced: false }
+    : { frequency: 0, coerced: true };
 }
 
 /**
@@ -140,22 +146,25 @@ export function sliceCodePoints(text: string, maxUnits: number): string {
 }
 
 /**
- * Control characters and Unicode line/paragraph separators become spaces and
- * invisible format characters (bidi overrides, zero-width joiners) are
- * removed, so feed text cannot forge extra lines or reorder what Discord
- * displays. The cut never splits a surrogate pair.
+ * Control characters, Unicode line/paragraph separators and unpaired
+ * surrogates become spaces and invisible format characters (bidi overrides,
+ * zero-width joiners) are removed, so feed text cannot forge extra lines,
+ * reorder what Discord displays, or make a payload invalid text. The cut
+ * never splits a surrogate pair.
  */
 function truncate(value: string, max: number): string {
-  const clean = value.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ').replace(/\p{Cf}/gu, '');
+  const clean = value.replace(/[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/gu, ' ').replace(/\p{Cf}/gu, '');
   return sliceCodePoints(clean, max);
 }
 
 function sanitizeAirport(raw: unknown): NonNullable<IvaoAtcSummaryEntry['atcPosition']>['airport'] {
   if (!raw || typeof raw !== 'object') return null;
   const airport = raw as Record<string, unknown>;
-  if (typeof airport.icao !== 'string' || !airport.icao.trim()) return null;
+  if (typeof airport.icao !== 'string') return null;
+  const icao = airport.icao.trim().toUpperCase();
+  if (!AIRPORT_ICAO_PATTERN.test(icao)) return null;
   return {
-    icao: truncate(airport.icao.trim(), MAX_ICAO_LENGTH),
+    icao,
     name: typeof airport.name === 'string' ? truncate(airport.name, MAX_TEXT_LENGTH) : null,
     city: typeof airport.city === 'string' ? truncate(airport.city, MAX_TEXT_LENGTH) : null,
     countryId: typeof airport.countryId === 'string' ? truncate(airport.countryId, MAX_ICAO_LENGTH) : null,
@@ -182,12 +191,19 @@ function sanitizeSubcenter(raw: unknown): IvaoAtcSummaryEntry['subcenter'] {
   };
 }
 
+/** Per-parse counts of repaired fields, logged once as counts only. */
+interface SanitizeStats {
+  frequencyCoerced: number;
+}
+
 /**
  * Validate and coerce one raw feed entry into a safe shape, or `null` when it
- * is too malformed to trust (missing identifiers, no callsign, an
- * unparseable frequency). One bad entry must never stall the whole poll.
+ * is too malformed to trust (missing identifiers, no callsign, no position).
+ * An unusable frequency is coerced to 0 (untuned) instead. Callsigns are
+ * uppercased so case variants share one session. One bad entry must never
+ * stall the whole poll.
  */
-function sanitizeEntry(raw: unknown): IvaoAtcSummaryEntry | null {
+function sanitizeEntry(raw: unknown, stats: SanitizeStats): IvaoAtcSummaryEntry | null {
   if (!raw || typeof raw !== 'object') return null;
   const entry = raw as Record<string, unknown>;
   if (!isPositiveId(entry.id) || !isPositiveId(entry.userId)) return null;
@@ -196,14 +212,14 @@ function sanitizeEntry(raw: unknown): IvaoAtcSummaryEntry | null {
   const session = entry.atcSession;
   if (!session || typeof session !== 'object') return null;
   const sessionRecord = session as Record<string, unknown>;
-  const frequency = coerceFrequency(sessionRecord.frequency);
-  if (frequency === null) return null;
   if (typeof sessionRecord.position !== 'string' || !sessionRecord.position.trim()) return null;
+  const { frequency, coerced } = coerceFrequency(sessionRecord.frequency);
+  if (coerced) stats.frequencyCoerced++;
 
   return {
     id: entry.id,
     userId: entry.userId,
-    callsign: truncate(entry.callsign.trim(), MAX_CALLSIGN_LENGTH),
+    callsign: truncate(entry.callsign.trim().toUpperCase(), MAX_CALLSIGN_LENGTH),
     connectionType: typeof entry.connectionType === 'string' ? entry.connectionType : '',
     atcSession: { frequency, position: truncate(sessionRecord.position.trim(), MAX_TEXT_LENGTH) },
     atcPosition: sanitizeAtcPosition(entry.atcPosition),
@@ -488,12 +504,16 @@ export async function fetchDivisionAtc(
 
   const sanitized: IvaoAtcSummaryEntry[] = [];
   let skipped = 0;
+  const stats: SanitizeStats = { frequencyCoerced: 0 };
   for (const raw of entries) {
-    const entry = sanitizeEntry(raw);
+    const entry = sanitizeEntry(raw, stats);
     if (entry) sanitized.push(entry); else skipped++;
   }
   if (skipped > 0) {
     console.warn(JSON.stringify({ event: 'ivao_entry_skipped', count: skipped }));
+  }
+  if (stats.frequencyCoerced > 0) {
+    console.warn(JSON.stringify({ event: 'ivao_frequency_coerced', count: stats.frequencyCoerced }));
   }
   // A feed format change can make every (or nearly every) entry fail
   // validation instead of the request itself failing. Treat that the same as
