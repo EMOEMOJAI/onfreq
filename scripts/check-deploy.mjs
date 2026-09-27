@@ -25,13 +25,15 @@ function exists(path) {
 }
 
 // A Git worktree of a private checkout lacks the ignored private config, so also
-// check the main worktree: the first `worktree` line Git lists. GIT_* variables
-// from hooks or npm could point Git at another repository, so they are removed.
+// check the main worktree: the first `worktree` line Git lists. Hooks or npm may
+// export variables that point Git at another repository, so those are removed;
+// GIT_CEILING_DIRECTORIES is kept so callers can still bound repository discovery.
 // Without Git, or outside a repository, only this checkout can be checked; with
 // a separate Git directory, Git lists that directory instead of the checkout.
+const repositoryVariable = /^GIT_(?:DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE|CONFIG.*)$/;
 function mainWorktree() {
   try {
-    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !repositoryVariable.test(name)));
     const [first = ''] = execFileSync('git', ['worktree', 'list', '--porcelain'],
       { cwd: root, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).split('\n');
     return first.startsWith('worktree ') ? first.slice('worktree '.length) : null;
