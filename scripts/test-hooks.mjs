@@ -784,3 +784,55 @@ test('pre-commit passes a commit that removes a committed secret, but blocks an 
     }
     assert.equal(f.git('rev-parse', 'HEAD'), head, 'no commit was made');
   });
+
+test('hunk-header context naming a committed secret does not block an edit below it, but an added secret still blocks (C64)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    const secret = new RegExp(token.slice(4));
+    const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+    const scan = (...args) => spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args], { cwd: f.repo, env, encoding: 'utf8' });
+    const run = (options) => [options.path ? 'shim' : options.commit ? 'git commit' : 'hook', f.commitHook(options)];
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = one\n`);
+    f.git('add', 'config.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret committed without the hook');
+    const committed = f.git('rev-parse', 'HEAD');
+    // Editing the line below it: even with -U0, Git names the key line in the hunk header.
+    const header = new RegExp(`^@@ -2 \\+2 @@ aws_access_key_id = ${token}$`, 'm');
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = two\n`);
+    f.git('add', 'config.txt');
+    assert.match(f.git('diff', '--cached', '-U0'), header);
+    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+      const [label, result] = run(options);
+      assert.equal(result.status, 0, `edit ${label}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+    }
+    const edited = f.git('rev-parse', 'HEAD');
+    assert.notEqual(edited, committed, 'the edit was committed');
+    assert.match(f.git('log', '-p', '-U0', '-1'), header);
+    let result = f.push([ref(edited, 'refs/heads/main', committed)]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr + result.stdout, secret);
+    result = scan(edited, '--not', committed);
+    assert.equal(result.status, 0, result.stderr);
+    // A key added on the line after such a hunk header is still blocked.
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = two\naws_access_key_id = ${token} # added\n`);
+    f.git('add', 'config.txt');
+    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+      const [label, result] = run(options);
+      assert.equal(result.status, 1, `addition ${label}: ${result.stderr}`);
+      assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret; see the output above/, label);
+      assert.doesNotMatch(result.stderr, /could not read the staged changes/, label);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+    }
+    assert.equal(f.git('rev-parse', 'HEAD'), edited, 'no commit was made');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret added without the hook');
+    const added = f.git('rev-parse', 'HEAD');
+    result = f.push([ref(added, 'refs/heads/main', edited)]);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/);
+    assert.doesNotMatch(result.stderr + result.stdout, secret);
+    result = scan(added, '--not', edited);
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stderr + result.stdout, secret);
+  });

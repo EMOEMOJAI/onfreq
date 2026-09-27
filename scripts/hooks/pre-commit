@@ -30,13 +30,15 @@ trap 'exit 1' HUP INT TERM
 
 # Scan the literal staged bytes: external diff drivers, textconv filters and
 # binary attributes could otherwise hide a staged secret from gitleaks. As in
-# scripts/secret-scan.sh, context and removed lines are dropped, so a commit that
-# removes a leaked secret is not blocked by it. A failed Git or filter stage
-# leaves a marker, so unreadable staged changes block the commit.
+# scripts/secret-scan.sh, context and removed lines are dropped, as is the
+# existing line Git appends to each hunk header (@@ -2 +2 @@ <line>), so a
+# commit that removes a leaked secret, or edits a line below one, is not blocked
+# by it. A failed Git or filter stage leaves a marker, so unreadable staged
+# changes block the commit.
 status=0
 output=$({ git diff --cached -U0 --no-ext-diff --no-textconv --no-color --text </dev/null ||
     : >"$tmp/failed"; } |
-  { LC_ALL=C sed '/^-/d' || : >"$tmp/failed"; } |
+  { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
   gitleaks stdin --no-banner --redact 2>&1) || status=$?
 if [ -e "$tmp/failed" ] || [ "$status" != 0 ]; then printf '\n%s\n' "$output" >&2; fi
 # A Gitleaks that exits before reading all its input, for example on a bad

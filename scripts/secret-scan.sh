@@ -6,8 +6,10 @@
 # Merges are diffed against each parent, so content only a merge resolution
 # adds is scanned; --diff-merges=separate, unlike -m, ignores the log.diffMerges
 # setting, which could turn merge diffs off. External diff drivers, textconv
-# filters and binary or -diff attributes cannot hide content. Removed lines are
-# dropped, so removing content does not re-flag what is already published.
+# filters and binary or -diff attributes cannot hide content. Removed lines, and
+# the existing line Git appends to each hunk header (@@ -2 +2 @@ <line>), are
+# dropped, so removing content or editing below it does not re-flag what is
+# already published. Added lines start with "+", so no content is dropped.
 # Gitleaks redacts findings.
 #
 # Exit status: 0 clean; 1 Gitleaks found a secret or failed; 2 the commits
@@ -35,7 +37,7 @@ trap 'exit 2' HUP INT TERM
 status=0
 { git log -p -U0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null ||
     : >"$tmp/failed"; } |
-  { LC_ALL=C sed '/^-/d' || : >"$tmp/failed"; } |
+  { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
   gitleaks stdin --redact --no-banner || status=$?
 if [ -e "$tmp/failed" ]; then
   if [ "$status" != 0 ]; then
