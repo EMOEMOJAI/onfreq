@@ -6,6 +6,7 @@ import {
   buildOnlineEmbeds,
   buildSessionEndedEmbed,
   DiscordApiError,
+  DiscordInvalidChannelIdError,
   DiscordInvalidMessageIdError,
   DiscordResponseTooLargeError,
   DiscordUnconfirmedPostError,
@@ -17,9 +18,12 @@ import {
   editMessage,
   formatDuration,
   formatFrequency,
+  isSnowflake,
   messageNonce,
   parseChannelIds,
   postMessage,
+  snowflakeTime,
+  SNOWFLAKE_PATTERN,
 } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
 import { countsAgainstBudget, type OfflineEvent, type OnlineAtc, type TrackedAtc } from '../src/types';
@@ -103,6 +107,23 @@ const endedEvent: OfflineEvent = {
   endedAt: NOW,
   durationSeconds: 7200,
 };
+
+describe('snowflake helpers', () => {
+  it('accepts only strings of 17-20 decimal digits', () => {
+    expect(isSnowflake('100000000000000123')).toBe(true);
+    expect(isSnowflake('1'.repeat(20))).toBe(true);
+    for (const id of ['1'.repeat(16), '1'.repeat(21), '10000000000000012a', ' 100000000000000123', '', null, undefined, 100000000000000123n, 1e17]) {
+      expect(isSnowflake(id)).toBe(false);
+    }
+    expect(SNOWFLAKE_PATTERN.test('100000000000000123')).toBe(true);
+  });
+
+  it('decodes the creation time of a snowflake', () => {
+    const at = 1_800_000_000_000;
+    const id = ((BigInt(at - 1_420_070_400_000) << 22n) + 4_194_303n).toString();
+    expect(snowflakeTime(id)).toBe(at);
+  });
+});
 
 describe('embeds', () => {
   const airport = { icao: 'XAHH', iata: 'XXX', city: 'Australia', countryId: 'AU' };
@@ -499,6 +520,19 @@ describe('REST calls', () => {
     return fetchMock;
   }
 
+  /**
+   * Settle a request whose 5xx retries back off for 0.5 + 1 + 2 s, on fake
+   * timers so the test does not wait 3.5 s of real time. Only the timer
+   * functions are faked; `Date.now()` stays real.
+   */
+  async function withRetryBackoffElapsed(request: Promise<unknown>): Promise<unknown> {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    onTestFinished(() => { vi.useRealTimers(); });
+    const settled = request.catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(3_500);
+    return settled;
+  }
+
   it('escapes markdown in callsigns and positions but keeps word-internal underscores', () => {
     const embed = buildOnlineEmbed({ ...sample, callsign: 'LE*MD_TWR', position: '<@&1>\nTWR' }, undefined, LABELS);
     expect(embed.title).toContain('LE\\*MD_TWR');
@@ -652,9 +686,10 @@ describe('REST calls', () => {
       ...Array.from({ length: 4 }, () => Response.json({ message: 'server error' }, { status: 503 })),
     );
     const limits = new DiscordRateLimits();
-    await expect(
+    const edit = await withRetryBackoffElapsed(
       editMessage('token', '100000000000000123', '100000000000000999', buildSessionEndedEmbed(endedEvent, LABELS), limits),
-    ).rejects.toBeInstanceOf(DiscordApiError);
+    );
+    expect(edit).toBeInstanceOf(DiscordApiError);
     expect(fetchMock).toHaveBeenCalledTimes(4);
 
     // A single PATCH/DELETE exhausting its own retry budget is already an
@@ -684,7 +719,7 @@ describe('REST calls', () => {
 
     // The second consecutive POST failure now declares an outage; a third
     // destination fails fast without spending a network call.
-    const err = await postMessage('token', '789', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
+    const err = await postMessage('token', '100000000000000789', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
     expect(err).toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
   });
 
@@ -692,17 +727,17 @@ describe('REST calls', () => {
     const limits = new DiscordRateLimits();
     stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     await expect(
-      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000001', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
 
     stubFetch(Response.json({ id: '100000000000000999' }));
     await expect(
-      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000002', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).resolves.toBe('100000000000000999');
 
     const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     await expect(
-      postMessage('token', '3', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000003', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -711,19 +746,19 @@ describe('REST calls', () => {
     const limits = new DiscordRateLimits();
     stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     await expect(
-      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000001', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
 
     // A second consecutive 5xx still declares an outage: the first 5xx must
     // not have reset the streak.
     const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     await expect(
-      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000002', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     // A third destination now fails fast, proving the outage was marked.
-    const err = await postMessage('token', '3', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
+    const err = await postMessage('token', '100000000000000003', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
     expect(err).toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
   });
 
@@ -731,17 +766,17 @@ describe('REST calls', () => {
     const limits = new DiscordRateLimits();
     stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     await expect(
-      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000001', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
 
     stubFetch(Response.json({ message: 'bad request' }, { status: 400 }));
     await expect(
-      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000002', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
 
     const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     await expect(
-      postMessage('token', '3', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000003', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -750,7 +785,7 @@ describe('REST calls', () => {
     const limits = new DiscordRateLimits();
     stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     await expect(
-      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000001', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
 
     stubFetch(Response.json({ message: 'Unknown Message' }, { status: 404 }));
@@ -760,7 +795,7 @@ describe('REST calls', () => {
 
     const fetchMock = stubFetch(Response.json({ message: 'server error' }, { status: 503 }));
     await expect(
-      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000002', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(DiscordApiError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -785,13 +820,13 @@ describe('REST calls', () => {
     vi.stubGlobal('fetch', network);
     const limits = new DiscordRateLimits();
     await expect(
-      postMessage('token', '1', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000001', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(TypeError);
     await expect(
-      postMessage('token', '2', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
+      postMessage('token', '100000000000000002', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits),
     ).rejects.toBeInstanceOf(TypeError);
 
-    const err = await postMessage('token', '3', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
+    const err = await postMessage('token', '100000000000000003', buildOnlineEmbed(sample, undefined, LABELS), undefined, undefined, limits).catch((e) => e);
     expect(err).toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
     expect(network).toHaveBeenCalledTimes(2);
   });
@@ -810,8 +845,11 @@ describe('REST calls', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(err).toBeInstanceOf(DiscordApiError);
     expect((err as DiscordApiError).message).toBe('Discord API 403 (code 50013)');
-    expect((err as DiscordApiError).body).toContain('a lot of extra detail');
+    expect((err as DiscordApiError).code).toBe(50013);
     expect((err as DiscordApiError).isGone).toBe(true);
+    // The raw body is parsed for its code and then dropped, never retained on the error.
+    expect(err).not.toHaveProperty('body');
+    expect(JSON.stringify({ ...err, message: err.message, stack: err.stack })).not.toContain('a lot of extra detail');
   });
 
   it('treats an oversized channel scan as a budgeted lookup failure without deferring later posts', async () => {
@@ -926,7 +964,8 @@ describe('REST calls', () => {
       .catch((e: unknown) => e);
     expect(first).toBeInstanceOf(DiscordApiError);
     expect(first).not.toBeInstanceOf(DiscordResponseTooLargeError);
-    expect(first).toMatchObject({ status: 503, body: '' });
+    expect(first).toMatchObject({ status: 503 });
+    expect(first).not.toHaveProperty('body');
     // Not budgeted as a permanent failure: the card may have been posted.
     expect(countsAgainstBudget(first)).toBe(false);
     // A second consecutive POST 5xx declares an outage, exactly as for a readable 5xx.
@@ -942,8 +981,9 @@ describe('REST calls', () => {
     const oversized5xx = () => new Response('x', { status: 502, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } });
     const fetchMock = stubFetch(...Array.from({ length: 4 }, oversized5xx));
     const limits = new DiscordRateLimits();
-    const err = await editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, limits)
-      .catch((e: unknown) => e);
+    const err = await withRetryBackoffElapsed(
+      editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, limits),
+    );
     expect(err).toBeInstanceOf(DiscordApiError);
     expect(err).not.toBeInstanceOf(DiscordResponseTooLargeError);
     expect(err).toMatchObject({ status: 502 });
@@ -1024,6 +1064,30 @@ describe('REST calls', () => {
       // Not silently treated as deleted: a budgeted permanent failure instead.
       expect(del).toBeInstanceOf(DiscordInvalidMessageIdError);
       expect(countsAgainstBudget(del)).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+  it.each(['../100000000000000123', '100000000000000123/messages', '100000000000000123?x=1', 'synthetic-id', '123', '1'.repeat(21), ''])(
+    'never places a stored channel id %j that is not a snowflake in a request path', async (channelId) => {
+      const botId = '100000000000000009';
+      const token = `${btoa(botId)}.synthetic.token`;
+      const fetchMock = stubFetch(Response.json({ id: '100000000000000999' }), new Response(null, { status: 204 }));
+      const limits = new DiscordRateLimits();
+      const results = await Promise.all([
+        postMessage('token', channelId, { title: 'Synthetic' }, undefined, undefined, limits),
+        editMessage('token', channelId, '100000000000000999', { title: 'Synthetic' }, limits),
+        deleteMessage('token', channelId, '100000000000000999', limits),
+        findBotMessages(token, channelId, { from: 1_800_000_000_000, to: 1_800_000_000_000 }, limits, () => true),
+      ].map((call: Promise<unknown>) => call.then(() => null, (e: unknown) => e)));
+      for (const err of results) {
+        expect(err).toBeInstanceOf(DiscordInvalidChannelIdError);
+        expect(err).toBeInstanceOf(DiscordApiError);
+        expect(err).toMatchObject({ status: 400 });
+        // A definite, budgeted rejection, never a gone message that invites a fallback post to the same id.
+        expect(countsAgainstBudget(err)).toBe(true);
+        expect((err as DiscordApiError).isGone).toBe(false);
+        expect((err as Error).message).not.toContain(channelId || 'unused');
+      }
       expect(fetchMock).not.toHaveBeenCalled();
     });
 

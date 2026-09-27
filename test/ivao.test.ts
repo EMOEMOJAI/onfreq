@@ -118,7 +118,10 @@ describe('getAccessToken', () => {
   }
 
   beforeEach(() => resetTokenCache());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
 
   it('requests a tracker-scoped token with the client credentials', async () => {
     const fetchMock = vi.fn().mockResolvedValue(tokenResponse('tok-1'));
@@ -350,7 +353,6 @@ describe('normalizeAtc', () => {
       id: 42,
       userId: 12345,
       callsign: 'QCTT_TWR',
-      connectionType: 'ATC',
       atcSession: { frequency: 118.1, position: 'TWR' },
       atcPosition: {
         atcCallsign: 'Example City Tower',
@@ -375,7 +377,6 @@ describe('normalizeAtc', () => {
       id: 7,
       userId: 999,
       callsign: 'QCJJ_CTR',
-      connectionType: 'ATC',
       atcSession: { frequency: 132.3, position: 'CTR' },
       atcPosition: null,
       subcenter: { atcCallsign: 'Example Control', centerId: 'QCJJ' },
@@ -390,7 +391,6 @@ describe('normalizeAtc', () => {
       id: 1,
       userId: 1,
       callsign: 'QJAA_TWR',
-      connectionType: 'ATC',
       atcSession: { frequency: 118.5, position: 'TWR' },
       atcPosition: null,
       subcenter: null,
@@ -424,6 +424,7 @@ describe('fetchDivisionAtc', () => {
       id: 1,
       userId: 100,
       callsign: 'QCTT_TWR',
+      // Present in the real feed; ignored by the sanitizer.
       connectionType: 'ATC',
       atcSession: { frequency: 118.1, position: 'TWR' },
       atcPosition: { atcCallsign: 'Example Tower', airport: { icao: 'QCTT', name: 'Example Airport', countryId: 'BR' } },
@@ -433,7 +434,10 @@ describe('fetchDivisionAtc', () => {
   }
 
   beforeEach(() => resetTokenCache());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
 
   it('skips malformed entries and logs only counts, coercing numeric and unusable frequencies', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -535,7 +539,6 @@ describe('fetchDivisionAtc', () => {
 
   it.each(['__proto__', '__QCTT_TWR', '__'])('rejects a callsign %j starting with a double underscore', async (callsign) => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    warn.mockClear();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([rawEntry({ callsign }), ...filler(2)])));
     // The prefix would otherwise admit it, so only the callsign check can drop it.
     await expect(fetchDivisionAtc(['__'])).resolves.toEqual([]);
@@ -560,7 +563,6 @@ describe('fetchDivisionAtc', () => {
     undefined, true, {}, { mhz: 118.1 }, [118.1]])(
     'keeps an entry whose frequency %j is not plain decimal MHz as untuned (0), logging only a count', async (frequency) => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      warn.mockClear();
       const entries = [rawEntry({ atcSession: { frequency, position: 'TWR' } }), ...filler(2)];
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
       const result = await fetchDivisionAtc(['QC']);
@@ -572,7 +574,6 @@ describe('fetchDivisionAtc', () => {
 
   it('logs one coerced-frequency count per parse, however many entries were coerced', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    warn.mockClear();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
       rawEntry({ id: 1, callsign: 'QCTT_TWR', atcSession: { frequency: null, position: 'TWR' } }),
       rawEntry({ id: 2, callsign: 'QCTT_APP', atcSession: { frequency: '118.', position: 'APP' } }),
@@ -586,7 +587,6 @@ describe('fetchDivisionAtc', () => {
 
   it('treats a feed whose frequencies are all unusable as an outage instead of a silent success', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    warn.mockClear();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
       rawEntry({ id: 1, callsign: 'QCTT_TWR', atcSession: { frequency: 'x', position: 'TWR' } }),
       ...filler(3).map((entry) => ({ ...entry, atcSession: { frequency: 'x', position: 'TWR' } })),
@@ -637,7 +637,6 @@ describe('fetchDivisionAtc', () => {
     [5e-324, 0, true], [1e-4, 0, true], [0.0009, 0, true], [0.001, 0.001, false],
   ])('keeps an entry with frequency %j as %j instead of dropping it (coerced: %j)', async (frequency, expected, coerced) => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    warn.mockClear();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
       rawEntry({ atcSession: { frequency, position: 'TWR' } }),
       ...filler(2),
@@ -738,9 +737,17 @@ describe('fetchDivisionAtc', () => {
     await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('upstream response exceeded size limit');
   });
 
+  it.each(['<html>synthetic-private-upstream-detail</html>', '[{"id":1,"callsign":"synthetic-private-upstream-detail"', ''])(
+    'fails a 2xx feed whose body is not JSON with a fixed message that never quotes the body: %j', async (body) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 200 })));
+      const err = await fetchDivisionAtc(['QC']).then(() => null, (e: unknown) => e as Error);
+      expect(err).toBeInstanceOf(Error);
+      expect(err?.message).toBe('IVAO API returned invalid JSON');
+      expect(String(err)).not.toContain('synthetic-private-upstream-detail');
+    });
+
   it('treats a feed with more than 20000 entries as an outage before sanitising any of them', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    warn.mockClear();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(Array.from({ length: 20_001 }, () => 0))));
     await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('IVAO API returned too many entries; treating as feed outage');
     expect(warn).not.toHaveBeenCalled();

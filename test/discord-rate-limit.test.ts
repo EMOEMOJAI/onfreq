@@ -65,7 +65,7 @@ it('shares member-list cooldowns across pagination cursors', async () => {
 it('defers standalone public requests instead of shortening a 65-second cooldown', async () => {
   const network = vi.fn().mockImplementation(async () => Response.json({ retry_after: 65 }, { status: 429 }));
   vi.stubGlobal('fetch', network);
-  await expect(postMessage('test-token', 'a', { title: 'Synthetic' }, undefined, undefined, new DiscordRateLimits()))
+  await expect(postMessage('test-token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, new DiscordRateLimits()))
     .rejects.toMatchObject({ retryAt: START + 65_000 });
   expect(network).toHaveBeenCalledTimes(1);
 });

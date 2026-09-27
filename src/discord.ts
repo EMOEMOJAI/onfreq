@@ -326,7 +326,24 @@ export function buildOfflineEmbed(event: OfflineEvent, labels: FirLabel[] = []):
 // --- REST --------------------------------------------------------------------
 
 /** A Discord snowflake id, safe to place in an API path. */
-const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
+export const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
+
+/** Whether `id` is a Discord snowflake string (17-20 digits). */
+export function isSnowflake(id: unknown): id is string {
+  return typeof id === 'string' && SNOWFLAKE_PATTERN.test(id);
+}
+
+const DISCORD_EPOCH_MS = 1_420_070_400_000;
+
+/** The creation time, in ms since the Unix epoch, encoded in a snowflake. */
+export function snowflakeTime(id: string): number {
+  return Number(BigInt(id) >> 22n) + DISCORD_EPOCH_MS;
+}
+
+/** The smallest snowflake that could have been created at `ms`. */
+function snowflakeAt(ms: number): string {
+  return (BigInt(Math.max(0, ms - DISCORD_EPOCH_MS)) << 22n).toString();
+}
 
 /**
  * Parse the comma-separated DISCORD_CHANNEL_IDS var. Entries that are not
@@ -337,7 +354,7 @@ export function parseChannelIds(raw: string | undefined): string[] {
     .split(',')
     .map((id) => id.trim())
     .filter(Boolean);
-  const valid = ids.filter((id) => SNOWFLAKE_PATTERN.test(id));
+  const valid = ids.filter(isSnowflake);
   if (valid.length < ids.length) {
     console.error(JSON.stringify({
       event: 'config_invalid', reason: 'discord_channel_ids', count: ids.length - valid.length,
@@ -352,7 +369,7 @@ export function parseChannelIds(raw: string | undefined): string[] {
  */
 function allowedMentions(content: string | undefined): { parse: []; roles?: string[]; replied_user: false } {
   const role = /^<@&(\d+)>$/.exec(content ?? '')?.[1];
-  return role && SNOWFLAKE_PATTERN.test(role)
+  return isSnowflake(role)
     ? { parse: [], roles: [role], replied_user: false }
     : { parse: [], replied_user: false };
 }
@@ -369,9 +386,13 @@ export class DiscordApiError extends Error {
   /** Discord's own numeric error code, when the body carried one. */
   readonly code?: number;
 
+  /**
+   * Only the numeric code is kept from `body`; the raw response body is never
+   * stored, so it cannot leak into a log line or stay retained in memory.
+   */
   constructor(
     readonly status: number,
-    readonly body: string,
+    body = '',
   ) {
     const code = DiscordApiError.parseCode(body);
     super(`Discord API ${status}${code !== undefined ? ` (code ${code})` : ''}`);
@@ -404,7 +425,7 @@ export class DiscordApiError extends Error {
  */
 export class DiscordResponseTooLargeError extends DiscordApiError {
   constructor(readonly upstreamStatus: number) {
-    super(413, '');
+    super(413);
     this.name = 'DiscordResponseTooLargeError';
     this.message = 'Discord API response exceeded size limit';
   }
@@ -418,7 +439,7 @@ export class DiscordResponseTooLargeError extends DiscordApiError {
  */
 export class DiscordInvalidMessageIdError extends DiscordApiError {
   constructor() {
-    super(400, '');
+    super(400);
     this.name = 'DiscordInvalidMessageIdError';
     this.message = 'Stored Discord message id is not a snowflake; request skipped';
   }
@@ -429,7 +450,26 @@ export class DiscordInvalidMessageIdError extends DiscordApiError {
 }
 
 function assertMessageId(messageId: string): void {
-  if (!SNOWFLAKE_PATTERN.test(messageId)) throw new DiscordInvalidMessageIdError();
+  if (!isSnowflake(messageId)) throw new DiscordInvalidMessageIdError();
+}
+
+/**
+ * A channel id (from a stored message reference or job, say, written by an
+ * older deploy or corrupted) that is not a snowflake is never placed in a
+ * request path. No request is made. A definite 4xx-class rejection, so every
+ * budgeted caller (`countsAgainstBudget`) gives up after its bounded retries;
+ * not `isGone`, so no caller falls back to posting into the same channel id.
+ */
+export class DiscordInvalidChannelIdError extends DiscordApiError {
+  constructor() {
+    super(400);
+    this.name = 'DiscordInvalidChannelIdError';
+    this.message = 'Discord channel id is not a snowflake; request skipped';
+  }
+}
+
+function assertChannelId(channelId: string): void {
+  if (!isSnowflake(channelId)) throw new DiscordInvalidChannelIdError();
 }
 
 const MAX_ATTEMPTS = 4;
@@ -449,7 +489,7 @@ function sleep(ms: number): Promise<void> {
  * otherwise be resent, posting a duplicate card and re-pinging a role. The
  * next poll re-delivers instead — duplicates across polls are deduped by
  * Discord only within its own nonce window (a few minutes), via the optional
- * `enforce_nonce` payload built from `messageNonce`. PATCH/DELETE are
+ * `enforce_nonce` payload built from `messageNonce`. GET/PATCH/DELETE are
  * idempotent and keep retrying.
  */
 async function discordRequest(
@@ -489,7 +529,7 @@ async function discordRequest(
       // A thrown fetch error (timeout, network failure, TypeError) never
       // gets an in-request retry — there is no response to retry against.
       // For POST, only mark an outage after a second consecutive failure so
-      // one blip doesn't defer the rest of the poll; PATCH/DELETE mark
+      // one blip doesn't defer the rest of the poll; GET/PATCH/DELETE mark
       // immediately since a thrown error already exhausts their only attempt.
       if (method !== 'POST' || limits.notePostFailure()) limits.markOutage(OUTAGE_COOLDOWN_MS);
       throw err;
@@ -498,7 +538,7 @@ async function discordRequest(
     const status = typeof res === 'number' ? res : res.status;
     // Any non-5xx response — regardless of method — proves Discord is
     // reachable, so it resets the POST failure streak even when this call
-    // was itself a PATCH/DELETE, or a POST that came back with a non-5xx
+    // was itself a GET/PATCH/DELETE, or a POST that came back with a non-5xx
     // failure such as 404.
     if (status < 500) limits.noteDiscordResponded();
     if (typeof res !== 'number' && res.ok) return res;
@@ -507,7 +547,7 @@ async function discordRequest(
     const retryable = method !== 'POST' && status >= 500;
     if (!retryable || attempt >= MAX_ATTEMPTS) {
       if (status >= 500) {
-        // PATCH/DELETE have exhausted their real retry budget here; POST
+        // GET/PATCH/DELETE have exhausted their real retry budget here; POST
         // never retries in-request, so it instead needs a second consecutive
         // 5xx/timeout before an outage is declared.
         if (method !== 'POST' || limits.notePostFailure()) limits.markOutage(OUTAGE_COOLDOWN_MS);
@@ -549,6 +589,7 @@ export async function postMessage(
   limits: DiscordRateLimits,
   nonce?: string,
 ): Promise<string> {
+  assertChannelId(channelId);
   const res = await discordRequest(botToken, 'POST', `/channels/${channelId}/messages`, {
     content,
     embeds: [embed],
@@ -557,7 +598,7 @@ export async function postMessage(
     ...(nonce ? { nonce, enforce_nonce: true } : {}),
   }, limits);
   const message = await res.json().catch(() => null) as { id?: unknown } | null;
-  if (typeof message?.id !== 'string' || !SNOWFLAKE_PATTERN.test(message.id)) throw new DiscordUnconfirmedPostError();
+  if (!isSnowflake(message?.id)) throw new DiscordUnconfirmedPostError();
   return message.id;
 }
 
@@ -569,6 +610,7 @@ export async function editMessage(
   embed: DiscordEmbed,
   limits: DiscordRateLimits,
 ): Promise<void> {
+  assertChannelId(channelId);
   assertMessageId(messageId);
   await discordRequest(botToken, 'PATCH', `/channels/${channelId}/messages/${messageId}`, {
     embeds: [embed],
@@ -579,20 +621,10 @@ export async function editMessage(
 function botUserId(botToken: string): string | undefined {
   try {
     const id = atob(botToken.split('.')[0]!.replace(/-/g, '+').replace(/_/g, '/'));
-    return /^\d{17,20}$/.test(id) ? id : undefined;
+    return isSnowflake(id) ? id : undefined;
   } catch {
     return undefined;
   }
-}
-
-const DISCORD_EPOCH_MS = 1_420_070_400_000;
-
-function snowflakeAt(ms: number): string {
-  return (BigInt(Math.max(0, ms - DISCORD_EPOCH_MS)) << 22n).toString();
-}
-
-function snowflakeTime(id: string): number {
-  return Number(BigInt(id) >> 22n) + DISCORD_EPOCH_MS;
 }
 
 /** Messages requested per channel-scan page, and the smaller retry size for an oversized page. */
@@ -623,6 +655,7 @@ export async function findBotMessages(
   botToken: string, channelId: string, window: { from: number; to: number }, limits: DiscordRateLimits,
   match: (message: FetchedMessage) => boolean,
 ): Promise<string[]> {
+  assertChannelId(channelId);
   const botId = botUserId(botToken);
   if (!botId) return [];
   const found: string[] = [];
@@ -647,7 +680,7 @@ export async function findBotMessages(
     if (!Array.isArray(list)) throw new Error('Discord returned an invalid message list');
     let newest = after;
     for (const item of list as Partial<FetchedMessage>[]) {
-      if (typeof item?.id !== 'string' || !SNOWFLAKE_PATTERN.test(item.id)) continue;
+      if (!isSnowflake(item?.id)) continue;
       if (BigInt(item.id) > BigInt(newest)) newest = item.id;
       const at = snowflakeTime(item.id);
       if (at < window.from - 60_000 || at > window.to + 60_000) continue;
@@ -671,6 +704,7 @@ export function findBotReplies(
 /** Remove an obsolete roster continuation; already-deleted messages are clean. */
 export async function deleteMessage(botToken: string, channelId: string, messageId: string, limits: DiscordRateLimits): Promise<void> {
   try {
+    assertChannelId(channelId);
     assertMessageId(messageId);
     await discordRequest(botToken, 'DELETE', `/channels/${channelId}/messages/${messageId}`, undefined, limits);
   } catch (err) {

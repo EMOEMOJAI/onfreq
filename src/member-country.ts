@@ -1,14 +1,16 @@
 import { TOKEN_KEY } from './config';
-import { fetchBuffered } from './http';
+import { fetchBuffered, ResponseTooLargeError } from './http';
 import { getAccessToken, hasFrequency, invalidateCachedToken } from './ivao';
 import type { IvaoAuth, MemberCountry, OnlineAtc, StateMap } from './types';
 
 const COUNTRY_TTL_MS = 24 * 60 * 60 * 1000;
 const RETRY_MS = 15 * 60 * 1000;
-/** A short in-memory/snapshot-consistent backoff for ids that were skipped
- * entirely (never attempted) because an earlier id in the same batch stopped
- * the run — avoids hammering the same blocked-looking id every poll. */
-const SKIP_BACKOFF_MS = 60 * 1000;
+/** An in-memory/snapshot-consistent backoff for ids that were skipped
+ * entirely (never attempted), either because an earlier id in the same batch
+ * stopped the run or because the lookup deadline elapsed first. Several cron
+ * intervals long, so a blocked-looking batch is not retried on the very next
+ * poll. */
+const SKIP_BACKOFF_MS = 5 * 60 * 1000;
 // Bound optional enrichment work even when many controllers connect at once.
 const MAX_LOOKUPS_PER_POLL = 5;
 /** No new lookup starts after this wall-clock budget elapses, even if every
@@ -18,6 +20,26 @@ const LOOKUP_DEADLINE_MS = 10_000;
  * currently blocked (bad/rejected auth, or already rate-limited) — further
  * lookups in the same run would just fail the same way. */
 const STOP_RUN_STATUSES = new Set([401, 403, 429]);
+/** Matches the abort reason `fetchBuffered` uses for its request timeout. */
+const TIMEOUT_MESSAGE = 'upstream request timed out';
+
+/**
+ * Why a lookup failed, safe to log: an HTTP status or a fixed category, never
+ * an error message, URL, token or response body.
+ */
+type LookupFailureReason = number | 'kv' | 'token' | 'timeout' | 'network' | 'too_large' | 'parse';
+
+class LookupFailure extends Error {
+  constructor(readonly reason: LookupFailureReason) {
+    super('IVAO member country lookup failed');
+    this.name = 'LookupFailure';
+  }
+}
+
+function fetchFailureReason(err: unknown): LookupFailureReason {
+  if (err instanceof ResponseTooLargeError) return 'too_large';
+  return err instanceof Error && err.message === TIMEOUT_MESSAGE ? 'timeout' : 'network';
+}
 
 export function countryCode(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -58,21 +80,32 @@ export async function enrichMemberCountries(
     let value: MemberCountry;
     let persist = true;
     try {
-      const stored = await auth.kv.get<MemberCountry>(key, 'json');
+      const stored = await auth.kv.get<MemberCountry>(key, 'json').catch(() => {
+        throw new LookupFailure('kv');
+      });
       if (stored && stored.expiresAt > now) {
-        cached.set(id, { countryId: countryCode(stored.countryId), expiresAt: stored.expiresAt });
+        // Never trust a stored expiry beyond one TTL from now (a corrupt or
+        // hand-edited entry must not pin a country indefinitely).
+        cached.set(id, {
+          countryId: countryCode(stored.countryId), expiresAt: Math.min(stored.expiresAt, now + COUNTRY_TTL_MS),
+        });
         continue;
       }
       token ??= getAccessToken(auth);
       let res: Response;
       try {
+        const bearer = await token.catch(() => {
+          throw new LookupFailure('token');
+        });
         res = await fetchBuffered(`https://api.ivao.aero/v2/users/${id}`, {
-          headers: { accept: 'application/json', authorization: `Bearer ${await token}` },
+          headers: { accept: 'application/json', authorization: `Bearer ${bearer}` },
+        }).catch((err: unknown) => {
+          throw new LookupFailure(fetchFailureReason(err));
         });
       } catch (err) {
-        // A thrown fetch error (timeout, network failure) means this batch's
-        // auth/network path is currently broken; further ids would just fail
-        // the same way.
+        // A token failure or a thrown fetch error (timeout, network failure)
+        // means this batch's auth/network path is currently broken; further
+        // ids would just fail the same way.
         stopRun = true;
         throw err;
       }
@@ -90,16 +123,20 @@ export async function enrichMemberCountries(
           }
         }
         if (STOP_RUN_STATUSES.has(res.status) || res.status >= 500) stopRun = true;
-        throw new Error(`IVAO profile request failed with ${res.status}`);
+        throw new LookupFailure(res.status);
       }
-      const body = await res.json() as { countryId?: unknown } | null;
+      const body = await res.json().catch(() => {
+        throw new LookupFailure('parse');
+      }) as { countryId?: unknown } | null;
       value = { countryId: countryCode(body?.countryId), expiresAt: now + COUNTRY_TTL_MS };
-    } catch {
+    } catch (err) {
       // Keep a previously known country during transient failures; retry
       // later. Not written to KV below: a failing lookup must not consume
       // the KV write quota on every poll, only this run's in-memory map and
       // the session snapshot (via `previous`) carry the backoff forward.
-      console.warn(JSON.stringify({ event: 'member_country_unavailable', userId: id }));
+      // Only the classified reason is logged, never the error itself.
+      const reason = err instanceof LookupFailure ? err.reason : 'unknown';
+      console.warn(JSON.stringify({ event: 'member_country_unavailable', userId: id, reason }));
       value = { countryId: cached.get(id)?.countryId ?? null, expiresAt: now + RETRY_MS };
       persist = false;
     }
@@ -116,8 +153,9 @@ export async function enrichMemberCountries(
       }
     }
   }
-  // Ids that were never attempted (stopRun broke the loop before reaching
-  // them) get a short backoff instead of being retried again next poll.
+  // Ids that were never attempted (a stopped run or the lookup deadline broke
+  // the loop before reaching them) get a backoff instead of being retried
+  // again next poll.
   for (const id of ids) {
     if (attempted.has(id)) continue;
     const prior = cached.get(id);

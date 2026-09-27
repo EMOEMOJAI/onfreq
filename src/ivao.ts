@@ -226,7 +226,6 @@ function sanitizeEntry(raw: unknown, stats: SanitizeStats): IvaoAtcSummaryEntry 
     id: entry.id,
     userId: entry.userId,
     callsign: truncate(entry.callsign.trim().toUpperCase(), MAX_CALLSIGN_LENGTH),
-    connectionType: typeof entry.connectionType === 'string' ? entry.connectionType : '',
     atcSession: { frequency, position: truncate(sessionRecord.position.trim(), MAX_TEXT_LENGTH) },
     atcPosition: sanitizeAtcPosition(entry.atcPosition),
     subcenter: sanitizeSubcenter(entry.subcenter),
@@ -497,7 +496,14 @@ export async function fetchDivisionAtc(
   if (!res.ok) {
     throw new Error(`IVAO API responded with ${res.status}`);
   }
-  const entries = (await res.json()) as unknown[];
+  let entries: unknown;
+  try {
+    entries = await res.json();
+  } catch {
+    // A fixed message: the parser's own error quotes the body, which would
+    // then reach the poll_failed log and the stored snapshot error.
+    throw new Error('IVAO API returned invalid JSON');
+  }
   if (!Array.isArray(entries)) {
     throw new Error('IVAO API returned an unexpected payload');
   }
