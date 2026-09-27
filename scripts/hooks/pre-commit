@@ -34,16 +34,22 @@ trap 'exit 1' HUP INT TERM
 status=0
 output=$({ git diff --cached --no-ext-diff --no-textconv --no-color --text </dev/null ||
     : >"$tmp/failed"; } | gitleaks stdin --no-banner --redact 2>&1) || status=$?
+if [ -e "$tmp/failed" ] || [ "$status" != 0 ]; then printf '\n%s\n' "$output" >&2; fi
+# A Gitleaks that exits before reading all its input, for example on a bad
+# configuration, makes Git fail on the closed pipe, so both causes are named.
+if [ -e "$tmp/failed" ] && [ "$status" != 0 ]; then
+  printf '\npre-commit: BLOCKED — could not read the staged changes for the secret scan, or the scan failed; see the output above.\n' >&2
+  exit 1
+fi
 if [ -e "$tmp/failed" ]; then
-  printf '\n%s\n' "$output" >&2
   printf '\npre-commit: BLOCKED — could not read the staged changes for the secret scan.\n' >&2
   exit 1
 fi
+# Gitleaks exits non-zero both for findings and for its own errors.
 if [ "$status" != 0 ]; then
-  printf '\n%s\n' "$output" >&2
-  printf '\npre-commit: BLOCKED — staged changes look like they contain a secret.\n' >&2
-  printf 'Unstage it, move the value into .dev.vars (gitignored) or a Wrangler secret.\n' >&2
-  printf 'If it is genuinely a false positive, append a "gitleaks:allow" comment on that line.\n' >&2
+  printf '\npre-commit: BLOCKED — the secret scan failed or found a secret; see the output above.\n' >&2
+  printf 'For a finding, unstage it and move the value into .dev.vars (gitignored) or a Wrangler secret.\n' >&2
+  printf 'If a finding is genuinely a false positive, append a "gitleaks:allow" comment on that line.\n' >&2
   exit 1
 fi
 
