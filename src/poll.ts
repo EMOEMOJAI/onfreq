@@ -23,7 +23,10 @@ import {
   parseExcludedCallsigns,
   parsePrefixes,
 } from './ivao';
-import { diffState, loadPendingOffline, loadSessions, newestCardedSession, offlineEventFor } from './state';
+import {
+  diffState, loadPendingOffline, loadRolePings, loadRosterMessages, loadRosterPostAttempts, loadSessions,
+  newestCardedSession, offlineEventFor,
+} from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
 import { gcaMismatch, gcaRemindersEnabled, parseGcaPolicy, sendGcaReminders, type GcaPolicy } from './gca';
 import { channelIndex, mayHavePosted, nextBudget, syncRosterMessages, type RosterTarget } from './roster';
@@ -680,10 +683,7 @@ export interface RunPollOptions {
 export async function runPoll(
   env: Env, stored: StateMap | null, nowIso: string, options: RunPollOptions = {},
 ): Promise<PollOutcome> {
-  const {
-    storage, previousRosterMessages = [], previousRosterPostAttempts = [], previousPendingOffline = [],
-    previousRolePings = {},
-  } = options;
+  const { storage } = options;
   const channelIds = [...new Set(parseChannelIds(env.DISCORD_CHANNEL_IDS))];
   if (!channelIds.length || !env.DISCORD_BOT_TOKEN?.trim()) {
     throw new Error('Discord bot token and notification channels are required');
@@ -707,7 +707,10 @@ export async function runPoll(
     .sort((a, b) => a.callsign.localeCompare(b.callsign));
   // Normalized once here: invalid entries are dropped, legacy fields stripped.
   const prev = loadSessions(stored ?? {});
-  const previousJobs = loadPendingOffline(previousPendingOffline);
+  const previousJobs = loadPendingOffline(options.previousPendingOffline ?? []);
+  const previousRosterMessages = loadRosterMessages(options.previousRosterMessages ?? []);
+  const previousRosterPostAttempts = loadRosterPostAttempts(options.previousRosterPostAttempts ?? []);
+  const previousRolePings = loadRolePings(options.previousRolePings ?? {});
   // A callsign carded before it was excluded must have its card closed out,
   // not silently abandoned: it disappears from `prev`/`next` below (so
   // `diffState` cannot see it went offline), so queue a closeout here for

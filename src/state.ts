@@ -1,6 +1,7 @@
 import { hasFrequency } from './ivao';
 import type {
-  DiffResult, OfflineEvent, OnlineAtc, PendingOffline, PostedMessage, PostWindow, StateMap, TrackedAtc,
+  DiffResult, OfflineEvent, OnlineAtc, PendingOffline, PostedMessage, PostWindow, RosterMessage, RosterPostAttempt,
+  StateMap, TrackedAtc,
 } from './types';
 
 type Guard<T> = (value: unknown) => value is T;
@@ -11,6 +12,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const isString: Guard<string> = (value): value is string => typeof value === 'string';
 const isNumber: Guard<number> = (value): value is number => typeof value === 'number';
+/** Whole numbers: a fractional or NaN epoch-ms window would make building a snowflake from it throw. */
+const isSafeInteger: Guard<number> = (value): value is number => Number.isSafeInteger(value);
 const arrayOf = <T>(guard: Guard<T>): Guard<T[]> => (value): value is T[] => Array.isArray(value) && value.every(guard);
 const recordOf = <T>(guard: Guard<T>): Guard<Record<string, T>> => (value): value is Record<string, T> =>
   isRecord(value) && Object.values(value).every(guard);
@@ -20,7 +23,13 @@ const optional = <T>(guard: Guard<T>): Guard<T | undefined> => (value): value is
 const isPostedMessage: Guard<PostedMessage> = (value): value is PostedMessage =>
   isRecord(value) && isString(value.channelId) && isString(value.messageId);
 const isPostWindow: Guard<PostWindow> = (value): value is PostWindow =>
-  isRecord(value) && Number.isFinite(value.from) && Number.isFinite(value.to);
+  isRecord(value) && isSafeInteger(value.from) && isSafeInteger(value.to);
+const isRosterMessage: Guard<RosterMessage> = (value): value is RosterMessage =>
+  isPostedMessage(value) && isString((value as Partial<RosterMessage>).parentMessageId) &&
+  isSafeInteger((value as Partial<RosterMessage>).page);
+const isRosterPostAttempt: Guard<RosterPostAttempt> = (value): value is RosterPostAttempt =>
+  isRecord(value) && isString(value.channelId) && isString(value.parentMessageId) && isSafeInteger(value.page) &&
+  optional(isSafeInteger)(value.maybePostedFrom) && optional(isSafeInteger)(value.maybePostedTo);
 
 /** Whether a stored session has every field a poll reads, in the shape it reads it. */
 function isTrackedAtc(value: unknown): value is TrackedAtc {
@@ -66,13 +75,47 @@ export function loadSessions(stored: StateMap): StateMap {
   return Object.fromEntries(valid.map(([callsign, session]) => [callsign, stripLegacyRoster(session)]));
 }
 
+/**
+ * The entries of a stored list that pass `guard`, logging how many were
+ * dropped (count only: entries hold private IDs). A stored value that is
+ * not a list at all counts as one invalid entry.
+ */
+function loadList<T>(stored: unknown, guard: Guard<T>, event: string): T[] {
+  const list: unknown[] = Array.isArray(stored) ? stored : [stored];
+  const valid = list.filter(guard);
+  if (valid.length < list.length) {
+    console.error(JSON.stringify({ event, reason: 'invalid', count: list.length - valid.length }));
+  }
+  return valid;
+}
+
 /** See `loadSessions`. */
 export function loadPendingOffline(stored: unknown[]): PendingOffline[] {
-  const valid = stored.filter(isPendingOffline);
-  if (valid.length < stored.length) {
-    console.error(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'invalid', count: stored.length - valid.length }));
-  }
-  return valid.map((job) => ({ ...job, event: stripLegacyRoster(job.event) }));
+  return loadList(stored, isPendingOffline, 'offline_jobs_dropped')
+    .map((job) => ({ ...job, event: stripLegacyRoster(job.event) }));
+}
+
+/** Stored roster continuation pages; see `loadSessions`. */
+export function loadRosterMessages(stored: unknown): RosterMessage[] {
+  return loadList(stored, isRosterMessage, 'roster_messages_dropped');
+}
+
+/**
+ * Stored continuation post attempts; see `loadSessions`. A sweep window that
+ * is not whole epoch ms is dropped with its entry: it would otherwise throw
+ * while building the channel scan, failing every poll.
+ */
+export function loadRosterPostAttempts(stored: unknown): RosterPostAttempt[] {
+  return loadList(stored, isRosterPostAttempt, 'roster_post_attempts_dropped');
+}
+
+/** Stored role ping times per channel, keeping only numeric times; see `loadSessions`. */
+export function loadRolePings(stored: unknown): Record<string, number> {
+  const entries = isRecord(stored) ? Object.entries(stored) : [];
+  const valid = entries.filter(([, at]) => Number.isFinite(at));
+  const dropped = isRecord(stored) ? entries.length - valid.length : 1;
+  if (dropped > 0) console.error(JSON.stringify({ event: 'role_pings_dropped', reason: 'invalid', count: dropped }));
+  return Object.fromEntries(valid) as Record<string, number>;
 }
 
 /**

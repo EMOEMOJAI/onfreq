@@ -367,9 +367,10 @@ describe('polling through the Durable Object', () => {
     await expect(configuredPoll()).resolves.toEqual({ skipped: false });
   });
 
-  it('strips a legacy roster field from an imported pending-offline event', async () => {
+  it('C58: strips a legacy roster field from an imported pending-offline event before storing it again', async () => {
     // This event comes straight from a stored `PendingOffline` job,
-    // never through `diffState`'s own stripping.
+    // never through `diffState`'s own stripping. A failed closeout stores
+    // the job again, which shows whether the field survived the import.
     await runInDurableObject(stub(), async (_, ctx) => {
       const event = {
         ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600, roster: true,
@@ -378,9 +379,69 @@ describe('polling through the Durable Object', () => {
         event, messages: [{ channelId: '900000000000000001', messageId: mid(a) }], channelIds: [],
       }] } satisfies PollSnapshot);
     });
+    failures.add(mid(a));
+    await expect(configuredPoll()).rejects.toThrow('all Discord notifications failed');
+    const stored = (await snapshot())?.pendingOffline;
+    expect(stored).toHaveLength(1);
+    expect(stored![0]!.event.callsign).toBe(a);
+    expect(stored![0]!.event).not.toHaveProperty('roster');
+    failures.clear();
+    now += 60_000;
     await expect(configuredPoll()).resolves.toEqual({ skipped: false });
     expect((await snapshot())?.pendingOffline).toBeUndefined();
     expect(cards.get(mid(a))?.title).toContain('OFFLINE');
+  });
+
+  describe('C57: malformed stored roster lists and ping times', () => {
+    const channel = '900000000000000001';
+    const parent = mid('old-parent');
+    const window = { from: START - 120_000, to: START - 60_000 };
+    const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
+      ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
+    }).poll());
+
+    it('sweeps a valid orphan marker and drops a malformed one beside it instead of failing every poll', async () => {
+      const error = vi.spyOn(console, 'error');
+      const orphan = snowflakeAt(window.from + 30_000, 1);
+      const marker = { channelId: channel, parentMessageId: parent, attempts: 0, maybePostedFrom: window.from,
+        maybePostedTo: window.to };
+      await runInDurableObject(stub(), async (_, ctx) => {
+        await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, rosterPostAttempts: [
+          // A fractional time would make the shared scan window throw.
+          { ...marker, page: 0, maybePostedFrom: window.from + 0.5 }, { ...marker, page: 1 },
+        ] } satisfies PollSnapshot);
+      });
+      const original = network.getMockImplementation()!;
+      network.mockImplementation(async (input, init) => {
+        const url = String(input);
+        if ((init?.method ?? 'GET') === 'GET' && url.includes(`/channels/${channel}/messages?after=`)) {
+          return Response.json([{ id: orphan, author: { id: BOT_ID }, message_reference: { message_id: parent } }]);
+        }
+        return original(input, init);
+      });
+      await expect(run()).resolves.toEqual({ skipped: false });
+      expect(deleted).toEqual([orphan]);
+      expect((await snapshot())?.rosterPostAttempts).toBeUndefined();
+      expect((await snapshot())?.lastSuccessfulPollAt).toBe(START);
+      expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'roster_post_attempts_dropped', reason: 'invalid', count: 1 }));
+    });
+
+    it('drops a null roster page and ignores null ping times instead of failing every poll', async () => {
+      const error = vi.spyOn(console, 'error');
+      await runInDurableObject(stub(), async (_, ctx) => {
+        await ctx.storage.put(POLL_SNAPSHOT_KEY, {
+          state: {}, rosterMessages: [null], rolePings: null,
+        } as unknown as PollSnapshot);
+      });
+      await expect(run()).resolves.toEqual({ skipped: false });
+      const stored = await snapshot();
+      expect(stored?.rosterMessages).toBeUndefined();
+      expect(stored?.rolePings).toBeUndefined();
+      expect(stored?.lastSuccessfulPollAt).toBe(START);
+      // Null ping times read as none recorded; only the page is counted.
+      expect(error.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('_dropped')))
+        .toEqual([JSON.stringify({ event: 'roster_messages_dropped', reason: 'invalid', count: 1 })]);
+    });
   });
 
   it('C16: drops a malformed stored closeout job or session instead of failing every poll', async () => {
@@ -2010,6 +2071,58 @@ describe('polling through the Durable Object', () => {
     expect(recovered?.nonce).toBe(messageNonce(`online:100:${b}:${new Date(START - 3_600_000).toISOString()}`,
       '900000000000000001'));
     expect(cards.get(recovered!.id!)?.title).toContain(`${b} is OFFLINE`);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('C61: closes the original card by lookup once access returns after a 403 edit', async () => {
+    const c = 'QGLL_TWR';
+    const channel = '900000000000000001';
+    // A real snowflake from when the card was posted, so the lookup's time window covers it.
+    const cardB = snowflakeAt(START - 30_000, 7);
+    const original = network.getMockImplementation()!;
+    const lookups: string[] = [];
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if ((init?.method ?? 'GET') === 'GET' && url.includes(`/channels/${channel}/messages?after=`)) {
+        lookups.push(url);
+        // The card still exists, unchanged since its last successful edit.
+        return Response.json([{ id: cardB, author: { id: BOT_ID }, embeds: [cards.get(cardB)] }]);
+      }
+      return original(input, init);
+    });
+    const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
+      ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
+    }).poll().catch(() => undefined));
+    await seed({
+      [a]: session(a), [b]: { ...session(b, START - 30_000), messages: [{ channelId: channel, messageId: cardB }] },
+      [c]: session(c, START - 90_000),
+    });
+    feed = [entry(a), entry(b), entry(c)];
+    await run();
+    expect(cards.get(cardB)?.title).toContain(`${b} is now ONLINE`);
+    // Access to the card is lost: the edit is refused, but the card stays.
+    failures.add(cardB);
+    failureStatus = 403;
+    feed = [entry(a, 121.7), entry(b), entry(c)];
+    now += 60_000;
+    await run();
+    expect((await stub().getState())?.[b]?.messages).toEqual([]);
+    expect(Object.keys((await stub().getState())?.[b]?.uncertainPosts ?? {})).toEqual([channel]);
+    expect(cards.has(cardB)).toBe(true);
+    // Access returns, then the session ends.
+    failures.clear();
+    const count = sent.length;
+    feed = [entry(a, 121.7), entry(c)];
+    for (let i = 0; i < 3; i++) {
+      now += 60_000;
+      await run();
+    }
+    expect(lookups.length).toBeGreaterThan(0);
+    expect(cards.get(cardB)?.title).toContain(`${b} is OFFLINE`);
+    expect(sent.slice(count).filter((message) => message.id === cardB).map((message) => message.method))
+      .toEqual(['PATCH']);
+    // Found by lookup: no re-post of the ONLINE card, and no fallback notice.
+    expect(sent.slice(count).filter((message) => message.method === 'POST')).toEqual([]);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
