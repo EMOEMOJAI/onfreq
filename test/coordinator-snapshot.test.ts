@@ -65,3 +65,25 @@ it('S1-3: a failed snapshot write rethrows the original error and logs no stored
   const logged = JSON.stringify(log.mock.calls);
   for (const secretish of ['XA_SYNTHETIC', '900000000000000', CONFIG_ERROR]) expect(logged).not.toContain(secretish);
 });
+
+it('S11-13: a future lastPollStartedAt does not throttle polling indefinitely', async () => {
+  const now = Date.now();
+  const future = now + 24 * 60 * 60_000;
+  await runInDurableObject(stub(), async (_, ctx) => {
+    await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, lastPollStartedAt: future, lastSuccessfulPollAt: now - 60_000 } satisfies PollSnapshot);
+    // Reaching runPoll (here, its config precondition) proves the poll was not skipped.
+    await expect(new PollCoordinator(ctx, misconfigured).poll()).rejects.toThrow(CONFIG_ERROR);
+    const stored = await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
+    expect(stored?.lastPollStartedAt).toBeGreaterThanOrEqual(now);
+    expect(stored?.lastPollStartedAt).toBeLessThanOrEqual(Date.now());
+  });
+});
+
+it('S11-13: a recent past lastPollStartedAt still throttles', async () => {
+  await runInDurableObject(stub(), async (_, ctx) => {
+    const snapshot = { state: {}, lastPollStartedAt: Date.now() - 1_000 } satisfies PollSnapshot;
+    await ctx.storage.put(POLL_SNAPSHOT_KEY, snapshot);
+    await expect(new PollCoordinator(ctx, misconfigured).poll()).resolves.toEqual({ skipped: true });
+    expect(await ctx.storage.get(POLL_SNAPSHOT_KEY)).toEqual(snapshot);
+  });
+});

@@ -65,7 +65,7 @@ export class PollCoordinator extends DurableObject<Env> {
     return { busy: false as const, ...cleanupGcaCopies(this.ctx.storage, apply, Date.now(), this.env.GCA_COPY_USER_ID) };
   }
 
-  async getGcaHistory(after = '') {
+  async getGcaHistory(after = 0) {
     const sql = this.ctx.storage.sql;
     // Existence check runs on every call rather than being cached per
     // instance: it is cheap, and it keeps this method correct even the very
@@ -75,17 +75,19 @@ export class PollCoordinator extends DurableObject<Env> {
     ).toArray().map((row) => row.name));
     if (!tables.has('gca_reminders')) return { records: [], nextCursor: null };
     const hasOccurrences = tables.has('gca_occurrences');
-    // `after` is an opaque pagination cursor over session_key's lexicographic
-    // order, not a timestamp: rows are not returned in chronological order.
-    const records = sql.exec<{
-      sessionKey: string; status: string; attempts: number; lastSeenAt: number; occurrence: number | null;
-    }>(`SELECT r.session_key AS sessionKey, r.status, r.attempts, r.last_seen AS lastSeenAt,
+    // `after` is an opaque cursor: the rowid of the last returned row. It never
+    // carries member ids, because request URLs reach Workers invocation logs.
+    // Upserts keep a row's rowid, so pages follow first-detection order.
+    const rows = sql.exec<{
+      cursor: number; sessionKey: string; status: string; attempts: number; lastSeenAt: number; occurrence: number | null;
+    }>(`SELECT r.rowid AS cursor, r.session_key AS sessionKey, r.status, r.attempts, r.last_seen AS lastSeenAt,
       ${hasOccurrences ? 'o.occurrence' : 'NULL'} AS occurrence
       FROM gca_reminders r
       ${hasOccurrences ? 'LEFT JOIN gca_occurrences o ON o.session_key = r.session_key' : ''}
-      WHERE r.session_key > ? AND (r.attempts > 0 OR r.status IN ('sent', 'reserved', 'failed'))
-      ORDER BY r.session_key LIMIT 101`, after).toArray();
-    return { records: records.slice(0, 100), nextCursor: records.length > 100 ? records[99]!.sessionKey : null };
+      WHERE r.rowid > ? AND (r.attempts > 0 OR r.status IN ('sent', 'reserved', 'failed'))
+      ORDER BY r.rowid LIMIT 101`, after).toArray();
+    const records = rows.slice(0, 100).map(({ cursor: _cursor, ...record }) => record);
+    return { records, nextCursor: rows.length > 100 ? String(rows[99]!.cursor) : null };
   }
 
   private async runOnce(): Promise<PollResult> {
@@ -98,8 +100,10 @@ export class PollCoordinator extends DurableObject<Env> {
     }
 
     const startedAt = Date.now();
-    if (snapshot.lastPollStartedAt !== undefined &&
-        startedAt - snapshot.lastPollStartedAt < MIN_POLL_INTERVAL_MS) {
+    // A future start time (clock skew or corrupted storage) is not trusted as a
+    // throttle: otherwise it would block every poll until that time arrives.
+    const elapsed = snapshot.lastPollStartedAt === undefined ? undefined : startedAt - snapshot.lastPollStartedAt;
+    if (elapsed !== undefined && elapsed >= 0 && elapsed < MIN_POLL_INTERVAL_MS) {
       if (snapshot.error) throw new Error(snapshot.error);
       return { skipped: true };
     }

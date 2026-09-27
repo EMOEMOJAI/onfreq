@@ -153,6 +153,40 @@ it('returns a generic failure if the coordinator is unavailable', async () => {
   expect(await response.json()).toEqual({ error: 'coordinator unavailable' });
 });
 
+it('S20-5: pagination cursors are opaque and never carry member ids', async () => {
+  await seed(105);
+  const first = await (await SELF.fetch('https://example.com/gca-history', { headers })).json() as { records: { sessionKey: string }[]; nextCursor: string };
+  expect(first.nextCursor).toMatch(/^\d{1,12}$/);
+  for (const record of first.records) expect(first.nextCursor).not.toContain(record.sessionKey.split(':')[0]);
+  // The former member-id cursor shape is refused rather than silently reinterpreted.
+  for (const legacy of ['600001:123555', '600001%3A123555', '1234567890123', '-1', '1.5']) {
+    const response = await SELF.fetch(`https://example.com/gca-history?after=${legacy}`, { headers });
+    expect(response.status).toBe(400);
+    expect(await response.text()).not.toContain('600001');
+  }
+});
+
+it('S20-5: pages follow stable first-detection order, independent of member ids and later updates', async () => {
+  const keys = ['900009:1', '100001:5', '500005:3', '100001:2'];
+  await runInDurableObject(env.POLL_COORDINATOR.getByName(COORDINATOR_NAME), (_instance, ctx) => {
+    const sql = ctx.storage.sql;
+    sql.exec('CREATE TABLE gca_reminders (session_key TEXT PRIMARY KEY, status TEXT, attempts INTEGER, last_seen INTEGER)');
+    for (const key of keys) sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, ?)', key, 'sent', 1, 1000);
+    for (let i = 0; i < 100; i++) sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, ?)', `700007:${i}`, 'failed', 1, 1000);
+  });
+  const first = await (await SELF.fetch('https://example.com/gca-history', { headers })).json() as { records: { sessionKey: string }[]; nextCursor: string };
+  expect(first.records.slice(0, 4).map((record) => record.sessionKey)).toEqual(keys);
+  expect(first.records[0]).not.toHaveProperty('cursor');
+  // An upsert of an already-returned row must not move it past the cursor.
+  await runInDurableObject(env.POLL_COORDINATOR.getByName(COORDINATOR_NAME), (_instance, ctx) => {
+    ctx.storage.sql.exec(`INSERT INTO gca_reminders (session_key, status, attempts, last_seen) VALUES ('100001:5', 'sent', 1, 2000)
+      ON CONFLICT(session_key) DO UPDATE SET last_seen = excluded.last_seen, attempts = gca_reminders.attempts + 1`);
+  });
+  const second = await (await SELF.fetch(`https://example.com/gca-history?after=${first.nextCursor}`, { headers })).json() as { records: { sessionKey: string }[]; nextCursor: string | null };
+  expect(second.records.map((record) => record.sessionKey)).toEqual(['700007:96', '700007:97', '700007:98', '700007:99']);
+  expect(second.nextCursor).toBeNull();
+});
+
 it('rejects invalid cursors and write methods', async () => {
   expect((await SELF.fetch('https://example.com/gca-history?after=invalid', { headers })).status).toBe(400);
   expect((await SELF.fetch('https://example.com/gca-history', { method: 'POST', headers })).status).toBe(405);
