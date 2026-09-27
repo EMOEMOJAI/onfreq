@@ -4,33 +4,22 @@
 # .gitignore only protects files whose *names* match a pattern; it does nothing
 # about a token pasted into a source file. This catches that case.
 #
-# Install (per clone — git hooks are not themselves versioned):
-#   Check `git config --get core.hooksPath` first. Only if unset:
-#     git config core.hooksPath scripts/hooks
-#   Preserve existing hooks and any private-history push guard.
+# Install per clone (Git does not version hooks); see README.md. If the
+# directory `git rev-parse --git-path hooks` prints has hooks other than
+# *.sample, keep them and call this file from their pre-commit at the
+# repository root.
+# Otherwise:
+#   git config core.hooksPath scripts/hooks
 set -eu
-# These variables would replace the repository's Gitleaks rules, for example
-# with an empty rule set; the scan uses only the reviewed configuration.
-unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
 
 if ! command -v gitleaks >/dev/null 2>&1; then
   printf 'pre-commit: install gitleaks before committing (https://github.com/gitleaks/gitleaks).\n' >&2
   exit 1
 fi
 
-# Gitleaks reads these from the current directory even when untracked or ignored.
-for file in .gitleaks.toml .gitleaksignore; do
-  if { [ -e "$file" ] || [ -L "$file" ]; } && ! git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
-    printf 'pre-commit: BLOCKED — untracked or ignored %s would change the secret scan.\n' "$file" >&2
-    printf 'Stage or remove it, then commit.\n' >&2
-    exit 1
-  fi
-done
-if ! git diff --quiet --no-ext-diff --no-textconv -- .gitleaks.toml .gitleaksignore; then
-  printf 'pre-commit: BLOCKED — unstaged changes to Gitleaks settings would change the secret scan.\n' >&2
-  printf 'Stage, stash or discard them, then commit.\n' >&2
-  exit 1
-fi
+# shellcheck source-path=SCRIPTDIR/../.. source=scripts/hooks/lib/gitleaks-settings.sh
+. scripts/hooks/lib/gitleaks-settings.sh
+gitleaks_settings_guard pre-commit Stage commit || exit 1
 
 if ! tmp=$(mktemp -d); then
   printf 'pre-commit: BLOCKED — could not create a temporary directory.\n' >&2

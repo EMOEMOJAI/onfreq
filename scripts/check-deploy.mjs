@@ -4,8 +4,8 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // A copied public template must never silently replace an existing deployment.
-// The public deploy script runs this directly as well as through predeploy, so
-// npm's ignore-scripts setting cannot skip it. lstat also catches symlinks,
+// The public deploy script runs this itself rather than as a predeploy hook,
+// so npm's ignore-scripts setting cannot skip it. lstat also catches symlinks,
 // including dangling ones; any error other than "absent" fails closed.
 const root = fileURLToPath(new URL('../', import.meta.url));
 const privateNames = ['wrangler.local.jsonc', 'wrangler.local.json', 'wrangler.local.toml'];

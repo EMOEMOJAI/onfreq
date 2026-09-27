@@ -1,15 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   launchd agent that triggers the bot's poll endpoint every 60s.
-  Replace __HOME__ with your home directory, then (see docs/setup.md):
-
-    launchctl bootout gui/$(id -u)/com.onfreq.poll 2>/dev/null || true
-    cp com.onfreq.poll.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.onfreq.poll.plist
-
-  StartInterval counts from when the agent was loaded, not from the top of
-  the minute, so this naturally lands off :00 and won't collide with the
-  Cloudflare cron if that ever recovers.
+  Install or upgrade it only with the steps in docs/setup.md, section
+  "Health and optional Mac fallback" (docs/setup.md#health-and-optional-mac-fallback).
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

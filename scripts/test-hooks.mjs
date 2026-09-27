@@ -12,16 +12,19 @@ const hooksDir = fileURLToPath(new URL('./hooks', import.meta.url));
 const preCommit = fileURLToPath(new URL('./hooks/pre-commit', import.meta.url));
 const preCommitShim = fileURLToPath(new URL('./pre-commit', import.meta.url));
 const zero = '0'.repeat(40);
+const hookHelpers = ['check-privacy.mjs', 'repo-files.mjs', 'secret-scan.sh', 'hooks/lib/gitleaks-settings.sh'];
 const hasGitleaks = spawnSync('gitleaks', ['version'], { stdio: 'ignore' }).status === 0;
 // A synthetic AWS-format key assembled at runtime, so this file never contains it.
 const syntheticKey = () => ['AKIA', 'Q7RZ', 'LX2M', 'NB4K', 'TWPJ'].join('');
 
 // A synthetic repository with fake npm and gitleaks commands that record their
 // arguments (and, for gitleaks, the commits in the scanned log), so the hook's ref
-// and index gating is tested without running the real checks. With realRange,
-// range checks run the real check-privacy.mjs copied into the fixture; gitleaks:
-// 'real' uses the installed Gitleaks, 'missing' none. Global and system Git
-// configuration are ignored so the scanned log format is predictable.
+// and index gating is tested without running the real checks. The hooks' own
+// helpers (range arguments, secret scan, Gitleaks settings guard) are copied in
+// and committed, as the hooks run them from the repository root. With realRange,
+// npm range checks run the real check-privacy.mjs too; gitleaks: 'real' uses the
+// installed Gitleaks, 'missing' none. Global and system Git configuration are
+// ignored so the scanned log format is predictable.
 function fixture(t, { npmExit = 0, realRange = false, gitleaks = 'fake', gitleaksExit = 0 } = {}) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-hooks-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -30,7 +33,8 @@ function fixture(t, { npmExit = 0, realRange = false, gitleaks = 'fake', gitleak
   const env = isolatedEnv({ PATH: `${bin}:${process.env.PATH}`, NPM_LOG: join(dir, 'npm.log'), NPM_EXIT: String(npmExit),
     GITLEAKS_LOG: join(dir, 'gitleaks.log'), GITLEAKS_EXIT: String(gitleaksExit),
     NODE: process.execPath, REAL_RANGE: realRange ? '1' : '', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
-  for (const path of [repo, bin, join(repo, 'scripts')]) mkdirSync(path);
+  for (const path of [repo, bin, join(repo, 'scripts/hooks/lib')]) mkdirSync(path, { recursive: true });
+  symlinkSync(process.execPath, join(bin, 'node'));
   writeFileSync(join(bin, 'npm'), `#!/bin/sh
 printf '%s\\n' "$*" >> "$NPM_LOG"
 if [ -n "$REAL_RANGE" ] && [ "$3" = check:privacy ] && [ "\${5:-}" = --range ]; then
@@ -61,15 +65,9 @@ exit "$GITLEAKS_EXIT"
   git('init', '--quiet', '--initial-branch=main');
   writeFileSync(join(repo, 'public.txt'), 'first\n');
   writeFileSync(join(repo, 'package.json'), '{ "private": true }\n');
-  if (realRange) {
-    for (const name of ['check-privacy.mjs', 'repo-files.mjs']) {
-      copyFileSync(new URL(`./${name}`, import.meta.url), join(repo, 'scripts', name));
-    }
-    symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(repo, 'node_modules'));
-    writeFileSync(join(repo, '.gitignore'), 'node_modules\n');
-  } else {
-    writeFileSync(join(repo, 'scripts/check.mjs'), '// synthetic check\n');
-  }
+  for (const name of hookHelpers) copyFileSync(new URL(`./${name}`, import.meta.url), join(repo, 'scripts', name));
+  symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(repo, 'node_modules'));
+  writeFileSync(join(repo, '.gitignore'), 'node_modules\n');
   git('add', '.');
   git('commit', '--quiet', '--no-verify', '-m', 'first');
   const first = git('rev-parse', 'HEAD');
@@ -175,7 +173,16 @@ test('pre-push blocks when Gitleaks reports a finding or is not installed (S19-2
   let result = f.push([ref(f.head)]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /synthetic finding: REDACTED/);
-  assert.match(result.stderr, /pushed commits look like they contain a secret/);
+  assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/);
+  // Regression (C53): Gitleaks errors, such as a bad configuration, exit non-zero
+  // too; the message stays neutral instead of asserting a leak.
+  for (const gitleaksExit of [1, 2, 126]) {
+    f = fixture(t, { gitleaksExit });
+    result = f.push([ref(f.head)]);
+    assert.equal(result.status, 1, String(gitleaksExit));
+    assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits; see the output above/);
+    assert.doesNotMatch(result.stderr, /look like they contain a secret|could not read the pushed commits/);
+  }
   f = fixture(t, { gitleaks: 'missing' });
   result = f.push([ref(f.head)]);
   assert.equal(result.status, 1);
@@ -197,7 +204,7 @@ test('pre-push Gitleaks scan catches a secret committed with --no-verify and red
     // Removed from the final tree, but still in a pushed commit.
     let result = f.push([ref(head)]);
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /pushed commits look like they contain a secret/);
+    assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/);
     assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)));
     assert.equal(result.npm, rangeCheck(head), 'the secret scan blocks before the full checks');
     // A remote that already has the secret commit is only sent the removal.
@@ -230,7 +237,7 @@ test('pre-push Gitleaks scan reads the literal bytes of binary, -diff and textco
       const head = f.git('rev-parse', 'HEAD');
       const result = f.push([ref(head, 'refs/heads/main', base)]);
       assert.equal(result.status, 1, `${name}: ${result.stderr}`);
-      assert.match(result.stderr, /pushed commits look like they contain a secret/, name);
+      assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/, name);
       assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)), name);
       base = head;
     }
@@ -248,7 +255,7 @@ test('pre-push Gitleaks scan catches a secret only a merge resolution adds (S19-
     const { merge, head } = mergeOnlySecret(f, token);
     let result = f.push([ref(head, 'refs/heads/main', f.head)]);
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /pushed commits look like they contain a secret/);
+    assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/);
     assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)));
     // A clean merge in the pushed range passes.
     result = f.push([ref(head, 'refs/heads/main', merge)]);
@@ -272,7 +279,7 @@ test('pre-push Gitleaks scan still diffs merges when log.diffMerges is off (S19-
     f.git('config', 'log.diffMerges', 'off');
     const result = f.push([ref(head, 'refs/heads/main', f.head)]);
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /pushed commits look like they contain a secret/);
+    assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/);
     assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)));
   });
 
@@ -286,6 +293,93 @@ test('pre-push blocks when Git cannot produce the pushed log (S19-28)', (t) => {
   assert.match(result.stderr, /could not read the pushed commits for the secret scan/);
   assert.doesNotMatch(result.npm, /check:setup/);
 });
+
+test('pre-push scans the range check-privacy.mjs --range-args prints and blocks without it (C47)', (t) => {
+  const f = fixture(t);
+  f.git('remote', 'add', 'origin', 'https://example.test/synthetic.git');
+  f.git('update-ref', 'refs/remotes/origin/main', f.first);
+  const rangeArgs = (...args) => spawnSync(process.execPath, ['scripts/check-privacy.mjs', '--range-args', ...args],
+    { cwd: f.repo, env: isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }), encoding: 'utf8' });
+  let result = rangeArgs(f.head, f.first, 'origin');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, `${f.head}\n--not\n${f.first}\n--remotes=origin\n`);
+  assert.equal(rangeArgs(f.head, zero, '').stdout, `${f.head}\n`);
+  // SHA-256 repositories use 64-digit IDs; anything else is refused, printing nothing.
+  for (const bad of [f.head.slice(0, 39), 'HEAD', zero]) {
+    result = rangeArgs(bad, zero, 'origin');
+    assert.equal(result.status, 1, bad);
+    assert.equal(result.stdout, '', bad);
+  }
+  // A committed range script that fails blocks the push before the setup checks.
+  writeFileSync(join(f.repo, 'scripts/check-privacy.mjs'), 'process.exitCode = 1;\n');
+  f.git('commit', '--quiet', '--no-verify', '-am', 'broken range');
+  result = f.push([ref(f.git('rev-parse', 'HEAD'))]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /could not read the pushed commits for the secret scan/);
+  assert.equal(result.gitleaks, '');
+  assert.doesNotMatch(result.npm, /check:setup/);
+});
+
+test('CI and pre-push share scripts/secret-scan.sh; it reports unreadable history separately (C47)', (t) => {
+  const f = fixture(t, { gitleaksExit: 1 });
+  const scan = (...args) => spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args],
+    { cwd: f.repo, env: isolatedEnv({ PATH: `${join(f.repo, '..', 'bin')}:${process.env.PATH}`,
+      GITLEAKS_LOG: join(f.repo, '..', 'scan.log'), GITLEAKS_EXIT: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_NOSYSTEM: '1', GITLEAKS_CONFIG: 'rules.toml' }), encoding: 'utf8' });
+  assert.equal(scan('HEAD').status, 1, 'any Gitleaks failure is status 1');
+  assert.equal(scan().status, 2, 'no revisions is a usage error');
+  assert.equal(scan('--not-a-revision-xyz').status, 2, 'a Git failure is status 2');
+  const log = readFileSync(join(f.repo, '..', 'scan.log'), 'utf8');
+  assert.doesNotMatch(log, /config variable set/);
+  // The CI step runs this script over the full history, and every Gitleaks
+  // install uses the one pinned, checksum-verified definition.
+  const workflow = readFileSync(new URL('../.github/workflows/checks.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /^ +run: sh scripts\/secret-scan\.sh HEAD$/m);
+  assert.doesNotMatch(workflow, /gitleaks stdin|gitleaks_\d/);
+  assert.equal(workflow.match(/^ +uses: \.\/\.github\/actions\/install-gitleaks$/gm)?.length, 3);
+  const action = readFileSync(new URL('../.github/actions/install-gitleaks/action.yml', import.meta.url), 'utf8');
+  assert.equal(action.match(/ sha256=[0-9a-f]{64} ;;$/gm)?.length, 3);
+  // Both hooks share one Gitleaks settings guard.
+  for (const file of ['./hooks/pre-push', './hooks/pre-commit']) {
+    const source = readFileSync(new URL(file, import.meta.url), 'utf8');
+    assert.match(source, /^\. scripts\/hooks\/lib\/gitleaks-settings\.sh$/m, file);
+    assert.doesNotMatch(source, /in \.gitleaks\.toml|untracked or ignored|GITLEAKS_CONFIG/, file);
+  }
+});
+
+test('secret-scan.sh finds a secret anywhere in history with the real Gitleaks, as CI runs it (C47)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+    const scan = () => spawnSync('/bin/sh', ['scripts/secret-scan.sh', 'HEAD'], { cwd: f.repo, env, encoding: 'utf8' });
+    assert.equal(scan().status, 0, scan().stderr);
+    const token = stageSyntheticKey(f);
+    f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret');
+    f.git('rm', '--quiet', 'config.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'remove synthetic secret');
+    const result = scan();
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)));
+  });
+
+test('privacy checks ignore log.showSignature on signed commits (C45)',
+  { skip: spawnSync('ssh-keygen', ['-?'], { stdio: 'ignore' }).error && 'ssh-keygen is not installed' }, (t) => {
+    const f = fixture(t, { realRange: true });
+    // An SSH-signed synthetic commit; no GPG agent or real key is involved.
+    const key = join(f.repo, '..', 'signing-key');
+    assert.equal(spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'synthetic', '-f', key]).status, 0);
+    writeFileSync(join(f.repo, 'public.txt'), 'signed\n');
+    f.git('-c', 'gpg.format=ssh', '-c', `user.signingkey=${key}`, 'commit', '--quiet', '--no-verify', '-S', '-am', 'signed');
+    const head = f.git('rev-parse', 'HEAD');
+    f.git('config', 'log.showSignature', 'true');
+    const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+    for (const args of [[], ['--range', head, zero, 'origin']]) {
+      const result = spawnSync(process.execPath, ['scripts/check-privacy.mjs', ...args], { cwd: f.repo, env, encoding: 'utf8' });
+      assert.equal(result.status, 0, `${args.join(' ')}: ${result.stderr}`);
+    }
+    const result = f.push([ref(head)]);
+    assert.equal(result.status, 0, result.stderr);
+  });
 
 test('pre-push ignores Gitleaks configuration variables (S19-29)', (t) => {
   const f = fixture(t);
@@ -308,7 +402,7 @@ test('pre-push Gitleaks scan cannot be emptied by configuration variables (S19-2
     for (const env of [{ GITLEAKS_CONFIG: rules }, { GITLEAKS_CONFIG_TOML: 'title = "no rules"\n' }]) {
       const result = f.push([ref(head, 'refs/heads/main', f.head)], undefined, env);
       assert.equal(result.status, 1, result.stderr);
-      assert.match(result.stderr, /pushed commits look like they contain a secret/);
+      assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/);
     }
   });
 
@@ -368,7 +462,7 @@ test('pre-push refuses when the index differs from HEAD (git rm --cached bypass)
 
 test('pre-push refuses unstaged edits to the checks or package files', (t) => {
   const f = fixture(t);
-  for (const file of ['package.json', 'scripts/check.mjs']) {
+  for (const file of ['package.json', ...hookHelpers.map((name) => `scripts/${name}`)]) {
     const original = readFileSync(join(f.repo, file), 'utf8');
     writeFileSync(join(f.repo, file), `${original}// unstaged\n`);
     const result = f.push([ref(f.head)]);

@@ -46,7 +46,7 @@ Public delivery is at least once; retries can occasionally produce duplicate car
 
 Share a small, anonymized example so others can reproduce the problem. Maintainer changes go directly to main after checks; please do not open pull requests.
 
-Working on the code? Start with [AGENTS.md](AGENTS.md) for the source map and checks. [Versioned Git hooks](scripts/hooks/) scan commits with Gitleaks and, before pushes, run Gitleaks and privacy checks on every pushed commit plus setup checks; if `git config --get core.hooksPath` is unset, enable them with `git config core.hooksPath scripts/hooks`. Older clones set to `scripts` get no pre-push check; repoint them with the same command. AI tools can use the [documentation index](llms.txt); shared instructions also have entry points for Claude, Gemini and GitHub Copilot.
+Working on the code? Start with [AGENTS.md](AGENTS.md) for the source map and checks. [Versioned Git hooks](scripts/hooks/) scan commits with Gitleaks and, before pushes, run Gitleaks and privacy checks on every pushed commit plus setup checks. If the directory `git rev-parse --git-path hooks` prints has hooks other than `*.sample`, keep them and call `scripts/hooks/pre-commit` and `scripts/hooks/pre-push` from them (pre-push with the same arguments and standard input); otherwise enable them with `git config core.hooksPath scripts/hooks`. Older clones set to `scripts` get no pre-push check; repoint them with the same command. AI tools can use the [documentation index](llms.txt); shared instructions also have entry points for Claude, Gemini and GitHub Copilot.
 
 [Security & privacy](SECURITY.md) · [MIT license](LICENSE)
 

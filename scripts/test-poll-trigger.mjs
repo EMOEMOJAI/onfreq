@@ -2,8 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, chmodSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+
+// Resolved from this file, so the tests run from any working directory.
+const script = fileURLToPath(new URL('./poll-trigger.sh', import.meta.url));
 
 function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), 'onfreq-poll-test-'));
@@ -28,7 +32,7 @@ exit "$TEST_CURL_EXIT"
   return {
     dir,
     run(code = '200', overrides = {}) {
-      return spawnSync('/bin/sh', [resolve('scripts/poll-trigger.sh')], {
+      return spawnSync('/bin/sh', [script], {
         env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, POLL_ENDPOINT: '',
           ONFREQ_POLL_DIR: dir, ONFREQ_POLL_LOG: join(dir, 'poll.log'), CURL_HOME: dir,
           TEST_HTTP_CODE: code, TEST_CURL_EXIT: '0', ...overrides }, encoding: 'utf8',
