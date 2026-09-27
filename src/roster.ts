@@ -225,6 +225,7 @@ export async function syncRosterMessages(
         if (!tracked.has(id)) await deleteMessage(botToken, channelId, id, limits);
       }
     } catch (err) {
+      failed = true;
       console.error(JSON.stringify({ event: 'roster_orphan_sweep_failed', channelIndex: logIndex(channelId), error: String(err) }));
       // Keep only the time windows: should the parent be shown again, its
       // pages post fresh rather than stay frozen with stale content.

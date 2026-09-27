@@ -387,6 +387,64 @@ describe('polling through the Durable Object', () => {
     expect(cards.get(mid(a))?.title).toContain('OFFLINE');
   });
 
+  it('C16: drops a malformed stored closeout job or session instead of failing every poll', async () => {
+    const error = vi.spyOn(console, 'error');
+    const valid: PendingOffline = {
+      event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
+      messages: [{ channelId: '900000000000000001', messageId: mid(a) }], channelIds: [],
+    };
+    const { messages: _messages, ...malformed } = { ...valid, event: { ...valid.event, callsign: b } };
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, {
+        state: { [b]: { ...session(b), messages: [null] } as unknown as TrackedAtc },
+        pendingOffline: [malformed as unknown as PendingOffline, valid],
+      } satisfies PollSnapshot);
+    });
+    feed = [entry(b)];
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
+    expect(cards.get(mid(a))?.title).toContain('OFFLINE');
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'sessions_dropped', reason: 'invalid', count: 1 }));
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'invalid', count: 1 }));
+    // The dropped session is tracked afresh, as a new connection.
+    expect(sent.filter((message) => message.method === 'POST').map((message) => message.embed.title))
+      .toEqual([expect.stringContaining(`${b} is now ONLINE`)]);
+  });
+
+  it('C17: closes an excluded legacy session the same way as one that disconnects', async () => {
+    // Predates both `messages` and `pendingChannelIds`: treated as announced.
+    const { messages: _messages, ...legacy } = session(a);
+    await seed({ [a]: legacy });
+    feed = [entry(a)];
+    await expect(configuredPoll({ EXCLUDED_CALLSIGNS: a, DISCORD_CHANNEL_IDS: '900000000000000001' }))
+      .resolves.toEqual({ skipped: false });
+    expect(sent.map((message) => [message.method, message.embed.title])).toEqual([
+      ['POST', expect.stringContaining(`${a} went OFFLINE`)],
+    ]);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('C19: charges a destination one failed poll however many of its requests fail, then gives all of them up', async () => {
+    const error = vi.spyOn(console, 'error');
+    const channel = '900000000000000001';
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
+        event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
+        messages: [{ channelId: channel, messageId: mid(a) }, { channelId: channel, messageId: mid('a-copy') }],
+        channelIds: [], attemptsByChannel: { [channel]: 9 },
+      }] } satisfies PollSnapshot);
+    });
+    failures.add(mid(a));
+    failures.add(mid('a-copy'));
+    const run = () => configuredPoll({ DISCORD_CHANNEL_IDS: channel });
+    await expect(run()).rejects.toThrow('all Discord notifications failed');
+    expect((await snapshot())?.pendingOffline?.[0]?.attemptsByChannel).toEqual({ [channel]: 10 });
+    now += 60_000;
+    await expect(run()).rejects.toThrow('all Discord notifications failed');
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    expect(error.mock.calls.filter(([line]) => String(line).includes('offline_abandoned'))).toHaveLength(1);
+  });
+
   it('closes out an ended session before announcing a new one in the same poll', async () => {
     await seed({ [a]: session(a) });
     feed = [entry(b)];
@@ -578,6 +636,18 @@ describe('polling through the Durable Object', () => {
       now += 10 * 60_000;
       await reconnect();
       expect(pings()).toBe(2);
+    });
+
+    it('C18: ignores a stored ping time in the future', async () => {
+      await runInDurableObject(stub(), async (_, ctx) => {
+        await ctx.storage.put(POLL_SNAPSHOT_KEY, {
+          state: {}, rolePings: { '900000000000000001': START + 3_600_000 },
+        } satisfies PollSnapshot);
+      });
+      feed = [entry(a)];
+      await rolePoll();
+      expect(pings()).toBe(1);
+      expect((await snapshot())?.rolePings).toEqual({ '900000000000000001': START });
     });
 
     it('honours a configured cooldown, including 0 for one ping per poll', async () => {
@@ -957,8 +1027,11 @@ describe('polling through the Durable Object', () => {
     feed = [{ ...entry('XDAA_ARR_APP'), userId: 600001, id: 999 }];
     gcaMemberStatus = 403;
     now += 60_000;
+    const error = vi.spyOn(console, 'error');
     await expect(gcaPoll()).resolves.toEqual({ skipped: false });
     expect(gcaMessages).toHaveLength(0);
+    // C20: only the error class is logged, never its message.
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'gca_poll_failed', error: 'Error' }));
     expect(sent.some((m) => m.method === 'POST' && m.embed.title?.includes('ONLINE'))).toBe(true);
   });
 
@@ -1843,9 +1916,21 @@ describe('polling through the Durable Object', () => {
     feed = [entry(a, 121.7), entry(b), entry(c)];
     await nextPoll();
     expect((await stub().getState())?.[b]?.messages).toEqual([]);
+    expect(Object.keys((await stub().getState())?.[b]?.uncertainPosts ?? {})).toEqual(['900000000000000001']);
     const count = sent.length;
     await nextPoll();
     expect(sent).toHaveLength(count);
+    // C13: access may return before the session ends, so its end still
+    // looks for that card (re-posting under its nonce) and closes it.
+    feed = [entry(a, 121.7), entry(c)];
+    await nextPoll();
+    await nextPoll();
+    const recovered = sent.slice(count).find((message) =>
+      message.method === 'POST' && message.embed.title?.includes(`${b} is now ONLINE`));
+    expect(recovered?.nonce).toBe(messageNonce(`online:100:${b}:${new Date(START - 3_600_000).toISOString()}`,
+      '900000000000000001'));
+    expect(cards.get(recovered!.id!)?.title).toContain(`${b} is OFFLINE`);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
   describe('roster continuation messages', () => {

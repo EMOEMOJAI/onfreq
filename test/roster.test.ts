@@ -110,6 +110,8 @@ it.each([
 ])('keeps sweeping after a transient failure but gives up on a 4xx (%j)', async ({ status, kept }) => {
   stubDiscord(() => Response.json({ code: 0 }, { status }));
   const result = await syncRosterMessages(TOKEN, [], [], new DiscordRateLimits(), [dropped({ abandoned: true })]);
+  // C20: a failed sweep fails the poll like any other roster update.
+  expect(result.failed).toBe(true);
   // Only the time window is kept, so a returning parent posts the page fresh.
   expect(result.postAttempts).toEqual(kept ? [dropped({ nonceKey: undefined })].map(({ nonceKey: _n, ...rest }) => rest) : []);
 });

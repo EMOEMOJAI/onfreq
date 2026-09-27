@@ -1,18 +1,97 @@
 import { hasFrequency } from './ivao';
-import type { DiffResult, OfflineEvent, OnlineAtc, StateMap, TrackedAtc } from './types';
+import type {
+  DiffResult, OfflineEvent, OnlineAtc, PendingOffline, PostedMessage, PostWindow, StateMap, TrackedAtc,
+} from './types';
+
+type Guard<T> = (value: unknown) => value is T;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+const isString: Guard<string> = (value): value is string => typeof value === 'string';
+const isNumber: Guard<number> = (value): value is number => typeof value === 'number';
+const arrayOf = <T>(guard: Guard<T>): Guard<T[]> => (value): value is T[] => Array.isArray(value) && value.every(guard);
+const recordOf = <T>(guard: Guard<T>): Guard<Record<string, T>> => (value): value is Record<string, T> =>
+  isRecord(value) && Object.values(value).every(guard);
+const optional = <T>(guard: Guard<T>): Guard<T | undefined> => (value): value is T | undefined =>
+  value === undefined || guard(value);
+
+const isPostedMessage: Guard<PostedMessage> = (value): value is PostedMessage =>
+  isRecord(value) && isString(value.channelId) && isString(value.messageId);
+const isPostWindow: Guard<PostWindow> = (value): value is PostWindow =>
+  isRecord(value) && Number.isFinite(value.from) && Number.isFinite(value.to);
+
+/** Whether a stored session has every field a poll reads, in the shape it reads it. */
+function isTrackedAtc(value: unknown): value is TrackedAtc {
+  return isRecord(value) && isString(value.callsign) && isString(value.position) && isNumber(value.frequency) &&
+    isNumber(value.userId) && isString(value.since) && isNumber(value.missed) &&
+    (value.station == null || isString(value.station)) && (value.location == null || isString(value.location)) &&
+    optional(arrayOf(isPostedMessage))(value.messages) && optional(arrayOf(isString))(value.pendingChannelIds) &&
+    optional(recordOf(isPostWindow))(value.uncertainPosts);
+}
+
+function isPendingOffline(value: unknown): value is PendingOffline {
+  if (!isRecord(value)) return false;
+  const event = value.event;
+  return isTrackedAtc(event) && isString((event as Partial<OfflineEvent>).endedAt) &&
+    isNumber((event as Partial<OfflineEvent>).durationSeconds) &&
+    arrayOf(isPostedMessage)(value.messages) && arrayOf(isString)(value.channelIds) &&
+    optional(recordOf(isPostWindow))(value.recoverPosts) && optional(isRecord)(value.attemptsByChannel);
+}
 
 /**
  * `roster` is a legacy field removed from `TrackedAtc`; strip it from any
- * session loaded from storage before an older deploy wrote it. Used both by
- * `diffState` (so it never survives on a resumed, still-missing, or
- * just-closed session) and by callers that load a session or offline event
- * from storage outside `diffState` (excluded-callsign closeouts, imported
- * `PendingOffline` jobs) — a legacy field must not survive on any of those
- * paths either.
+ * session or offline event loaded from storage before an older deploy wrote
+ * it, so it never survives on a resumed, still-missing, closed or excluded
+ * session, or on an imported `PendingOffline` job.
  */
-export function stripLegacyRoster<T extends TrackedAtc>(session: T): T {
+function stripLegacyRoster<T extends TrackedAtc>(session: T): T {
   const { roster: _legacyRoster, ...kept } = session as T & { roster?: boolean };
   return kept as T;
+}
+
+/**
+ * Stored sessions and closeout jobs, normalized once where a poll loads them.
+ * An entry missing a field every poll reads (a corrupt or hand-edited
+ * snapshot) is dropped, logged by count only, instead of throwing on every
+ * poll and halting delivery for everything else.
+ */
+export function loadSessions(stored: StateMap): StateMap {
+  const entries = Object.entries(stored);
+  const valid = entries.filter(([, session]) => isTrackedAtc(session));
+  if (valid.length < entries.length) {
+    console.error(JSON.stringify({ event: 'sessions_dropped', reason: 'invalid', count: entries.length - valid.length }));
+  }
+  return Object.fromEntries(valid.map(([callsign, session]) => [callsign, stripLegacyRoster(session)]));
+}
+
+/** See `loadSessions`. */
+export function loadPendingOffline(stored: unknown[]): PendingOffline[] {
+  const valid = stored.filter(isPendingOffline);
+  if (valid.length < stored.length) {
+    console.error(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'invalid', count: stored.length - valid.length }));
+  }
+  return valid.map((job) => ({ ...job, event: stripLegacyRoster(job.event) }));
+}
+
+/**
+ * The closeout for a session that ended at `endedAt`, or undefined when it
+ * never earned a real ONLINE card. `pendingChannelIds` set (even to an empty
+ * array) alongside no successful `messages` means that — every caller that
+ * persists a session without messages (a failed announcement, or silently
+ * seeding first-run state) must set `pendingChannelIds` for this to hold; a
+ * legacy session predating both fields has neither, and is treated as
+ * already announced. A channel where a first card may have landed unseen
+ * still gets closed.
+ */
+export function offlineEventFor(tracked: TrackedAtc, missed: number, endedAt: string): OfflineEvent | undefined {
+  if (tracked.pending || (tracked.pendingChannelIds && !tracked.messages?.length &&
+    !Object.keys(tracked.uncertainPosts ?? {}).length)) return undefined;
+  const durationSeconds = Math.max(0, Math.round(
+    (Date.parse(endedAt) - Date.parse(tracked.since)) / 1000,
+  ));
+  return { ...tracked, missed, missingSince: endedAt, endedAt, durationSeconds };
 }
 
 /**
@@ -24,6 +103,8 @@ export function stripLegacyRoster<T extends TrackedAtc>(session: T): T {
  *   missing `gracePolls` consecutive times it goes into `wentOffline`.
  * - The same VID at a callsign reappearing within the grace window resumes silently —
  *   no duplicate "online" notification, original start time preserved.
+ *
+ * `prev` comes from `loadSessions`.
  *
  * The session end time is the *first* poll the callsign went missing
  * (`missingSince`), not the poll the grace window expired, so the reported
@@ -41,10 +122,6 @@ export function diffState(
   nowIso: string,
   gracePolls: number,
 ): DiffResult {
-  // Strip a legacy `roster` field from every loaded session up front,
-  // not just ones that resume below — it must not survive on a session that
-  // stays missing, or on the offline event `close()` copies out.
-  prev = Object.fromEntries(Object.entries(prev).map(([callsign, session]) => [callsign, stripLegacyRoster(session)]));
   const next: StateMap = {};
   const wentOnline: TrackedAtc[] = [];
   const wentOffline: OfflineEvent[] = [];
@@ -53,19 +130,8 @@ export function diffState(
   let changed = false;
 
   function close(tracked: TrackedAtc, missed: number, endedAt: string): void {
-    // `pendingChannelIds` set (even to an empty array) alongside no
-    // successful `messages` means this session never earned a real ONLINE
-    // card — every caller that persists a session without messages (a
-    // failed announcement, or silently seeding first-run state) must set
-    // `pendingChannelIds` for this to hold; a legacy session predating both
-    // fields has neither, and is treated as already announced.
-    // A channel where a first card may have landed unseen still gets closed.
-    if (tracked.pending || (tracked.pendingChannelIds && !tracked.messages?.length &&
-      !Object.keys(tracked.uncertainPosts ?? {}).length)) return;
-    const durationSeconds = Math.max(0, Math.round(
-      (Date.parse(endedAt) - Date.parse(tracked.since)) / 1000,
-    ));
-    wentOffline.push({ ...tracked, missed, missingSince: endedAt, endedAt, durationSeconds });
+    const event = offlineEventFor(tracked, missed, endedAt);
+    if (event) wentOffline.push(event);
   }
 
   for (const atc of current) {
@@ -79,7 +145,6 @@ export function diffState(
       if (existing.missed !== 0 || existing.missingSince !== undefined) changed = true;
       // `missingSince` is dropped rather than overwritten so a resumed
       // session doesn't carry a stale end time. `messages` is preserved.
-      // `roster` was already stripped above.
       const { missingSince: _resumed, pending: _held, ...kept } = existing;
       const entry: TrackedAtc = {
         ...kept,
