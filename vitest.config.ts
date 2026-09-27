@@ -1,7 +1,9 @@
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
+  // Scratch work under the ignored .local/ must never change the test gate.
+  test: { exclude: [...configDefaults.exclude, '.local/**', '.wrangler/**'] },
   plugins: [cloudflareTest({
     wrangler: { configPath: './wrangler.jsonc' },
     remoteBindings: false,
