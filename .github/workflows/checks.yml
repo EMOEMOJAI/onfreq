@@ -45,13 +45,14 @@ jobs:
           tar -xzf actionlint.tar.gz actionlint
           printf '%s\n' "$tool_dir" >> "$GITHUB_PATH"
 
-      # Same literal-byte log as the pre-push hook: merges against each parent,
-      # binary, -diff and textconv files as raw text; removed lines are dropped.
+      # Same literal-byte log as the pre-push hook: merges against each parent
+      # whatever log.diffMerges says, binary, -diff and textconv files as raw
+      # text; removed lines are dropped.
       # The bash shell's pipefail fails the step if Git or sed fails.
       - name: Scan reachable commit history for secrets
         shell: bash
         run: |
-          git log -p -U0 --root --no-ext-diff --no-textconv --text --no-color -m HEAD -- \
+          git log -p -U0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate HEAD -- \
             | LC_ALL=C sed '/^-/d' \
             | gitleaks stdin --redact --no-banner
 

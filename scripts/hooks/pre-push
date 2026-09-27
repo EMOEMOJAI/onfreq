@@ -88,10 +88,12 @@ trap 'exit 1' HUP INT TERM
 # Scans the literal bytes one pushed ref adds, matching check-privacy --range:
 # HEAD minus the remote ref's old commit, when present, and the pushed remote's
 # tracking refs. Merges are diffed against each parent, so content only a merge
-# resolution adds is scanned; external diff drivers, textconv filters and binary
-# or -diff attributes cannot hide content. Removed lines are dropped, so pushing
-# a removal does not re-flag content the remote already has. A failed Git or
-# filter stage leaves a marker, so an unreadable range blocks the push.
+# resolution adds is scanned; --diff-merges=separate, unlike -m, ignores the
+# log.diffMerges setting, which could turn merge diffs off. External diff
+# drivers, textconv filters and binary or -diff attributes cannot hide content.
+# Removed lines are dropped, so pushing a removal does not re-flag content the
+# remote already has. A failed Git or filter stage leaves a marker, so an
+# unreadable range blocks the push.
 scan_range() {
   old=$1
   set -- "$head" --not
@@ -107,7 +109,7 @@ $remotes
 $remote
 "*) set -- "$@" "--remotes=$remote" ;; esac ;;
   esac
-  { git log -p -U0 --root --no-ext-diff --no-textconv --text --no-color -m "$@" -- </dev/null ||
+  { git log -p -U0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null ||
       : >"$tmp/failed"; } |
     { LC_ALL=C sed '/^-/d' || : >"$tmp/failed"; } |
     gitleaks stdin --redact --no-banner
