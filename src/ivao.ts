@@ -97,6 +97,12 @@ const CALLSIGN_PATTERN = /^(?!__)[A-Za-z0-9_-]{2,32}$/;
 const FREQUENCY_STRING_PATTERN = /^\d{1,3}(\.\d{1,3})?$/;
 /** Frequencies at or above this many MHz are implausible and read as untuned. */
 const MAX_FREQUENCY_MHZ = 1000;
+/**
+ * The smallest tuned frequency: one kHz, the resolution the string form
+ * allows. A smaller positive number would render as 0.000 MHz, so it reads as
+ * untuned instead.
+ */
+const MIN_FREQUENCY_MHZ = 0.001;
 /** The whole-network summary is large; everything else keeps the default cap. */
 const IVAO_ATC_SUMMARY_MAX_BYTES = 2 * 1024 * 1024;
 /** More entries than this is not a real network snapshot; bounds sanitising work. */
@@ -114,11 +120,11 @@ function isPositiveId(value: unknown): value is number {
 /**
  * The feed occasionally reports frequency as a numeric string. Zero (`0`,
  * `"0.000"`) reads as 0, i.e. connected but untuned. Anything unusable — an
- * implausible number (negative, or 1000 MHz and above), a missing or
- * non-numeric value, or a string that is not plain decimal — is coerced to 0
- * too, so the entry is kept: an established session keeps its last frequency
- * and a new one waits, rather than the entry vanishing and producing a false
- * OFFLINE. `coerced` reports whether the raw value was unusable.
+ * implausible number (negative, positive but below 0.001, or 1000 MHz and
+ * above), a missing or non-numeric value, or a string that is not plain
+ * decimal — is coerced to 0 too, so the entry is kept: an established
+ * session keeps its last frequency and a new one waits, rather than the entry
+ * vanishing and producing a false OFFLINE. `coerced` reports whether the raw value was unusable.
  */
 function coerceFrequency(value: unknown): { frequency: number; coerced: boolean } {
   let frequency: number;
@@ -126,7 +132,7 @@ function coerceFrequency(value: unknown): { frequency: number; coerced: boolean 
   else if (typeof value === 'string' && FREQUENCY_STRING_PATTERN.test(value.trim())) frequency = Number(value.trim());
   else return { frequency: 0, coerced: true };
   if (frequency === 0) return { frequency: 0, coerced: false };
-  return frequency > 0 && frequency < MAX_FREQUENCY_MHZ
+  return frequency >= MIN_FREQUENCY_MHZ && frequency < MAX_FREQUENCY_MHZ
     ? { frequency, coerced: false }
     : { frequency: 0, coerced: true };
 }
@@ -517,10 +523,14 @@ export async function fetchDivisionAtc(
   }
   // A feed format change can make every (or nearly every) entry fail
   // validation instead of the request itself failing. Treat that the same as
-  // the zero-ATC check above: an outage, not a mass real disconnect.
-  if (sanitized.length === 0 || skipped > entries.length / 2) {
+  // the zero-ATC check above: an outage, not a mass real disconnect. Kept
+  // entries whose frequency was unusable count too: a feed whose frequencies
+  // all fail to parse would otherwise poll "successfully" while never
+  // announcing anyone. A genuine 0 (untuned) is not coerced and does not count.
+  const unusable = skipped + stats.frequencyCoerced;
+  if (sanitized.length === 0 || unusable > entries.length / 2) {
     throw new Error(
-      `IVAO API entries mostly failed validation (${skipped}/${entries.length} skipped); treating as feed outage`,
+      `IVAO API entries mostly failed validation (${skipped}/${entries.length} skipped, ${stats.frequencyCoerced} frequencies coerced); treating as feed outage`,
     );
   }
 

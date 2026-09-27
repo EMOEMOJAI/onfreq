@@ -598,6 +598,11 @@ function snowflakeTime(id: string): number {
 /** Messages requested per channel-scan page, and the smaller retry size for an oversized page. */
 const SCAN_PAGE_SIZE = 100;
 const SCAN_FALLBACK_PAGE_SIZE = 25;
+/**
+ * Messages one channel scan covers at most, whatever the page size: 5 pages
+ * of 100, or up to 20 pages once an oversized page forces pages of 25.
+ */
+const SCAN_MAX_MESSAGES = 500;
 
 /** The fields of a fetched Discord message this bot inspects. */
 export interface FetchedMessage {
@@ -609,7 +614,7 @@ export interface FetchedMessage {
 
 /**
  * Ids of this bot's messages matching `match`, among up to 500 messages
- * (fewer once an oversized page forces smaller pages) posted within the
+ * (in smaller pages once an oversized page forces them) posted within the
  * given time window (a minute of slack either side). Used
  * to find messages whose POST succeeded without the bot learning their id.
  * Returns nothing when the bot's own id is unknown.
@@ -623,7 +628,9 @@ export async function findBotMessages(
   const found: string[] = [];
   let after = snowflakeAt(window.from - 60_000);
   let limit = SCAN_PAGE_SIZE;
-  for (let page = 0; page < 5; page++) {
+  // Bounded by messages covered, not pages, so falling back to smaller pages
+  // keeps the same coverage (at most 20 pages, all of 25 messages).
+  for (let scanned = 0; scanned < SCAN_MAX_MESSAGES; scanned += limit) {
     const path = () => `/channels/${channelId}/messages?after=${after}&limit=${limit}`;
     let res: Response;
     try {
