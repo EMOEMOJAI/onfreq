@@ -98,18 +98,32 @@ it.each([
   ['/gca-history', 'GET', 'getGcaHistory'],
   ['/gca-history/cleanup', 'GET', 'cleanupGcaHistory'],
   ['/gca-history/cleanup', 'POST', 'cleanupGcaHistory'],
-])('C3: %s %s returns a generic 503 when the coordinator throws', async (path, method, name) => {
+])('C3/C56: %s %s returns a generic 503 and logs one detail-free line when the coordinator throws', async (path, method, name) => {
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
   const failing = vi.fn(async () => { throw new Error(PRIVATE_DETAIL); });
   for (const target of [
     withCoordinator({ [name]: failing }).env,
     { ...env, POLL_COORDINATOR: { getByName: () => { throw new Error(PRIVATE_DETAIL); } } as unknown as Env['POLL_COORDINATOR'] },
   ]) {
-    const response = await send(path, method, target, { 'x-onfreq-confirm': 'delete-old-copies' });
+    log.mockClear();
+    const response = await send(`${path}?after=600001`, method, target, { 'x-onfreq-confirm': 'delete-old-copies' });
     expect(response.status).toBe(503);
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(await response.json()).toEqual({ error: 'coordinator unavailable' });
+    // Exactly one line naming the route and error type, never the message or query.
+    expect(log).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(log.mock.calls[0]![0]))).toEqual({ event: 'route_failed', route: path, error: 'Error' });
+    expect(JSON.stringify(log.mock.calls)).not.toContain('600001');
   }
   expect(failing).toHaveBeenCalledOnce();
+});
+
+it('C56: a non-Error throw logs only its type', async () => {
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const { env: target } = withCoordinator({ getHealth: vi.fn(async () => { throw PRIVATE_DETAIL; }) });
+  expect((await send('/health', 'GET', target)).status).toBe(503);
+  expect(log.mock.calls.map(([line]) => JSON.parse(String(line)) as unknown))
+    .toEqual([{ event: 'route_failed', route: '/health', error: 'string' }]);
 });
 
 it('C1: a thrown /poll keeps its 500 result body, now with no-store, and exposes no detail', async () => {

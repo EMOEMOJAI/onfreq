@@ -125,8 +125,9 @@ export class PollCoordinator extends DurableObject<Env> {
       // A failure while recording that must never mask the original runPoll
       // error — log it (without bodies) and rethrow `err` regardless.
       try {
+        // An empty message still records a failure, so the throttle keeps reporting it.
         await this.persist(snapshot, startedAt, snapshot.lastSuccessfulPollAt,
-          err instanceof Error ? err.message : String(err));
+          (err instanceof Error ? err.message || err.name : String(err)) || 'poll failed');
       } catch (putErr) {
         console.error(JSON.stringify({ event: 'poll_snapshot_put_failed', error: String(putErr) }));
       }

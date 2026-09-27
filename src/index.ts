@@ -53,8 +53,12 @@ async function serve(route: Route, request: Request, url: URL, env: Env): Promis
     } else {
       try {
         response = await route.handle(request, url, env);
-      } catch {
-        // Responses must never expose stored errors or identifiers.
+      } catch (err) {
+        // Neither the response nor the log may expose stored errors or
+        // identifiers, so only the error type is recorded, never its message.
+        console.error(JSON.stringify({
+          event: 'route_failed', route: url.pathname, error: err instanceof Error ? err.name : typeof err,
+        }));
         response = errorResponse('coordinator unavailable', 503);
       }
     }
