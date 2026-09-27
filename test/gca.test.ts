@@ -823,9 +823,71 @@ describe('durable GCA delivery', () => {
     expect(sent).toHaveLength(0);
     expect(logged(warn, 'gca_member_list_failed')).toEqual([{ event: 'gca_member_list_failed', reason: 'http', status }]);
     listStatus = 200;
+    // No Retry-After: backs off the five-minute floor, not the 60 s default.
     now += 60_000;
     await check([atc()]);
+    expect(sent).toHaveLength(0);
+    now += 4 * 60_000;
+    await check([atc()]);
     expect(sent).toHaveLength(1);
+  });
+
+  it('does not repeat a member-list lookup rejected with 403 twice within five minutes', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    const lookups = () => network.mock.calls.filter(([url]) => String(url).includes('/members?')).length;
+    const before = lookups();
+    listStatus = 403;
+    await expect(check([atc()])).rejects.toThrow('Discord status 403');
+    for (let i = 0; i < 4; i++) {
+      now += 60_000;
+      await check([atc()]);
+    }
+    now += 59_000;
+    await check([atc()]);
+    expect(lookups() - before).toBe(1);
+    now += 1_000;
+    await expect(check([atc()])).rejects.toThrow('Discord status 403');
+    expect(lookups() - before).toBe(2);
+    now += 5 * 60_000 - 1_000;
+    await check([atc()]);
+    expect(lookups() - before).toBe(2);
+    expect(sent).toHaveLength(0);
+    expect(logged(warn, 'gca_member_list_failed')).toEqual(Array(2).fill(
+      { event: 'gca_member_list_failed', reason: 'http', status: 403 }));
+  });
+
+  it('keeps the reported delay of a member-list rate limit and logs a locally deferred lookup', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    const lookups = () => network.mock.calls.filter(([url]) => String(url).includes('/members?')).length;
+    // A global cooldown stored by an earlier poll defers the lookup locally.
+    const before = lookups();
+    await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.put('discord-rate-limits-v1', { '*': now + 90_000 }));
+    await expect(check([atc()])).rejects.toThrow('Discord API 429');
+    expect(lookups()).toBe(before); // deferred locally: no request reached Discord
+    expect(logged(warn, 'gca_member_list_failed')).toEqual([
+      { event: 'gca_member_list_failed', reason: 'rate_limit', status: 429, requestMade: false }]);
+    now += 89_000;
+    await check([atc()]);
+    expect(lookups()).toBe(before);
+    now += 1_000; // the 90 s rate limit, not the five-minute floor
+    await check([atc()]);
+    expect(lookups()).toBe(before + 1);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('logs a network reason after a member-list request that never got an HTTP reply', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).includes('/members?')) throw new Error('Synthetic connection failure');
+      return original(input, init);
+    });
+    await expect(check([atc()])).rejects.toThrow('Synthetic connection failure');
+    expect(logged(warn, 'gca_member_list_failed')).toEqual([
+      { event: 'gca_member_list_failed', reason: 'network', status: 'unavailable' }]);
   });
 
   it('persists a reservation before the POST so eviction cannot duplicate it', async () => {
