@@ -435,7 +435,7 @@ describe('fetchDivisionAtc', () => {
   beforeEach(() => resetTokenCache());
   afterEach(() => vi.unstubAllGlobals());
 
-  it('skips malformed entries and logs only a count, coercing a numeric frequency string', async () => {
+  it('skips malformed entries and logs only counts, coercing numeric and unusable frequencies', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     // Padded with well-formed entries outside the QC prefix so malformed
     // entries stay a minority of the feed (otherwise this is a feed-outage,
@@ -456,9 +456,12 @@ describe('fetchDivisionAtc', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
 
     const result = await fetchDivisionAtc(['QC']);
-    expect(result.map((atc) => atc.callsign).sort()).toEqual(['QCTT_DEL', 'QCTT_TWR']);
+    expect(result.map((atc) => atc.callsign).sort()).toEqual(['QCTT_DEL', 'QCTT_GND', 'QCTT_TWR']);
     expect(result.find((atc) => atc.callsign === 'QCTT_DEL')?.frequency).toBe(121.5);
-    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'ivao_entry_skipped', count: 4 }));
+    // An unusable frequency reads as untuned rather than dropping the entry.
+    expect(result.find((atc) => atc.callsign === 'QCTT_GND')?.frequency).toBe(0);
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'ivao_entry_skipped', count: 3 }));
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'ivao_frequency_coerced', count: 1 }));
     // No entry content (callsigns, ids) ever reaches the log.
     expect(warn.mock.calls.every(([line]) => !String(line).includes('QCTT'))).toBe(true);
   });
@@ -483,16 +486,37 @@ describe('fetchDivisionAtc', () => {
   it('caps runaway string lengths from the feed', async () => {
     const entries = [rawEntry({
       atcSession: { frequency: 118.1, position: `T${'W'.repeat(300)}R` },
-      atcPosition: { atcCallsign: 'S'.repeat(300), airport: { icao: 'QCTTTTTTTTTT', name: 'N'.repeat(300), countryId: 'BR' } },
+      atcPosition: { atcCallsign: 'S'.repeat(300), airport: { icao: 'QCTT', name: 'N'.repeat(300), countryId: 'BR' } },
     })];
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
 
     const [atc] = await fetchDivisionAtc(['QC']);
     expect(atc?.position.length).toBeLessThanOrEqual(128);
     expect(atc?.station?.length).toBeLessThanOrEqual(128);
-    expect(atc?.location?.length).toBeLessThanOrEqual(128);
-    expect(atc?.airport?.icao.length).toBeLessThanOrEqual(8);
+    expect(atc?.location?.length).toBe(128);
   });
+
+  it.each(['QCTTTTTTTTTT', 'QC', 'QC\u200DTT', 'QC TT', 'QC_T', '**Q', 'QC\nT', '<@&1>', '\uFF31\uFF23\uFF34\uFF34', ''])(
+    'drops an airport whose ICAO is not 3-4 letters/digits: %j', async (icao) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([rawEntry({
+        atcPosition: { atcCallsign: 'Example Tower', airport: { icao, name: 'Example Airport', countryId: 'BR' } },
+      })])));
+      const [atc] = await fetchDivisionAtc(['QC']);
+      // The entry is kept; only the untrusted airport is discarded.
+      expect(atc?.callsign).toBe('QCTT_TWR');
+      expect(atc?.station).toBe('Example Tower');
+      expect(atc?.airport).toBeNull();
+      expect(atc?.location).toBeNull();
+    });
+
+  it.each([['qctt', 'QCTT'], [' qc1 ', 'QC1'], ['Q2T4', 'Q2T4']])(
+    'accepts airport ICAO %j as %j after uppercasing', async (icao, expected) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([rawEntry({
+        atcPosition: { atcCallsign: 'Example Tower', airport: { icao, name: 'Example Airport', countryId: 'br' } },
+      })])));
+      const [atc] = await fetchDivisionAtc(['QC']);
+      expect(atc?.airport).toEqual({ icao: expected, countryId: 'BR' });
+    });
 
   /** Valid entries outside the QC prefix keep rejected entries a minority of the feed. */
   function filler(count: number): Record<string, unknown>[] {
@@ -532,13 +556,32 @@ describe('fetchDivisionAtc', () => {
     await expect(fetchDivisionAtc(['QC'])).resolves.toEqual([]);
   });
 
-  it.each(['0x7B', '1e3', '-118.1', '118.1000', 'Infinity', '118.', '.5', '1180', '118,1', '-0', ''])(
-    'rejects a frequency string that is not plain decimal MHz: %j', async (frequency) => {
-      vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it.each<unknown>(['0x7B', '1e3', '-118.1', '118.1000', 'Infinity', '118.', '.5', '1180', '118,1', '-0', '', null,
+    undefined, true, {}, { mhz: 118.1 }, [118.1]])(
+    'keeps an entry whose frequency %j is not plain decimal MHz as untuned (0), logging only a count', async (frequency) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      warn.mockClear();
       const entries = [rawEntry({ atcSession: { frequency, position: 'TWR' } }), ...filler(2)];
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
-      await expect(fetchDivisionAtc(['QC'])).resolves.toEqual([]);
+      const result = await fetchDivisionAtc(['QC']);
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({ callsign: 'QCTT_TWR', frequency: 0 });
+      expect(hasFrequency(result[0]!)).toBe(false);
+      expect(warn.mock.calls).toEqual([[JSON.stringify({ event: 'ivao_frequency_coerced', count: 1 })]]);
     });
+
+  it('logs one coerced-frequency count per parse, however many entries were coerced', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    warn.mockClear();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
+      rawEntry({ id: 1, callsign: 'QCTT_TWR', atcSession: { frequency: null, position: 'TWR' } }),
+      rawEntry({ id: 2, callsign: 'QCTT_APP', atcSession: { frequency: '118.', position: 'APP' } }),
+      rawEntry({ id: 3, callsign: 'QCTT_GND', atcSession: { frequency: 5000, position: 'GND' } }),
+      rawEntry({ id: 4, callsign: 'QCTT_DEL', atcSession: { frequency: 0, position: 'DEL' } }),
+    ])));
+    await expect(fetchDivisionAtc(['QC'])).resolves.toHaveLength(4);
+    expect(warn.mock.calls).toEqual([[JSON.stringify({ event: 'ivao_frequency_coerced', count: 3 })]]);
+  });
 
   it.each([['118', 118], ['118.1', 118.1], [' 121.500 ', 121.5], ['99.9', 99.9], ['3.5', 3.5], ['1', 1], ['999.999', 999.999]])(
     'accepts a decimal MHz frequency string %j', async (frequency, expected) => {
@@ -549,10 +592,10 @@ describe('fetchDivisionAtc', () => {
       expect(atc?.frequency).toBe(expected);
     });
 
-  it.each<[unknown, number]>([
-    ['0', 0], ['0.000', 0], [' 0.0 ', 0], ['000', 0], [0, 0],
-    [-118.1, 0], [1000, 0], [1e300, 0], [5e-324, 5e-324], [999.999, 999.999],
-  ])('keeps an entry with frequency %j as %j instead of dropping it', async (frequency, expected) => {
+  it.each<[unknown, number, boolean]>([
+    ['0', 0, false], ['0.000', 0, false], [' 0.0 ', 0, false], ['000', 0, false], [0, 0, false],
+    [-118.1, 0, true], [1000, 0, true], [1e300, 0, true], [5e-324, 5e-324, false], [999.999, 999.999, false],
+  ])('keeps an entry with frequency %j as %j instead of dropping it (coerced: %j)', async (frequency, expected, coerced) => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     warn.mockClear();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
@@ -561,10 +604,11 @@ describe('fetchDivisionAtc', () => {
     const [atc] = await fetchDivisionAtc(['QC']);
     expect(atc?.frequency).toBe(expected);
     expect(hasFrequency(atc!)).toBe(expected > 0);
-    expect(warn).not.toHaveBeenCalled();
+    // A genuine 0 is the feed's untuned marker; only an implausible value counts as coerced.
+    expect(warn.mock.calls).toEqual(coerced ? [[JSON.stringify({ event: 'ivao_frequency_coerced', count: 1 })]] : []);
   });
 
-  it.each(['0.000', '0', 1e300])(
+  it.each<unknown>(['0.000', '0', 1e300, null, '118.', '118.1000', {}, 'garbage'])(
     'keeps a tracked session online at its last frequency when the feed reports %j', async (frequency) => {
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
         rawEntry({ atcSession: { frequency, position: 'TWR' } }),
@@ -604,12 +648,31 @@ describe('fetchDivisionAtc', () => {
     expect(`${atc?.station}${atc?.location}`).not.toMatch(lone);
   });
 
+  it('replaces unpaired surrogates in feed text at ingest, keeping valid pairs', async () => {
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    const body = JSON.stringify([rawEntry({
+      atcSession: { frequency: 118.1, position: 'TW\uD800R' },
+      atcPosition: { atcCallsign: 'Example\uDC00Tower \u{1F600}', airport: { icao: 'QCTT', name: '\uDBFFA\uD83D', countryId: 'BR' } },
+    })]);
+    // JSON.stringify escapes lone surrogates, so they reach the parser intact.
+    expect(body).toContain('\\ud800');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body)));
+    const [atc] = await fetchDivisionAtc(['QC']);
+    // Compared as escaped JSON so a regression's failure report never itself
+    // carries a lone surrogate (which the test runner cannot transport).
+    const escaped = (text: string | null | undefined) => JSON.stringify(text);
+    expect(escaped(atc?.position)).toBe(escaped('TW R'));
+    expect(escaped(atc?.station)).toBe(escaped('Example Tower \u{1F600}'));
+    expect(escaped(atc?.location)).toBe(escaped(' A '));
+    expect(lone.test(`${atc?.position}${atc?.station}${atc?.location}`)).toBe(false);
+  });
+
   it('strips control and invisible format characters from feed text at ingest', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([rawEntry({
       atcSession: { frequency: 118.1, position: 'TW\u200BR' },
       atcPosition: {
         atcCallsign: 'Example\r\nQXXX_TWR  Fake Tower  118.100\u0007',
-        airport: { icao: 'QC\u200DTT', name: 'Safe\u202Eevil\u202C Airport\u2066', countryId: 'BR' },
+        airport: { icao: 'QCTT', name: 'Safe\u202Eevil\u202C Airport\u2066', countryId: 'BR' },
       },
     })])));
     const [atc] = await fetchDivisionAtc(['QC']);
@@ -654,7 +717,24 @@ describe('fetchDivisionAtc', () => {
     const result = await fetchDivisionAtc(['QC']);
     expect(result).toHaveLength(1);
     expect(result[0]?.userId).toBe(200);
+    expect(result[0]?.callsign).toBe('QCTT_TWR');
     expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'ivao_duplicate_callsign', count: 1 }));
+  });
+
+  it('uppercases feed callsigns so a case variant resumes the tracked session instead of splitting it', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
+      rawEntry({ callsign: 'qctt_Twr' }),
+    ])));
+    const current = await fetchDivisionAtc(['QC']);
+    expect(current.map((atc) => atc.callsign)).toEqual(['QCTT_TWR']);
+    const prev: StateMap = {
+      QCTT_TWR: { ...current[0]!, since: '2026-08-16T10:00:00.000Z', missed: 0,
+        messages: [{ channelId: '100000000000000123', messageId: '100000000000000999' }] },
+    };
+    const result = diffState(prev, current, '2026-08-16T12:00:00.000Z', 1);
+    expect(result.wentOnline).toEqual([]);
+    expect(result.wentOffline).toEqual([]);
+    expect(Object.keys(result.next)).toEqual(['QCTT_TWR']);
   });
 
   it('remints and retries exactly once after a 401 on an authenticated request', async () => {

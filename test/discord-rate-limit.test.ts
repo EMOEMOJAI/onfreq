@@ -76,6 +76,36 @@ it.each([null, { retry_after: -5 }, { retry_after: 'invalid' }])(
     await expect(request('/channels/a/messages')).rejects.toMatchObject({ retryAt: START + 60_000 });
   });
 
+it('persists a conservative 60-second route cooldown for a 429 whose body exceeded the size cap', async () => {
+  const network = vi.fn()
+    .mockImplementationOnce(async () => new Response('x', {
+      status: 429, headers: { 'content-length': String(4 * 1024 * 1024 + 1), 'retry-after': '1' },
+    }))
+    .mockImplementation(async () => Response.json({ id: 'synthetic' }));
+  vi.stubGlobal('fetch', network);
+  await expect(request('/channels/a/messages')).rejects.toMatchObject({
+    name: 'DiscordRateLimitError', retryAt: START + 60_000, requestMade: true, global: false, reason: 'rate_limit',
+  });
+  await evictDurableObject(stub());
+  now += 59_999;
+  await expect(request('/channels/a/messages/old', 'PATCH')).rejects.toMatchObject({ requestMade: false, global: false });
+  await expect(request('/channels/b/messages')).resolves.toBe(200);
+  expect(network).toHaveBeenCalledTimes(2);
+  now++;
+  await expect(request('/channels/a/messages')).resolves.toBe(200);
+  expect(network).toHaveBeenCalledTimes(3);
+});
+
+it.each([200, 404, 503])('leaves an oversized %i response to the caller without recording a cooldown', async (status) => {
+  const network = vi.fn()
+    .mockImplementationOnce(async () => new Response('x', { status, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }))
+    .mockImplementation(async () => Response.json({ id: 'synthetic' }));
+  vi.stubGlobal('fetch', network);
+  await expect(request('/channels/a/messages')).rejects.toMatchObject({ name: 'ResponseTooLargeError', status });
+  await expect(request('/channels/a/messages')).resolves.toBe(200);
+  expect(network).toHaveBeenCalledTimes(2);
+});
+
 it('does not mask the rate-limit error when persisting the cooldown fails', async () => {
   const network = vi.fn().mockImplementation(async () => Response.json({ retry_after: 65 }, { status: 429 }));
   vi.stubGlobal('fetch', network);

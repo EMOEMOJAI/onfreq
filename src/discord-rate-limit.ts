@@ -1,4 +1,4 @@
-import { fetchBuffered } from './http';
+import { fetchBuffered, ResponseTooLargeError } from './http';
 
 const KEY = 'discord-rate-limits-v1'; // gitleaks:allow — storage key name, not a credential
 const GLOBAL = '*';
@@ -10,6 +10,9 @@ export const MAX_RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000;
  * 1 MiB buffer cap, so they get a larger bounded one.
  */
 const DISCORD_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+/** Cooldown for a 429 whose body exceeded the cap, so its retry_after was never read. */
+const UNREADABLE_RATE_LIMIT_COOLDOWN_MS = 60_000;
 
 /**
  * `rate_limit`: a real Discord 429. `soft`: an in-memory cooldown inferred
@@ -112,8 +115,20 @@ export class DiscordRateLimits {
       throw new DiscordRateLimitError(blockedUntil, false, blockedUntil === globalDeadline, reason);
     }
 
-    const response = await fetchBuffered(`https://discord.com/api/v10${path}`, init,
-      { maxBytes: DISCORD_MAX_RESPONSE_BYTES });
+    let response: Response;
+    try {
+      response = await fetchBuffered(`https://discord.com/api/v10${path}`, init,
+        { maxBytes: DISCORD_MAX_RESPONSE_BYTES });
+    } catch (err) {
+      // An oversized 429 is still a rate limit, but its retry_after and scope
+      // headers/body were discarded unread: record a conservative route
+      // cooldown instead of letting it pass as a definite rejection.
+      if (err instanceof ResponseTooLargeError && err.status === 429) {
+        const until = await this.record(route, Date.now() + UNREADABLE_RATE_LIMIT_COOLDOWN_MS);
+        throw new DiscordRateLimitError(until, true, false);
+      }
+      throw err;
+    }
     if (response.status !== 429) {
       // A 2xx that reports an exhausted bucket is worth a soft, in-memory-only
       // cooldown: nothing to persist (it will refill on its own), but later
@@ -139,7 +154,11 @@ export class DiscordRateLimits {
     const retryAt = Date.now() + Math.min(MAX_RATE_LIMIT_COOLDOWN_MS, Number.isFinite(delay) ? delay : 60_000);
     const global = body?.global === true || response.headers.get('x-ratelimit-global') === 'true' ||
       response.headers.get('x-ratelimit-scope') === 'global';
-    const key = global ? GLOBAL : route;
+    throw new DiscordRateLimitError(await this.record(global ? GLOBAL : route, retryAt), true, global);
+  }
+
+  /** Extend and persist a real 429 cooldown; returns the effective deadline for `key`. */
+  private async record(key: string, retryAt: number): Promise<number> {
     this.deadlines[key] = Math.max(this.deadlines[key] ?? 0, retryAt);
     // Persist before returning to callers. A storage failure here must not
     // mask the rate-limit error itself — the in-memory deadline still applies
@@ -149,6 +168,6 @@ export class DiscordRateLimits {
     } catch (err) {
       console.warn(JSON.stringify({ event: 'discord_rate_limit_persist_failed', error: String(err) }));
     }
-    throw new DiscordRateLimitError(this.deadlines[key], true, global);
+    return this.deadlines[key]!;
   }
 }
