@@ -785,14 +785,19 @@ test('pre-commit passes a commit that removes a committed secret, but blocks an 
     assert.equal(f.git('rev-parse', 'HEAD'), head, 'no commit was made');
   });
 
-test('hunk-header context naming a committed secret does not block an edit below it, but an added secret still blocks (C64)',
+test('hunk-header or GIT_DIFF_OPTS context naming a committed secret does not block an edit below it, but an added secret still blocks (C64 C68)',
   { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     const secret = new RegExp(token.slice(4));
     const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
-    const scan = (...args) => spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args], { cwd: f.repo, env, encoding: 'utf8' });
-    const run = (options) => [options.path ? 'shim' : options.commit ? 'git commit' : 'hook', f.commitHook(options)];
+    // GIT_DIFF_OPTS overrides -U0 on the command line, adding the key line back as context.
+    const diffOpts = { GIT_DIFF_OPTS: '--unified=3' };
+    const scan = (extra, ...args) =>
+      spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args], { cwd: f.repo, env: { ...env, ...extra }, encoding: 'utf8' });
+    const run = (options) => [(options.extraEnv ? 'GIT_DIFF_OPTS ' : '') +
+      (options.path ? 'shim' : options.commit ? 'git commit' : 'hook'), f.commitHook(options)];
+    const hooks = [{}, { path: preCommitShim }, { extraEnv: diffOpts }, { extraEnv: diffOpts, path: preCommitShim }];
     writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = one\n`);
     f.git('add', 'config.txt');
     f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret committed without the hook');
@@ -802,7 +807,7 @@ test('hunk-header context naming a committed secret does not block an edit below
     writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = two\n`);
     f.git('add', 'config.txt');
     assert.match(f.git('diff', '--cached', '-U0'), header);
-    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+    for (const options of [...hooks, { extraEnv: diffOpts, commit: true }]) {
       const [label, result] = run(options);
       assert.equal(result.status, 0, `edit ${label}: ${result.stderr}`);
       assert.doesNotMatch(result.stderr + result.stdout, secret, label);
@@ -810,15 +815,18 @@ test('hunk-header context naming a committed secret does not block an edit below
     const edited = f.git('rev-parse', 'HEAD');
     assert.notEqual(edited, committed, 'the edit was committed');
     assert.match(f.git('log', '-p', '-U0', '-1'), header);
-    let result = f.push([ref(edited, 'refs/heads/main', committed)]);
-    assert.equal(result.status, 0, result.stderr);
-    assert.doesNotMatch(result.stderr + result.stdout, secret);
-    result = scan(edited, '--not', committed);
-    assert.equal(result.status, 0, result.stderr);
+    for (const extra of [{}, diffOpts]) {
+      const label = JSON.stringify(Object.keys(extra));
+      let result = f.push([ref(edited, 'refs/heads/main', committed)], undefined, extra);
+      assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+      result = scan(extra, edited, '--not', committed);
+      assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+    }
     // A key added on the line after such a hunk header is still blocked.
     writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = two\naws_access_key_id = ${token} # added\n`);
     f.git('add', 'config.txt');
-    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+    for (const options of [...hooks, { commit: true }, { extraEnv: diffOpts, commit: true }]) {
       const [label, result] = run(options);
       assert.equal(result.status, 1, `addition ${label}: ${result.stderr}`);
       assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret; see the output above/, label);
@@ -828,13 +836,16 @@ test('hunk-header context naming a committed secret does not block an edit below
     assert.equal(f.git('rev-parse', 'HEAD'), edited, 'no commit was made');
     f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret added without the hook');
     const added = f.git('rev-parse', 'HEAD');
-    result = f.push([ref(added, 'refs/heads/main', edited)]);
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/);
-    assert.doesNotMatch(result.stderr + result.stdout, secret);
-    result = scan(added, '--not', edited);
-    assert.equal(result.status, 1, result.stderr);
-    assert.doesNotMatch(result.stderr + result.stdout, secret);
+    for (const extra of [{}, diffOpts]) {
+      const label = JSON.stringify(Object.keys(extra));
+      let result = f.push([ref(added, 'refs/heads/main', edited)], undefined, extra);
+      assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+      assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/, label);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+      result = scan(extra, added, '--not', edited);
+      assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+    }
   });
 
 test('secret-scan.sh scans commit messages whatever format.pretty prints (C65)',
@@ -864,6 +875,17 @@ test('secret-scan.sh scans commit messages whatever format.pretty prints (C65)',
       assert.equal(result.status, 1, `${pretty} control: ${result.stderr}`);
       assert.doesNotMatch(result.stderr + result.stdout, secret, pretty);
       f.git('reset', '--quiet', '--hard', base);
+    }
+    // i18n.logOutputEncoding re-encodes messages, for example into UTF-16, where
+    // an ASCII key is no longer a byte sequence Gitleaks matches.
+    f.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m', 'synthetic message secret',
+      '-m', `aws_access_key_id = ${token}`);
+    const commit = f.git('rev-parse', 'HEAD');
+    for (const encoding of ['UTF-16', 'ISO-8859-1']) {
+      f.git('config', 'i18n.logOutputEncoding', encoding);
+      const result = scan(commit, '--not', base);
+      assert.equal(result.status, 1, `${encoding}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, encoding);
     }
   });
 
