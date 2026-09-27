@@ -1453,7 +1453,7 @@ describe('polling through the Durable Object', () => {
     await runInDurableObject(stub(), async (_, ctx) => {
       await ctx.storage.put(POLL_SNAPSHOT_KEY, {
         // A session saved by an earlier release, sharing the ended session's first-card nonce.
-        state: { [a]: { ...session(a), firstSessionId: 1, messages: [{ channelId: channel, messageId: live }] } as TrackedAtc },
+        state: { [a]: { ...session(a), firstSessionId: 1, messages: [{ channelId: channel, messageId: live }] } },
         pendingOffline: [{
           event: { ...ended, endedAt: new Date(START - 60_000).toISOString(), durationSeconds: 3600 },
           messages: [], channelIds: [], recoverPosts: { [channel]: { from: START - 7_200_000, to: START - 7_200_000 } },

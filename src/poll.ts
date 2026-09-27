@@ -4,14 +4,17 @@ import {
   buildOnlineEmbed,
   buildOnlineEmbeds,
   buildSessionEndedEmbed,
+  countsAgainstBudget,
   DiscordApiError,
   DiscordUnconfirmedPostError,
   editMessage,
   escapeMarkdown,
   findBotMessages,
+  isSnowflake,
   messageNonce,
   parseChannelIds,
   postMessage,
+  snowflakeTime,
 } from './discord';
 import {
   fetchDivisionAtc,
@@ -23,9 +26,8 @@ import {
 import { diffState, loadPendingOffline, loadSessions, newestCardedSession, offlineEventFor } from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
 import { gcaMismatch, gcaRemindersEnabled, parseGcaPolicy, sendGcaReminders, type GcaPolicy } from './gca';
-import { channelIndex, syncRosterMessages, type RosterTarget } from './roster';
+import { channelIndex, mayHavePosted, nextBudget, syncRosterMessages, type RosterTarget } from './roster';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
-import { countsAgainstBudget } from './types';
 import type {
   OfflineEvent, PendingOffline, OnlineAtc, PostedMessage, PostWindow, RosterMessage, RosterPostAttempt, StateMap,
   TrackedAtc,
@@ -37,8 +39,6 @@ function parseGracePolls(raw: string | undefined): number {
   return Math.min(Math.max(n, 1), 10);
 }
 
-/** Extra polls an undeliverable offline update is retried for before it is dropped. */
-const OFFLINE_RETRY_POLLS = 10;
 /**
  * Pending closeouts older than this are attempted once more, then dropped if
  * still undelivered; beyond MAX_OFFLINE_JOBS (oldest first) they are dropped.
@@ -69,7 +69,7 @@ const DEFAULT_MENTION_COOLDOWN_MINUTES = 10;
 function parseMentionRole(raw: string | undefined): string | undefined {
   const text = raw?.trim();
   if (!text) return undefined;
-  if (/^\d{17,20}$/.test(text)) return text;
+  if (isSnowflake(text)) return text;
   console.error(JSON.stringify({ event: 'mention_config_invalid', reason: 'role' }));
   return undefined;
 }
@@ -94,24 +94,15 @@ function logFailure(event: string, callsign: string, channelIds: string[], chann
 }
 
 /**
- * A tracked session plus the IVAO connection id it was first seen with. Kept
- * on the session (and its offline event) through grace-window resumes, which
- * replace `sessionId`; absent on sessions tracked before it was recorded.
- */
-type NonceSession = TrackedAtc & { firstSessionId?: number };
-
-/**
  * Nonce of a session's first ONLINE card in a channel: keyed to the IVAO
  * connection the session was first seen with, not the poll-time `since`, so a
  * re-send after a poll whose state was never saved returns the original card
  * instead of posting a duplicate. Older sessions keep their `since`-based key.
  */
-function onlineNonce(atc: NonceSession, channelId: string): string {
+function onlineNonce(atc: TrackedAtc, channelId: string): string {
   const identity = atc.firstSessionId === undefined ? atc.since : `session-${atc.firstSessionId}`;
   return messageNonce(`online:${atc.userId}:${atc.callsign}:${identity}`, channelId);
 }
-
-const DISCORD_EPOCH_MS = 1_420_070_400_000;
 
 /**
  * Whether a message id returned for a first-card POST was created shortly
@@ -121,8 +112,8 @@ const DISCORD_EPOCH_MS = 1_420_070_400_000;
  * range, or not snowflakes, read as new.
  */
 function createdBeforePoll(messageId: string, pollStartMs: number): boolean {
-  if (!/^\d{17,20}$/.test(messageId)) return false;
-  const createdMs = Number(BigInt(messageId) >> 22n) + DISCORD_EPOCH_MS;
+  if (!isSnowflake(messageId)) return false;
+  const createdMs = snowflakeTime(messageId);
   return createdMs < pollStartMs - 10_000 && createdMs > pollStartMs - 3_600_000;
 }
 
@@ -251,7 +242,7 @@ async function syncOnlineCards(
             ref.onlineEmbed = rendered;
             updated = true;
           } catch (err) {
-            logFailure('roster_edit_failed', callsign, channelIds, ref.channelId, err);
+            logFailure('online_edit_failed', callsign, channelIds, ref.channelId, err);
             if (err instanceof DiscordApiError && err.isGone && err.status !== 404) {
               // The card cannot be addressed (a corrupt stored id) or reached
               // (a 403, access that may return), but it was posted: record
@@ -312,13 +303,13 @@ async function announceOffline(
   // request there is given up with it.
   const charged = new Set<string>();
   const exhausted = new Set<string>();
-  // Only a definite Discord-side rejection (4xx, excluding the 429
-  // rate-limit deferral) counts towards this budget, via the same predicate
-  // the online first-card and roster page budgets use; a 5xx outage or a
-  // timeout/network error is transient and retried instead, so a prolonged
-  // Discord outage cannot abandon a closeout early. Only the job's overall
-  // age bound (OFFLINE_JOB_MAX_AGE_MS) ends those retries, and a job past it
-  // still gets one final attempt before it is dropped.
+  // Only a definite Discord-side rejection counts towards this budget
+  // (`nextBudget`, shared with the online first-card and roster page
+  // budgets); a 5xx outage or a timeout/network error is transient and
+  // retried instead, so a prolonged Discord outage cannot abandon a closeout
+  // early. Only the job's overall age bound (OFFLINE_JOB_MAX_AGE_MS) ends
+  // those retries, and a job past it still gets one final attempt before it
+  // is dropped.
   const keepForRetry = (channelId: string, err: unknown): boolean => {
     if (err instanceof DiscordUnconfirmedPostError) {
       // Discord accepted the fallback without returning its id: it was
@@ -330,10 +321,9 @@ async function announceOffline(
     }
     failed = true;
     if (exhausted.has(channelId)) return false;
-    const counts = countsAgainstBudget(err);
-    const used = (attempts[channelId] ?? job.attempts ?? 0) + (counts && !charged.has(channelId) ? 1 : 0);
-    if (counts) charged.add(channelId);
-    if (!counts || used <= OFFLINE_RETRY_POLLS) {
+    const { used, keep } = nextBudget(attempts[channelId] ?? job.attempts ?? 0, err, !charged.has(channelId));
+    if (countsAgainstBudget(err)) charged.add(channelId);
+    if (keep) {
       attempts[channelId] = used;
       if (err instanceof DiscordRateLimitError && !err.requestMade) deferred = true;
       return true;
@@ -347,6 +337,21 @@ async function announceOffline(
   // IVAO-issued `sessionId`, so a genuinely new session never collides with
   // this one's nonce.
   const offlineKey = `offline:${job.event.userId}:${job.event.callsign}:${job.event.since}`;
+  /** Post the standalone OFFLINE notice; true when the destination is kept for a retry. */
+  const postFallback = async (channelId: string): Promise<boolean> => {
+    try {
+      await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed, undefined, undefined, limits,
+        messageNonce(offlineKey, channelId));
+      delivered++;
+      delete attempts[channelId];
+      return false;
+    } catch (err) {
+      if (!(err instanceof DiscordUnconfirmedPostError)) {
+        logFailure('offline_post_failed', job.event.callsign, channelIds, channelId, err);
+      }
+      return keepForRetry(channelId, err);
+    }
+  };
   // Recover first cards that may exist unseen, so they are closed below:
   // look for them among the bot's messages from the uncertain attempts, and
   // only when none is found re-post with the original nonce (which returns
@@ -418,32 +423,12 @@ async function announceOffline(
         continue;
       }
     }
-    try {
-      await postMessage(env.DISCORD_BOT_TOKEN, ref.channelId, fallbackEmbed, undefined, undefined, limits,
-        messageNonce(offlineKey, ref.channelId));
-      delivered++;
-      delete attempts[ref.channelId];
-    } catch (err) {
-      if (!(err instanceof DiscordUnconfirmedPostError)) {
-        logFailure('offline_post_failed', job.event.callsign, channelIds, ref.channelId, err);
-      }
-      if (keepForRetry(ref.channelId, err)) remaining.push(ref);
-    }
+    if (await postFallback(ref.channelId)) remaining.push(ref);
   }
   job.messages = remaining;
   const remainingChannels: string[] = [];
   for (const channelId of job.channelIds) {
-    try {
-      await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed, undefined, undefined, limits,
-        messageNonce(offlineKey, channelId));
-      delivered++;
-      delete attempts[channelId];
-    } catch (err) {
-      if (!(err instanceof DiscordUnconfirmedPostError)) {
-        logFailure('offline_post_failed', job.event.callsign, channelIds, channelId, err);
-      }
-      if (keepForRetry(channelId, err)) remainingChannels.push(channelId);
-    }
+    if (await postFallback(channelId)) remainingChannels.push(channelId);
   }
   job.channelIds = remainingChannels;
   // Keep a numeric legacy field so an older Worker can still retry on rollback.
@@ -547,12 +532,12 @@ export async function runPoll(
   // Residual (accepted): if the first card posts but this poll's snapshot is
   // never saved and the controller reconnects under a new IVAO connection id
   // before the next poll, the card is never tracked and so never closed.
-  const closingKey = (event: NonceSession) =>
+  const closingKey = (event: TrackedAtc) =>
     event.firstSessionId === undefined ? undefined : `${event.userId}:${event.callsign}:${event.firstSessionId}`;
   const closing = new Set([
     ...previousJobs.map((job) => job.event), ...wentOffline, ...excludedClosures,
-  ].map((event) => closingKey(event as NonceSession)));
-  for (const session of Object.values(next) as NonceSession[]) {
+  ].map(closingKey));
+  for (const session of Object.values(next)) {
     if (session.since === nowIso && session.firstSessionId === undefined &&
         Number.isSafeInteger(session.sessionId) && session.sessionId > 0 &&
         !closing.has(`${session.userId}:${session.callsign}:${session.sessionId}`)) {
@@ -789,10 +774,9 @@ export async function runPoll(
       if (unconfirmed.has(id)) { markUncertain(id); continue; }
       const err = failed.get(id);
       // A 5xx or thrown fetch error may hide a card Discord did create.
-      if (!(err instanceof DiscordRateLimitError) && !countsAgainstBudget(err)) markUncertain(id);
-      const counts = countsAgainstBudget(err);
-      const used = (previousAttempts[id] ?? 0) + (counts ? 1 : 0);
-      if (!counts || used <= OFFLINE_RETRY_POLLS) {
+      if (mayHavePosted(err)) markUncertain(id);
+      const { used, keep } = nextBudget(previousAttempts[id] ?? 0, err);
+      if (keep) {
         attempts[id] = used;
         kept.push(id);
       } else {

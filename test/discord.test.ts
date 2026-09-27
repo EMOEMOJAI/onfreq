@@ -5,6 +5,7 @@ import {
   buildOnlineEmbed,
   buildOnlineEmbeds,
   buildSessionEndedEmbed,
+  countsAgainstBudget,
   DiscordApiError,
   DiscordInvalidChannelIdError,
   DiscordInvalidMessageIdError,
@@ -26,7 +27,7 @@ import {
   SNOWFLAKE_PATTERN,
 } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
-import { countsAgainstBudget, type OfflineEvent, type OnlineAtc, type TrackedAtc } from '../src/types';
+import type { OfflineEvent, OnlineAtc, TrackedAtc } from '../src/types';
 
 /** Any unpaired UTF-16 surrogate, which makes a Discord payload invalid text. */
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;

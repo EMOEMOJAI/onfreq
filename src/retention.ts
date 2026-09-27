@@ -1,3 +1,5 @@
+import { isSnowflake } from './discord';
+
 const COPY_RETENTION_MS = 30 * 86_400_000;
 const BATCH_SIZE = 500;
 
@@ -10,7 +12,7 @@ export function cleanupGcaCopies(storage: DurableObjectStorage, apply: boolean, 
   const cutoff = now - COPY_RETENTION_MS;
   // Without a valid current recipient (unset or a typo) nothing counts as
   // stale by recipient: only the age rule applies.
-  const currentRecipient = copyUserId && /^\d{17,20}$/.test(copyUserId) ? copyUserId : null;
+  const currentRecipient = isSnowflake(copyUserId) ? copyUserId : null;
   const sql = storage.sql;
   const tables = sql.exec<{ name: string }>(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('gca_copies', 'gca_reminders')",
