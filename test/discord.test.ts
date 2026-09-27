@@ -860,6 +860,52 @@ describe('REST calls', () => {
     expect(requested[2]!.get('after')).toBe(idAt(25));
   });
 
+  it('keeps scanning up to 500 messages after falling back to 25-message pages', async () => {
+    const botId = '100000000000000009';
+    const token = `${btoa(botId)}.synthetic.token`;
+    const at = 1_800_000_000_000;
+    const idAt = (n: number) => ((BigInt(at - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
+    const otherId = '100000000000000001';
+    // Six full pages of 25 other-user messages; the bot's message is the last one on page 6.
+    const pages = Array.from({ length: 6 }, (_, p) => Array.from({ length: 25 }, (_, n) => {
+      const seq = p * 25 + n + 1;
+      return { id: idAt(seq), author: { id: p === 5 && n === 24 ? botId : otherId } };
+    }));
+    const fetchMock = stubFetch(
+      new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
+      ...pages.map((page) => Response.json(page)),
+      Response.json([]),
+    );
+    await expect(findBotMessages(token, '100000000000000123', { from: at, to: at }, new DiscordRateLimits(), () => true))
+      .resolves.toEqual([idAt(150)]);
+    const requested = fetchMock.mock.calls.map(([url]) => new URL(String(url)).searchParams.get('limit'));
+    expect(requested).toEqual(['100', '25', '25', '25', '25', '25', '25', '25']);
+  });
+
+  it('stops a channel scan after 500 messages, whichever page size it uses', async () => {
+    const botId = '100000000000000009';
+    const token = `${btoa(botId)}.synthetic.token`;
+    const at = 1_800_000_000_000;
+    const idAt = (n: number) => ((BigInt(at - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
+    const fullPage = (size: number, p: number) => Array.from({ length: size }, (_, n) => (
+      { id: idAt(p * size + n + 1), author: { id: '100000000000000001' } }));
+
+    // Pages of 100: five pages.
+    let fetchMock = stubFetch(...Array.from({ length: 30 }, (_, p) => Response.json(fullPage(100, p))));
+    await expect(findBotMessages(token, '100000000000000123', { from: at, to: at }, new DiscordRateLimits(), () => true))
+      .resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+
+    // Oversized first page, then pages of 25: twenty pages, never more.
+    fetchMock = stubFetch(
+      new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
+      ...Array.from({ length: 30 }, (_, p) => Response.json(fullPage(25, p))),
+    );
+    await expect(findBotMessages(token, '100000000000000123', { from: at, to: at }, new DiscordRateLimits(), () => true))
+      .resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(21);
+  });
+
   it('does not shrink a channel scan page for a failure other than an oversized response', async () => {
     const botId = '100000000000000009';
     const token = `${btoa(botId)}.synthetic.token`;

@@ -578,9 +578,47 @@ describe('fetchDivisionAtc', () => {
       rawEntry({ id: 2, callsign: 'QCTT_APP', atcSession: { frequency: '118.', position: 'APP' } }),
       rawEntry({ id: 3, callsign: 'QCTT_GND', atcSession: { frequency: 5000, position: 'GND' } }),
       rawEntry({ id: 4, callsign: 'QCTT_DEL', atcSession: { frequency: 0, position: 'DEL' } }),
+      ...filler(3),
     ])));
     await expect(fetchDivisionAtc(['QC'])).resolves.toHaveLength(4);
     expect(warn.mock.calls).toEqual([[JSON.stringify({ event: 'ivao_frequency_coerced', count: 3 })]]);
+  });
+
+  it('treats a feed whose frequencies are all unusable as an outage instead of a silent success', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    warn.mockClear();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
+      rawEntry({ id: 1, callsign: 'QCTT_TWR', atcSession: { frequency: 'x', position: 'TWR' } }),
+      ...filler(3).map((entry) => ({ ...entry, atcSession: { frequency: 'x', position: 'TWR' } })),
+    ])));
+    await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('feed outage');
+    // Counts only, never entry content.
+    expect(warn.mock.calls).toEqual([[JSON.stringify({ event: 'ivao_frequency_coerced', count: 4 })]]);
+  });
+
+  it('treats skipped plus coerced entries together forming a majority as an outage', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
+      rawEntry({ id: 1, callsign: 'QCTT_TWR', atcSession: { frequency: 'x', position: 'TWR' } }),
+      null,
+      rawEntry({ id: 2, callsign: 'QCTT_APP', atcSession: { frequency: 118.1, position: 'APP' } }),
+    ])));
+    await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('feed outage');
+  });
+
+  it('keeps polling when only a minority of frequencies are coerced, or all are a genuine 0', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
+      rawEntry({ id: 1, callsign: 'QCTT_TWR', atcSession: { frequency: 'x', position: 'TWR' } }),
+      rawEntry({ id: 2, callsign: 'QCTT_APP', atcSession: { frequency: 118.1, position: 'APP' } }),
+    ])));
+    // Exactly half is not a majority.
+    await expect(fetchDivisionAtc(['QC'])).resolves.toHaveLength(2);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
+      rawEntry({ id: 1, callsign: 'QCTT_TWR', atcSession: { frequency: 0, position: 'TWR' } }),
+      rawEntry({ id: 2, callsign: 'QCTT_APP', atcSession: { frequency: '0.000', position: 'APP' } }),
+    ])));
+    await expect(fetchDivisionAtc(['QC'])).resolves.toHaveLength(2);
   });
 
   it.each([['118', 118], ['118.1', 118.1], [' 121.500 ', 121.5], ['99.9', 99.9], ['3.5', 3.5], ['1', 1], ['999.999', 999.999]])(
@@ -594,12 +632,15 @@ describe('fetchDivisionAtc', () => {
 
   it.each<[unknown, number, boolean]>([
     ['0', 0, false], ['0.000', 0, false], [' 0.0 ', 0, false], ['000', 0, false], [0, 0, false],
-    [-118.1, 0, true], [1000, 0, true], [1e300, 0, true], [5e-324, 5e-324, false], [999.999, 999.999, false],
+    [-118.1, 0, true], [1000, 0, true], [1e300, 0, true], [999.999, 999.999, false],
+    // Below one kHz a positive number would render as 0.000 MHz: untuned, and coerced.
+    [5e-324, 0, true], [1e-4, 0, true], [0.0009, 0, true], [0.001, 0.001, false],
   ])('keeps an entry with frequency %j as %j instead of dropping it (coerced: %j)', async (frequency, expected, coerced) => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     warn.mockClear();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
       rawEntry({ atcSession: { frequency, position: 'TWR' } }),
+      ...filler(2),
     ])));
     const [atc] = await fetchDivisionAtc(['QC']);
     expect(atc?.frequency).toBe(expected);
@@ -610,8 +651,10 @@ describe('fetchDivisionAtc', () => {
 
   it.each<unknown>(['0.000', '0', 1e300, null, '118.', '118.1000', {}, 'garbage'])(
     'keeps a tracked session online at its last frequency when the feed reports %j', async (frequency) => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
         rawEntry({ atcSession: { frequency, position: 'TWR' } }),
+        ...filler(2),
       ])));
       const current = await fetchDivisionAtc(['QC']);
       const prev: StateMap = {
