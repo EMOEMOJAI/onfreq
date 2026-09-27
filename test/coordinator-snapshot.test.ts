@@ -87,3 +87,23 @@ it('S11-13: a recent past lastPollStartedAt still throttles', async () => {
     expect(await ctx.storage.get(POLL_SNAPSHOT_KEY)).toEqual(snapshot);
   });
 });
+
+it.each([
+  ['an empty Error', () => new Error(''), 'Error'],
+  ['an empty TypeError', () => new TypeError(), 'TypeError'],
+  ['an empty non-Error', () => '', 'poll failed'],
+])('C60: %s from runPoll still records an error marker', async (_label, thrown, marker) => {
+  const now = Date.now();
+  const seeded = seededSnapshot(now);
+  const throwing = Object.defineProperty({ ...env }, 'DISCORD_CHANNEL_IDS', {
+    get() { throw thrown(); },
+  }) as Env;
+  await runInDurableObject(stub(), async (_, ctx) => {
+    await ctx.storage.put(POLL_SNAPSHOT_KEY, seeded);
+    await expect(new PollCoordinator(ctx, throwing).poll()).rejects.toSatisfy((err) => err === '' || err instanceof Error);
+    const stored = await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
+    expect(stored).toEqual({ ...seeded, lastPollStartedAt: expect.any(Number), error: marker });
+    // The throttled next trigger reports the failure instead of a silent skip.
+    await expect(new PollCoordinator(ctx, env).poll()).rejects.toThrow(marker);
+  });
+});
