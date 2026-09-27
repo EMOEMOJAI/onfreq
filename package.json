@@ -5,6 +5,9 @@
   "license": "MIT",
   "description": "Self-hosted IVAO air traffic control Discord bot with live ATC session cards and FIR coverage, built with TypeScript on Cloudflare Workers.",
   "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "node scripts/check-deploy.mjs && wrangler deploy --config wrangler.jsonc",
@@ -20,14 +23,14 @@
     "check:repo": "npm run check:privacy && npm run check:setup && npm run check:links"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/vitest-pool-workers": "0.22.0",
     "github-slugger": "2.0.0",
     "jsonc-parser": "3.3.1",
-    "markdown-it": "15.0.1",
+    "markdown-it": "15.0.2",
     "markdownlint-cli2": "0.23.3",
-    "typescript": "^5.9.0",
-    "vitest": "^4.1.11",
-    "wrangler": "^4.0.0"
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "wrangler": "4.124.0"
   },
   "overrides": {
     "sharp": "0.35.4"
