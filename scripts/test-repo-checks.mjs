@@ -184,6 +184,22 @@ test('rejects C2PA provenance, SVG editor metadata and unreviewed image formats 
   assert.deepEqual(fileErrors('docs/notes.txt', '100644', () => Buffer.from('/Users/synthetic')), []);
 });
 
+test('reads file contents only for images and Wrangler configs (C46)', () => {
+  const unread = () => { throw new Error('read an uninspected blob'); };
+  for (const file of ['src/index.ts', 'docs/setup.md', 'large.bin', 'notwrangler.jsonc']) {
+    assert.deepEqual(fileErrors(file, '100644', unread), [], file);
+  }
+  assert.deepEqual(fileErrors('.dev.vars', '100644', unread), ['.dev.vars: private file is tracked']);
+  assert.deepEqual(fileErrors('link', '120000', unread), ['link: symlink or submodule requires review']);
+  let reads = 0;
+  const read = (data) => () => { reads++; return Buffer.from(data); };
+  assert.deepEqual(fileErrors('nested/wrangler.jsonc', '100644', read('{ "routes": [] }')),
+    ['nested/wrangler.jsonc: operator deployment setting']);
+  assert.deepEqual(fileErrors('icon.svg', '100644', read('<svg><metadata/></svg>')),
+    ['icon.svg: SVG contains editor metadata or a local path']);
+  assert.equal(reads, 2);
+});
+
 test('validates guided setup and rejects changed prompts, values and deployment identities', () => {
   const config = jsonc(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -193,7 +209,6 @@ test('validates guided setup and rejects changed prompts, values and deployment 
   assert.throws(() => validateSetup(config, pkg, example.replace('POLL_SECRET=""', 'POLL_SECRET="synthetic"')));
   assert.throws(() => validateSetup({ ...config, kv_namespaces: [{ binding: 'ATC_STATE', id: '1'.repeat(32) }] }, pkg, example));
   assert.throws(() => validateSetup(config, { ...pkg, cloudflare: { bindings: {} } }, example));
-  assert.throws(() => validateSetup(config, { ...pkg, scripts: { ...pkg.scripts, predeploy: 'echo skipped' } }, example));
   // Relying on predeploy alone is bypassed by npm --ignore-scripts.
   assert.throws(() => validateSetup(config, { ...pkg, scripts: { ...pkg.scripts, deploy: 'wrangler deploy' } }, example));
 });

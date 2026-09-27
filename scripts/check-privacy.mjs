@@ -11,8 +11,9 @@ export function privatePath(file) {
 }
 
 /** Validate every tracked Wrangler config without printing its values; TOML cannot be checked. */
+export const wranglerFile = (file) => /(^|\/)wrangler[^/]*\.(?:jsonc?|toml)$/.test(file);
 export function wranglerConfigErrors(file, data) {
-  if (!/(^|\/)wrangler[^/]*\.(?:jsonc?|toml)$/.test(file)) return [];
+  if (!wranglerFile(file)) return [];
   if (file.endsWith('.toml')) return [`${file}: Wrangler TOML configuration is not allowed; use wrangler.jsonc`];
   let config;
   try { config = jsonc(data.toString()); } catch { return [`${file}: invalid Wrangler configuration`]; }
@@ -121,14 +122,12 @@ export function privateCommitEmails(log) {
 export function fileErrors(file, mode, read) {
   if (privatePath(file)) return [`${file}: private file is tracked`];
   if (!['100644', '100755'].includes(mode)) return [`${file}: symlink or submodule requires review`];
-  const data = read();
-  const errors = [];
+  // Only images and Wrangler configs are inspected, so other blobs are never read.
   if (imageFile(file)) {
-    const error = imagePrivacy(file, data);
-    if (error) errors.push(`${file}: ${error}`);
+    const error = imagePrivacy(file, read());
+    return error ? [`${file}: ${error}`] : [];
   }
-  errors.push(...wranglerConfigErrors(file, data));
-  return errors;
+  return wranglerFile(file) ? wranglerConfigErrors(file, read()) : [];
 }
 
 export function checkPrivacy() {
@@ -137,7 +136,7 @@ export function checkPrivacy() {
   if (git('rev-parse', '--is-shallow-repository').toString().trim() === 'true') {
     errors.push('Full reachable history is required; fetch with depth 0');
   } else {
-    errors.push(...privateCommitEmails(git('log', 'HEAD', '--format=%H%x09%ae%x09%ce').toString()));
+    errors.push(...privateCommitEmails(git('log', '--no-show-signature', '--format=%H%x09%ae%x09%ce', 'HEAD').toString()));
   }
   return errors;
 }
@@ -174,13 +173,18 @@ export function rangeArgs(local, excludes, remotes, hasCommit) {
   return not.length ? [local, '--not', ...not] : [local];
 }
 
-/** Check every file version added or modified, and every commit email, in a pushed range. */
-export function checkRange(local, excludes) {
+/** The pushed range in this repository; the pre-push secret scan reads it via --range-args. */
+export function pushedRange(local, excludes) {
   const hasCommit = (hash) => {
     try { git('cat-file', '-e', `${hash}^{commit}`); return true; } catch { return false; }
   };
   const remotes = git('remote').toString().split('\n').filter(Boolean);
-  const range = rangeArgs(local, excludes, remotes, hasCommit);
+  return rangeArgs(local, excludes, remotes, hasCommit);
+}
+
+/** Check every file version added or modified, and every commit email, in a pushed range. */
+export function checkRange(local, excludes) {
+  const range = pushedRange(local, excludes);
   const commits = git('rev-list', ...range).toString().split('\n').filter(Boolean);
   const errors = [];
   const seen = new Set();
@@ -195,19 +199,29 @@ export function checkRange(local, excludes) {
       }
     }
   }
-  errors.push(...privateCommitEmails(git('log', '--format=%H%x09%ae%x09%ce', ...range).toString()));
+  // log.showSignature would add signature lines that parse as commits.
+  errors.push(...privateCommitEmails(git('log', '--no-show-signature', '--format=%H%x09%ae%x09%ce', ...range).toString()));
   return [...new Set(errors)];
 }
 
-if (isMain(import.meta.url)) {
-  const args = process.argv.slice(2);
+function main(args) {
+  if (args[0] === '--range-args') {
+    // One revision argument per line for scripts/secret-scan.sh; remote names cannot contain newlines.
+    try {
+      process.stdout.write(`${pushedRange(args[1], args.slice(2)).join('\n')}\n`);
+    } catch {
+      console.error('Could not list the pushed commits; refusing to continue');
+      process.exitCode = 1;
+    }
+    return;
+  }
   let errors;
   let scope = 'indexed files and HEAD history';
   if (args[0] === '--range') {
     scope = 'pushed commits';
     try { errors = checkRange(args[1], args.slice(2)); } catch { errors = ['Could not list the pushed commits; refusing to continue']; }
   } else if (args.length) {
-    errors = ['Usage: check-privacy.mjs [--range <local-oid> [<remote-oid-or-name>...]]'];
+    errors = ['Usage: check-privacy.mjs [--range | --range-args <local-oid> [<remote-oid-or-name>...]]'];
   } else {
     errors = checkPrivacy();
   }
@@ -215,3 +229,5 @@ if (isMain(import.meta.url)) {
   console.log(`Privacy checks: ${errors.length ? 'FAILED' : 'passed'} (${scope})`);
   process.exitCode = errors.length ? 1 : 0;
 }
+
+if (isMain(import.meta.url)) main(process.argv.slice(2));

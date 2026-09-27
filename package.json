@@ -13,7 +13,6 @@
     "test": "vitest run && node --test scripts/test-*.mjs",
     "tail": "wrangler tail --config wrangler.local.jsonc",
     "lint:docs": "markdownlint-cli2",
-    "predeploy": "node scripts/check-deploy.mjs",
     "deploy:local": "wrangler deploy --config wrangler.local.jsonc",
     "check:privacy": "node scripts/check-privacy.mjs",
     "check:setup": "node scripts/check-setup.mjs",

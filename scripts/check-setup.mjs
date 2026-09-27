@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { indexedFiles, isMain, jsonc, readIndexed } from './repo-files.mjs';
 import { publicConfig } from './check-privacy.mjs';
 
-// The guard runs inside the deploy script too, so npm --ignore-scripts cannot skip it.
+// The guard runs inside the deploy script, not predeploy, so npm --ignore-scripts cannot skip it.
 // Deploy to Cloudflare and Workers Builds use the detected `npm run deploy`.
 // --config pins the public template: Wrangler otherwise prefers a wrangler.json or
 // wrangler.toml found in the working directory or its ancestors, or a .wrangler/deploy redirect.
@@ -24,7 +24,6 @@ export function validateSetup(config, pkg, examples) {
   assert.deepEqual(lines.map((line) => line.split('=')[0]).sort(), required);
   for (const name of required) assert.ok(pkg.cloudflare?.bindings?.[name]?.description?.trim(), `Missing guided prompt: ${name}`);
   assert.equal(pkg.scripts?.deploy, PUBLIC_DEPLOY);
-  assert.equal(pkg.scripts?.predeploy, 'node scripts/check-deploy.mjs');
   assert.equal(pkg.scripts?.['deploy:local'], 'wrangler deploy --config wrangler.local.jsonc');
 }
 
@@ -56,7 +55,6 @@ export function testDeployGuard(guard, deploy = PUBLIC_DEPLOY) {
     writeFileSync(join(dir, 'scripts/deploy-marker.mjs'),
       "console.log('DEPLOY_REACHED'); console.log(['ARGS', ...process.argv.slice(2)].join(' '));\n");
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ private: true, scripts: {
-      predeploy: 'node scripts/check-deploy.mjs',
       deploy: deploy.replace(wrangler, '$1node scripts/deploy-marker.mjs$2'),
     } }));
     const run = (ignoreScripts) => spawnSync('npm', ['run', 'deploy'], { cwd: dir, encoding: 'utf8', timeout: 15_000,

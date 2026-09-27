@@ -1,0 +1,28 @@
+name: Install verified Gitleaks
+description: >-
+  Installs the pinned Gitleaks release for the runner's platform after checking
+  its SHA-256 from the release checksums, outside the checkout, and adds it to PATH.
+runs:
+  using: composite
+  steps:
+    # The only Gitleaks version and checksums used by CI; update them together
+    # from gitleaks_<version>_checksums.txt in the release.
+    - name: Install verified Gitleaks 8.30.1
+      shell: bash
+      run: |
+        version=8.30.1
+        case "$RUNNER_OS/$RUNNER_ARCH" in
+          Linux/X64) platform=linux_x64 sha256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;;
+          macOS/ARM64) platform=darwin_arm64 sha256=b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5 ;;
+          macOS/X64) platform=darwin_x64 sha256=dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709 ;;
+          *) echo "::error::No pinned Gitleaks build for $RUNNER_OS/$RUNNER_ARCH"; exit 1 ;;
+        esac
+        tool_dir=$(mktemp -d "$RUNNER_TEMP/onfreq-gitleaks.XXXXXX")
+        cd "$tool_dir"
+        curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+          --retry 3 --max-time 120 -o gitleaks.tar.gz \
+          "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_${platform}.tar.gz"
+        printf '%s  %s\n' "$sha256" gitleaks.tar.gz | shasum -a 256 --check --strict
+        tar -xzf gitleaks.tar.gz gitleaks
+        ./gitleaks version
+        printf '%s\n' "$tool_dir" >> "$GITHUB_PATH"

@@ -28,16 +28,14 @@ jobs:
 
       # Pin tool versions and verify release archives before executing them.
       # Install outside the checkout so downloads never become scan inputs.
-      - name: Install verified scanning tools
+      - name: Install verified Gitleaks
+        uses: ./.github/actions/install-gitleaks
+
+      - name: Install verified actionlint
         shell: bash
         run: |
           tool_dir=$(mktemp -d "$RUNNER_TEMP/onfreq-tools.XXXXXX")
           cd "$tool_dir"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --retry 3 --max-time 120 -o gitleaks.tar.gz \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' gitleaks.tar.gz | sha256sum --check --strict
-          tar -xzf gitleaks.tar.gz gitleaks
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --retry 3 --max-time 120 -o actionlint.tar.gz \
             https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
@@ -45,19 +43,12 @@ jobs:
           tar -xzf actionlint.tar.gz actionlint
           printf '%s\n' "$tool_dir" >> "$GITHUB_PATH"
 
-      # Same literal-byte log as the pre-push hook: merges against each parent
-      # whatever log.diffMerges says, binary, -diff and textconv files as raw
-      # text; removed lines are dropped.
-      # The bash shell's pipefail fails the step if Git or sed fails.
+      # The pre-push hook's scan over all reachable history; see the script.
       - name: Scan reachable commit history for secrets
-        shell: bash
-        run: |
-          git log -p -U0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate HEAD -- \
-            | LC_ALL=C sed '/^-/d' \
-            | gitleaks stdin --redact --no-banner
+        run: sh scripts/secret-scan.sh HEAD
 
       - name: Check POSIX shell scripts
-        run: shellcheck scripts/poll-trigger.sh scripts/pre-commit scripts/hooks/pre-commit scripts/hooks/pre-push
+        run: shellcheck scripts/poll-trigger.sh scripts/pre-commit scripts/secret-scan.sh scripts/hooks/pre-commit scripts/hooks/pre-push scripts/hooks/lib/gitleaks-settings.sh
 
       - name: Check GitHub Actions workflows
         run: actionlint
@@ -80,8 +71,10 @@ jobs:
           plutil -lint scripts/com.onfreq.poll.plist
           sh -n scripts/poll-trigger.sh
           sh -n scripts/pre-commit
+          sh -n scripts/secret-scan.sh
           sh -n scripts/hooks/pre-commit
           sh -n scripts/hooks/pre-push
+          sh -n scripts/hooks/lib/gitleaks-settings.sh
 
       # The test harness uses temporary files and mocked curl.
       # It never installs agents or calls production.
@@ -92,8 +85,12 @@ jobs:
       - name: Install check dependencies without lifecycle scripts
         run: npm ci --ignore-scripts
 
-      # Synthetic repositories with fake npm and Gitleaks; runs the hooks with macOS
-      # /bin/sh. The real-Gitleaks case is skipped here and runs in the checks job.
+      # Real-Gitleaks hook tests run here too, with macOS /bin/sh and BSD tools.
+      - name: Install verified Gitleaks
+        uses: ./.github/actions/install-gitleaks
+
+      # Synthetic repositories with fake npm and, except for the real-Gitleaks
+      # cases, fake Gitleaks; runs the hooks with macOS /bin/sh.
       - name: Test Git hooks
         run: node --test scripts/test-hooks.mjs
 
@@ -129,19 +126,9 @@ jobs:
       - name: Typecheck (wrangler types + tsc)
         run: npm run typecheck
 
-      # The pre-push hook test scans a synthetic secret with the real Gitleaks.
-      # Same pinned, checksum-verified release as above, installed outside the checkout.
+      # The hook tests scan synthetic secrets with the real Gitleaks.
       - name: Install verified Gitleaks for hook tests
-        shell: bash
-        run: |
-          tool_dir=$(mktemp -d "$RUNNER_TEMP/onfreq-tools.XXXXXX")
-          cd "$tool_dir"
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --retry 3 --max-time 120 -o gitleaks.tar.gz \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' gitleaks.tar.gz | sha256sum --check --strict
-          tar -xzf gitleaks.tar.gz gitleaks
-          printf '%s\n' "$tool_dir" >> "$GITHUB_PATH"
+        uses: ./.github/actions/install-gitleaks
 
       - name: Unit tests
         run: npm test
