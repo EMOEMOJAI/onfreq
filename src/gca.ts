@@ -642,7 +642,13 @@ async function sendMemberReminders(
     if (fresh.status !== 'pending' || fresh.retry_at > Date.now() || fresh.attempts >= MAX_ATTEMPTS) continue;
     const recipient = index.get(atc.userId);
     if (!recipient) {
-      sql.exec("UPDATE gca_reminders SET status = 'unmapped' WHERE session_key = ?", key);
+      // Still 'pending' here, so any earlier message POST for this connection
+      // was an explicit 429 rejection (see below) and never delivered: its
+      // reserved occurrence is released, as the stale-row pruning would do.
+      storage.transactionSync(() => {
+        sql.exec("UPDATE gca_reminders SET status = 'unmapped' WHERE session_key = ?", key);
+        sql.exec('DELETE FROM gca_occurrences WHERE session_key = ?', key);
+      });
       console.log(JSON.stringify({ event: 'gca_skipped_unmapped' }));
       continue;
     }
@@ -691,9 +697,14 @@ async function sendMemberReminders(
       // occurrence is released, so the member's next received warning is not
       // numbered past one they never got. Only this connection's row is
       // removed; the reminder row keeps deduplicating it.
-      const undelivered = messageAttempted && (
+      // A row that ends failed without a message POST in this attempt (openDm
+      // refused, wrong recipient, or out of attempts) was also never
+      // delivered: it started this attempt 'pending', and a message POST only
+      // leaves a row pending when Discord explicitly rejected it with a 429.
+      const undelivered = (messageAttempted && (
         (err instanceof GcaDiscordError && err.status >= 400 && err.status < 500) ||
-        (err instanceof DiscordRateLimitError && outcome.status === 'failed'));
+        (err instanceof DiscordRateLimitError && outcome.status === 'failed'))) ||
+        (!messageAttempted && outcome.status === 'failed');
       storage.transactionSync(() => {
         sql.exec('UPDATE gca_reminders SET status = ?, attempts = ?, retry_at = ? WHERE session_key = ?',
           outcome.status, outcome.attempts, outcome.retryAt, key);

@@ -519,6 +519,48 @@ describe('durable GCA delivery', () => {
     expect(titles().at(-1)).toContain('[2nd occurrence]');
   });
 
+  it('releases the occurrence of a rate-limited DM that later fails before its message POST', async () => {
+    const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
+      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+    await check([]);
+    await check([atc({ sessionId: 1 })]);
+    messageStatus = 429;
+    await check([atc({ sessionId: 2 })]);
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'pending' });
+    expect(await occurrences()).toHaveLength(2);
+    // The retry never reaches the message POST: opening the DM is now refused.
+    messageStatus = 200;
+    openStatus = 403;
+    now += 200_000;
+    await check([atc({ sessionId: 2 })]);
+    expect(sent).toHaveLength(2);
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'failed' });
+    expect(await occurrences()).toEqual([{ session_key: '600001:1', occurrence: 1 }]);
+    openStatus = 200;
+    now += 60_000;
+    await check([atc({ sessionId: 3 })]);
+    expect(titles().at(-1)).toContain('[2nd occurrence]');
+  });
+
+  it('releases the occurrence of a rate-limited DM whose member left the server', async () => {
+    const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
+      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+    await check([]);
+    await check([atc({ sessionId: 1 })]);
+    messageStatus = 429;
+    await check([atc({ sessionId: 2 })]);
+    messageStatus = 200;
+    members = [];
+    now += 200_000;
+    await check([atc({ sessionId: 2 })]);
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'unmapped' });
+    expect(await occurrences()).toEqual([{ session_key: '600001:1', occurrence: 1 }]);
+    members = [member()];
+    now += 60_000;
+    await check([atc({ sessionId: 3 })]);
+    expect(titles().at(-1)).toContain('[2nd occurrence]');
+  });
+
   it.each(['pending', 'unmapped'])(
     'releases the occurrence of a deferred DM whose %s row is pruned, keeping sent ones', async (kind) => {
       const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
