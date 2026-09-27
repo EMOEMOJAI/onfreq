@@ -294,6 +294,38 @@ test('pre-push blocks when Git cannot produce the pushed log (S19-28)', (t) => {
   assert.doesNotMatch(result.npm, /check:setup/);
 });
 
+test('a Gitleaks that exits before reading a large log is reported as a scan or read failure (C59)', (t) => {
+  const f = fixture(t);
+  // Well beyond any pipe buffer, so Git and sed fail on the closed pipe.
+  writeFileSync(join(f.repo, 'large.txt'), `${'synthetic filler line for the scanned log\n'.repeat(40000)}`);
+  f.git('add', 'large.txt');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'large');
+  const head = f.git('rev-parse', 'HEAD');
+  const bin = join(f.repo, '..', 'bin');
+  // Like Gitleaks on a bad configuration: fails without reading standard input.
+  writeFileSync(join(bin, 'gitleaks'), '#!/bin/sh\nprintf \'synthetic gitleaks error\\n\' >&2\nexit 1\n', { mode: 0o700 });
+  const scan = (...args) => spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args], { cwd: f.repo,
+    env: isolatedEnv({ PATH: `${bin}:${process.env.PATH}`, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }),
+    encoding: 'utf8' });
+  const combined = /secret-scan: the secret scan failed or could not read the commits; see the output above/;
+  let result = scan('HEAD');
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /synthetic gitleaks error/);
+  assert.match(result.stderr, combined);
+  assert.doesNotMatch(result.stderr, /could not read the commits to scan/);
+  result = f.push([ref(head)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, combined);
+  assert.match(result.stderr, /pre-push: BLOCKED — could not read the pushed commits for the secret scan, or the scan failed; see the output above/);
+  assert.doesNotMatch(result.npm, /check:setup/);
+  // A Git failure while Gitleaks reads everything and succeeds names only the read failure.
+  writeFileSync(join(bin, 'gitleaks'), '#!/bin/sh\ncat >/dev/null\nexit 0\n', { mode: 0o700 });
+  result = scan('--not-a-revision-xyz');
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /secret-scan: could not read the commits to scan/);
+  assert.doesNotMatch(result.stderr, combined);
+});
+
 test('pre-push scans the range check-privacy.mjs --range-args prints and blocks without it (C47)', (t) => {
   const f = fixture(t);
   f.git('remote', 'add', 'origin', 'https://example.test/synthetic.git');
