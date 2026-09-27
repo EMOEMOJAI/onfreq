@@ -8,6 +8,9 @@
 #   git config core.hooksPath scripts/hooks
 # Preserve existing hooks and any private-history push guard.
 set -eu
+# These variables would replace the repository's Gitleaks rules, for example
+# with an empty rule set; the scan uses only the reviewed configuration.
+unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
 
 if ! command -v npm >/dev/null 2>&1; then
   printf 'pre-push: install Node.js 24 and run npm ci before pushing.\n' >&2
@@ -50,9 +53,10 @@ if ! git diff --cached --quiet --no-ext-diff --no-textconv --ignore-submodules=n
   printf 'Commit or unstage them, then push from a clean checkout of HEAD.\n' >&2
   exit 1
 fi
-# The checks run from the working tree, so their code must match HEAD.
-if ! git diff --quiet --no-ext-diff --no-textconv -- package.json package-lock.json scripts/; then
-  printf 'pre-push: BLOCKED — unstaged changes to package files or scripts/ would change the checks.\n' >&2
+# The checks run from the working tree, so their code and the Gitleaks
+# configuration and ignore list read from it must match HEAD.
+if ! git diff --quiet --no-ext-diff --no-textconv -- package.json package-lock.json scripts/ .gitleaks.toml .gitleaksignore; then
+  printf 'pre-push: BLOCKED — unstaged changes to package files, scripts/ or Gitleaks settings would change the checks.\n' >&2
   printf 'Commit, stash or discard them, then push.\n' >&2
   exit 1
 fi
@@ -61,20 +65,39 @@ if ! untracked=$(git ls-files --others --exclude-standard -- scripts/) || [ -n "
   printf 'Commit, ignore or remove them, then push.\n' >&2
   exit 1
 fi
-if ! root=$(git rev-parse --show-toplevel) || ! remotes=$(git remote); then
+# Gitleaks reads these from the current directory even when untracked or ignored.
+for file in .gitleaks.toml .gitleaksignore; do
+  if { [ -e "$file" ] || [ -L "$file" ]; } && ! git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+    printf 'pre-push: BLOCKED — untracked or ignored %s would change the secret scan.\n' "$file" >&2
+    printf 'Commit or remove it, then push.\n' >&2
+    exit 1
+  fi
+done
+if ! remotes=$(git remote); then
   printf 'pre-push: BLOCKED — could not inspect the repository.\n' >&2
   exit 1
 fi
 
-# Gitleaks log options for one pushed ref, matching check-privacy --range: HEAD
-# minus the remote ref's old commit, when present, and the pushed remote's
-# tracking refs. Remote names cannot contain spaces, which Gitleaks splits on.
-log_opts() {
-  opts=$head
-  not=
-  case "$1" in
+if ! tmp=$(mktemp -d); then
+  printf 'pre-push: BLOCKED — could not create a temporary directory.\n' >&2
+  exit 1
+fi
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+
+# Scans the literal bytes one pushed ref adds, matching check-privacy --range:
+# HEAD minus the remote ref's old commit, when present, and the pushed remote's
+# tracking refs. Merges are diffed against each parent, so content only a merge
+# resolution adds is scanned; external diff drivers, textconv filters and binary
+# or -diff attributes cannot hide content. Removed lines are dropped, so pushing
+# a removal does not re-flag content the remote already has. A failed Git or
+# filter stage leaves a marker, so an unreadable range blocks the push.
+scan_range() {
+  old=$1
+  set -- "$head" --not
+  case "$old" in
     *[!0-9a-f]* | '') ;;
-    *[!0]*) if git cat-file -e "$1^{commit}" 2>/dev/null; then not="$not $1"; fi ;;
+    *[!0]*) if git cat-file -e "$old^{commit}" 2>/dev/null; then set -- "$@" "$old"; fi ;;
   esac
   case "$remote" in
     '' | *[[:space:]]*) ;;
@@ -82,23 +105,31 @@ log_opts() {
 $remotes
 " in *"
 $remote
-"*) not="$not --remotes=$remote" ;; esac ;;
+"*) set -- "$@" "--remotes=$remote" ;; esac ;;
   esac
-  if [ -n "$not" ]; then opts="$opts --not$not"; fi
-  printf '%s' "$opts"
+  { git log -p -U0 --root --no-ext-diff --no-textconv --text --no-color -m "$@" -- </dev/null ||
+      : >"$tmp/failed"; } |
+    { LC_ALL=C sed '/^-/d' || : >"$tmp/failed"; } |
+    gitleaks stdin --redact --no-banner
 }
 
-# New commits per ref: HEAD minus the remote ref and the pushed remote's
-# tracking refs. The checks never print matched private values; Gitleaks redacts.
+# New commits per ref. The checks never print matched private values; Gitleaks redacts.
 failed=false
 leaked=false
+unreadable=false
 for remote_oid in "$@"; do
-  if ! output=$(gitleaks git --redact --no-banner --log-opts="$(log_opts "$remote_oid")" "$root" 2>&1 </dev/null); then
-    printf '\n%s\n' "$output" >&2
-    leaked=true
-  fi
+  rm -f "$tmp/failed"
+  status=0
+  output=$(scan_range "$remote_oid" 2>&1) || status=$?
+  if [ "$status" != 0 ]; then leaked=true; fi
+  if [ -e "$tmp/failed" ]; then unreadable=true; fi
+  if [ "$status" != 0 ] || [ -e "$tmp/failed" ]; then printf '\n%s\n' "$output" >&2; fi
   npm run --silent check:privacy -- --range "$head" "$remote_oid" "$remote" </dev/null || failed=true
 done
+if [ "$unreadable" = true ]; then
+  printf '\npre-push: BLOCKED — could not read the pushed commits for the secret scan.\n' >&2
+  exit 1
+fi
 if [ "$leaked" = true ]; then
   printf '\npre-push: BLOCKED — pushed commits look like they contain a secret.\n' >&2
   printf 'Rewrite the unpublished commits to remove it and rotate the value; move it into .dev.vars (gitignored) or a Wrangler secret.\n' >&2

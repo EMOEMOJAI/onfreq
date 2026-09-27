@@ -10,11 +10,15 @@ import { isolatedEnv } from './check-setup.mjs';
 const hook = fileURLToPath(new URL('./hooks/pre-push', import.meta.url));
 const zero = '0'.repeat(40);
 const hasGitleaks = spawnSync('gitleaks', ['version'], { stdio: 'ignore' }).status === 0;
+// A synthetic AWS-format key assembled at runtime, so this file never contains it.
+const syntheticKey = () => ['AKIA', 'Q7RZ', 'LX2M', 'NB4K', 'TWPJ'].join('');
 
 // A synthetic repository with fake npm and gitleaks commands that record their
-// arguments, so the hook's ref and index gating is tested without running the
-// real checks. With realRange, range checks run the real check-privacy.mjs copied
-// into the fixture; gitleaks: 'real' uses the installed Gitleaks, 'missing' none.
+// arguments (and, for gitleaks, the commits in the scanned log), so the hook's ref
+// and index gating is tested without running the real checks. With realRange,
+// range checks run the real check-privacy.mjs copied into the fixture; gitleaks:
+// 'real' uses the installed Gitleaks, 'missing' none. Global and system Git
+// configuration are ignored so the scanned log format is predictable.
 function fixture(t, { npmExit = 0, realRange = false, gitleaks = 'fake', gitleaksExit = 0 } = {}) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-hooks-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -22,7 +26,7 @@ function fixture(t, { npmExit = 0, realRange = false, gitleaks = 'fake', gitleak
   const bin = join(dir, 'bin');
   const env = isolatedEnv({ PATH: `${bin}:${process.env.PATH}`, NPM_LOG: join(dir, 'npm.log'), NPM_EXIT: String(npmExit),
     GITLEAKS_LOG: join(dir, 'gitleaks.log'), GITLEAKS_EXIT: String(gitleaksExit),
-    NODE: process.execPath, REAL_RANGE: realRange ? '1' : '' });
+    NODE: process.execPath, REAL_RANGE: realRange ? '1' : '', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
   for (const path of [repo, bin, join(repo, 'scripts')]) mkdirSync(path);
   writeFileSync(join(bin, 'npm'), `#!/bin/sh
 printf '%s\\n' "$*" >> "$NPM_LOG"
@@ -36,6 +40,8 @@ exit "$NPM_EXIT"
     writeFileSync(join(bin, 'gitleaks'), `#!/bin/sh
 printf '[%s]' "$@" >> "$GITLEAKS_LOG"
 printf '\\n' >> "$GITLEAKS_LOG"
+if [ -n "\${GITLEAKS_CONFIG+x}\${GITLEAKS_CONFIG_TOML+x}" ]; then printf 'config variable set\\n' >> "$GITLEAKS_LOG"; fi
+sed -n 's/^commit \\([0-9a-f]\\{40\\}\\).*/\\1/p' >> "$GITLEAKS_LOG"
 if [ "$GITLEAKS_EXIT" != 0 ]; then printf 'synthetic finding: REDACTED\\n' >&2; fi
 exit "$GITLEAKS_EXIT"
 `, { mode: 0o700 });
@@ -69,11 +75,11 @@ exit "$GITLEAKS_EXIT"
   const head = git('rev-parse', 'HEAD');
   return {
     first, head, git, repo,
-    push(lines, args = ['origin', 'https://example.test/synthetic.git']) {
+    push(lines, args = ['origin', 'https://example.test/synthetic.git'], extraEnv = {}) {
       rmSync(env.NPM_LOG, { force: true });
       rmSync(env.GITLEAKS_LOG, { force: true });
       const result = spawnSync('/bin/sh', [hook, ...args],
-        { cwd: repo, env: hookEnv, input: lines.join('\n'), encoding: 'utf8' });
+        { cwd: repo, env: { ...hookEnv, ...extraEnv }, input: lines.join('\n'), encoding: 'utf8' });
       const log = (file) => existsSync(file) ? readFileSync(file, 'utf8') : '';
       return { ...result, npm: log(env.NPM_LOG), gitleaks: log(env.GITLEAKS_LOG) };
     },
@@ -83,7 +89,8 @@ exit "$GITLEAKS_EXIT"
 const ref = (oid, name = 'refs/heads/main', remote = zero) => `${name} ${oid} ${name} ${remote}\n`;
 const checks = 'run --silent check:privacy\nrun --silent check:setup\n';
 const rangeCheck = (head, remote = zero, name = 'origin') => `run --silent check:privacy -- --range ${head} ${remote} ${name}\n`;
-const leakScan = (repo, logOpts) => `[git][--redact][--no-banner][--log-opts=${logOpts}][${repo}]\n`;
+// One fake Gitleaks run over the piped log: its arguments, then the scanned commits.
+const leakScan = (...commits) => `[stdin][--redact][--no-banner]\n${commits.map((c) => `${c}\n`).join('')}`;
 
 test('pre-push runs range, privacy and setup checks when the pushed commit is the clean HEAD', (t) => {
   const f = fixture(t);
@@ -91,11 +98,11 @@ test('pre-push runs range, privacy and setup checks when the pushed commit is th
     const result = f.push(lines);
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.npm, rangeCheck(f.head) + checks);
-    assert.equal(result.gitleaks, leakScan(f.repo, f.head));
+    assert.equal(result.gitleaks, leakScan(f.head, f.first));
   }
   let result = f.push([ref(f.head, 'refs/heads/main', f.first)]);
   assert.equal(result.npm, rangeCheck(f.head, f.first) + checks);
-  assert.equal(result.gitleaks, leakScan(f.repo, `${f.head} --not ${f.first}`));
+  assert.equal(result.gitleaks, leakScan(f.head));
   // A deletion-only push, or a wrapper that omits the remote arguments.
   result = f.push([]);
   assert.equal(result.npm, checks);
@@ -103,28 +110,30 @@ test('pre-push runs range, privacy and setup checks when the pushed commit is th
   result = f.push([ref(f.head)], []);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.npm, rangeCheck(f.head, zero, '') + checks);
-  assert.equal(result.gitleaks, leakScan(f.repo, f.head));
+  assert.equal(result.gitleaks, leakScan(f.head, f.first));
 });
 
 test('pre-push scans the same pushed range with Gitleaks as the privacy range check (S19-24)', (t) => {
   const f = fixture(t);
   f.git('remote', 'add', 'origin', 'https://example.test/synthetic.git');
+  f.git('update-ref', 'refs/remotes/origin/main', f.first);
   const unknown = 'b'.repeat(40);
+  const url = 'https://example.test/synthetic.git';
   // Only the named remote's tracking refs and known remote commits are excluded.
-  for (const [remoteOid, args, logOpts] of [
-    [zero, undefined, `${f.head} --not --remotes=origin`],
-    [f.first, undefined, `${f.head} --not ${f.first} --remotes=origin`],
-    [unknown, undefined, `${f.head} --not --remotes=origin`],
-    [f.first, ['https://example.test/synthetic.git', 'https://example.test/synthetic.git'], `${f.head} --not ${f.first}`],
-    [unknown, ['public', 'https://example.test/public.git'], f.head],
+  for (const [remoteOid, args, commits] of [
+    [zero, undefined, [f.head]],
+    [f.first, undefined, [f.head]],
+    [unknown, undefined, [f.head]],
+    [f.first, [url, url], [f.head]],
+    [zero, [url, url], [f.head, f.first]],
+    [unknown, ['public', 'https://example.test/public.git'], [f.head, f.first]],
   ]) {
     const result = f.push([ref(f.head, 'refs/heads/main', remoteOid)], args);
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.gitleaks, leakScan(f.repo, logOpts));
+    assert.equal(result.gitleaks, leakScan(...commits));
   }
-  const result = f.push([ref(f.head), ref(f.head, 'refs/heads/copy', f.first)]);
-  assert.equal(result.gitleaks, leakScan(f.repo, `${f.head} --not --remotes=origin`) +
-    leakScan(f.repo, `${f.head} --not ${f.first} --remotes=origin`));
+  const result = f.push([ref(f.head), ref(f.head, 'refs/heads/copy', f.first)], ['public', 'https://example.test/public.git']);
+  assert.equal(result.gitleaks, leakScan(f.head, f.first) + leakScan(f.head));
 });
 
 test('pre-push blocks when Gitleaks reports a finding or is not installed (S19-24)', (t) => {
@@ -143,8 +152,7 @@ test('pre-push blocks when Gitleaks reports a finding or is not installed (S19-2
 test('pre-push Gitleaks scan catches a secret committed with --no-verify and redacts it (S19-24)',
   { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
-    // A synthetic AWS-format key assembled at runtime, so this file never contains it.
-    const token = ['AKIA', 'Q7RZ', 'LX2M', 'NB4K', 'TWPJ'].join('');
+    const token = syntheticKey();
     writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\n`);
     f.git('add', 'config.txt');
     f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret');
@@ -162,6 +170,145 @@ test('pre-push Gitleaks scan catches a secret committed with --no-verify and red
     result = f.push([ref(head, 'refs/heads/main', secret)]);
     assert.equal(result.status, 0, result.stderr);
   });
+
+test('pre-push Gitleaks scan reads the literal bytes of binary, -diff and textconv files (S19-28)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    // Without --text/--no-textconv, git log -p shows these as "Binary files differ"
+    // or as the textconv output, so Gitleaks would never see the key.
+    writeFileSync(join(f.repo, '.gitattributes'), 'marked.txt -diff\nhidden.txt diff=hide\n');
+    f.git('config', 'diff.hide.textconv', 'true');
+    f.git('add', '.gitattributes');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'attributes');
+    let base = f.git('rev-parse', 'HEAD');
+    const line = `aws_access_key_id = ${token}\n`;
+    for (const [name, content] of [
+      ['marked.txt', line],
+      ['hidden.txt', line],
+      ['blob.bin', Buffer.concat([Buffer.from([0, 0xff, 0xfe, 0x00, 0x0a]), Buffer.from(line), Buffer.from([0, 0x80])])],
+    ]) {
+      writeFileSync(join(f.repo, name), content);
+      f.git('add', name);
+      f.git('commit', '--quiet', '--no-verify', '-m', `synthetic secret in ${name}`);
+      f.git('rm', '--quiet', name);
+      f.git('commit', '--quiet', '--no-verify', '-m', `remove ${name}`);
+      const head = f.git('rev-parse', 'HEAD');
+      const result = f.push([ref(head, 'refs/heads/main', base)]);
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, /pushed commits look like they contain a secret/, name);
+      assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)), name);
+      base = head;
+    }
+    // Once the remote has those commits, a clean push passes.
+    writeFileSync(join(f.repo, 'public.txt'), 'clean\n');
+    f.git('commit', '--quiet', '--no-verify', '-am', 'clean');
+    const result = f.push([ref(f.git('rev-parse', 'HEAD'), 'refs/heads/main', base)]);
+    assert.equal(result.status, 0, result.stderr);
+  });
+
+test('pre-push Gitleaks scan catches a secret only a merge resolution adds (S19-28)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    f.git('checkout', '--quiet', '-b', 'side');
+    writeFileSync(join(f.repo, 'side.txt'), 'side\n');
+    f.git('add', 'side.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'side change');
+    f.git('checkout', '--quiet', 'main');
+    writeFileSync(join(f.repo, 'public.txt'), 'main\n');
+    f.git('commit', '--quiet', '--no-verify', '-am', 'main change');
+    // No ordinary commit adds the key: only the merge commit's own changes do.
+    f.git('merge', '--quiet', '--no-ff', '--no-commit', 'side');
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\n`);
+    f.git('add', 'config.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'merge side');
+    const merge = f.git('rev-parse', 'HEAD');
+    f.git('rm', '--quiet', 'config.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'remove synthetic secret');
+    const head = f.git('rev-parse', 'HEAD');
+    let result = f.push([ref(head, 'refs/heads/main', f.head)]);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /pushed commits look like they contain a secret/);
+    assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)));
+    // A clean merge in the pushed range passes.
+    result = f.push([ref(head, 'refs/heads/main', merge)]);
+    assert.equal(result.status, 0, result.stderr);
+    f.git('checkout', '--quiet', '-b', 'side2');
+    writeFileSync(join(f.repo, 'side2.txt'), 'side2\n');
+    f.git('add', 'side2.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'side2 change');
+    f.git('checkout', '--quiet', 'main');
+    f.git('merge', '--quiet', '--no-ff', '--no-verify', '-m', 'merge side2', 'side2');
+    result = f.push([ref(f.git('rev-parse', 'HEAD'), 'refs/heads/main', head)]);
+    assert.equal(result.status, 0, result.stderr);
+  });
+
+test('pre-push blocks when Git cannot produce the pushed log (S19-28)', (t) => {
+  const f = fixture(t);
+  // The first commit's public.txt blob is read only by the scan's log.
+  const blob = f.git('rev-parse', `${f.first}:public.txt`);
+  rmSync(join(f.repo, '.git', 'objects', blob.slice(0, 2), blob.slice(2)));
+  const result = f.push([ref(f.head)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /could not read the pushed commits for the secret scan/);
+  assert.doesNotMatch(result.npm, /check:setup/);
+});
+
+test('pre-push ignores Gitleaks configuration variables (S19-29)', (t) => {
+  const f = fixture(t);
+  const result = f.push([ref(f.head)], undefined,
+    { GITLEAKS_CONFIG: join(f.repo, 'rules.toml'), GITLEAKS_CONFIG_TOML: 'title = "no rules"\n' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.gitleaks, leakScan(f.head, f.first));
+});
+
+test('pre-push Gitleaks scan cannot be emptied by configuration variables (S19-29)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    // A configuration with no rules reports nothing when Gitleaks honours it.
+    const rules = join(f.repo, '..', 'rules.toml');
+    writeFileSync(rules, 'title = "no rules"\n');
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${syntheticKey()}\n`);
+    f.git('add', 'config.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret');
+    const head = f.git('rev-parse', 'HEAD');
+    for (const env of [{ GITLEAKS_CONFIG: rules }, { GITLEAKS_CONFIG_TOML: 'title = "no rules"\n' }]) {
+      const result = f.push([ref(head, 'refs/heads/main', f.head)], undefined, env);
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /pushed commits look like they contain a secret/);
+    }
+  });
+
+test('pre-push refuses untracked, ignored or unstaged Gitleaks settings (S19-29)', (t) => {
+  const f = fixture(t);
+  for (const file of ['.gitleaks.toml', '.gitleaksignore']) {
+    writeFileSync(join(f.repo, file), 'title = "no rules"\n');
+    let result = f.push([ref(f.head)]);
+    assert.equal(result.status, 1, file);
+    assert.match(result.stderr, new RegExp(`untracked or ignored \\${file} would change the secret scan`));
+    assert.equal(result.npm, '');
+    assert.equal(result.gitleaks, '');
+    // Ignoring it does not hide it from Gitleaks, so it still blocks.
+    writeFileSync(join(f.repo, '.git', 'info', 'exclude'), `${file}\n`);
+    result = f.push([ref(f.head)]);
+    assert.equal(result.status, 1, file);
+    assert.match(result.stderr, /would change the secret scan/);
+    rmSync(join(f.repo, '.git', 'info', 'exclude'));
+    rmSync(join(f.repo, file));
+  }
+  // A committed configuration is part of the reviewed history; edits to it are not.
+  writeFileSync(join(f.repo, '.gitleaks.toml'), '[extend]\nuseDefault = true\n');
+  f.git('add', '.gitleaks.toml');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'gitleaks config');
+  const head = f.git('rev-parse', 'HEAD');
+  assert.equal(f.push([ref(head)]).status, 0);
+  writeFileSync(join(f.repo, '.gitleaks.toml'), 'title = "no rules"\n');
+  const result = f.push([ref(head)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /unstaged changes to package files, scripts\/ or Gitleaks settings/);
+  assert.equal(result.gitleaks, '');
+});
 
 test('pre-push refuses pushed commits other than HEAD before running checks (other:main bypass)', (t) => {
   const f = fixture(t);
@@ -194,7 +341,7 @@ test('pre-push refuses unstaged edits to the checks or package files', (t) => {
     writeFileSync(join(f.repo, file), `${original}// unstaged\n`);
     const result = f.push([ref(f.head)]);
     assert.equal(result.status, 1, file);
-    assert.match(result.stderr, /unstaged changes to package files or scripts/);
+    assert.match(result.stderr, /unstaged changes to package files, scripts\/ or Gitleaks settings/);
     assert.equal(result.npm, '');
     writeFileSync(join(f.repo, file), original);
   }
