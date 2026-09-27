@@ -24,7 +24,7 @@ function reply(id: string, parent: string, author = BOT_ID) {
 
 function dropped(overrides: Partial<RosterPostAttempt> = {}): RosterPostAttempt {
   return {
-    channelId: 'chan', parentMessageId: 'old-parent', page: 0, attempts: 0, nonceKey: 'roster:old-parent:0:x',
+    channelId: '100000000000000321', parentMessageId: 'old-parent', page: 0, attempts: 0, nonceKey: 'roster:old-parent:0:x',
     maybePostedFrom: WINDOW.from, maybePostedTo: WINDOW.to, ...overrides,
   };
 }
@@ -44,9 +44,9 @@ it('finds only this bot’s replies to the parent, scanning from the attempt win
     reply(idAt(WINDOW.from, 1), 'parent'), reply(idAt(WINDOW.from, 2), 'other'),
     reply(idAt(WINDOW.from, 3), 'parent', '100000000000000001'), { id: 'x' },
   ]));
-  await expect(findBotReplies(TOKEN, 'chan', 'parent', WINDOW, new DiscordRateLimits()))
+  await expect(findBotReplies(TOKEN, '100000000000000321', 'parent', WINDOW, new DiscordRateLimits()))
     .resolves.toEqual([idAt(WINDOW.from, 1)]);
-  expect(requests).toEqual([`GET /channels/chan/messages?after=${idAt(WINDOW.from - 60_000)}&limit=100`]);
+  expect(requests).toEqual([`GET /channels/100000000000000321/messages?after=${idAt(WINDOW.from - 60_000)}&limit=100`]);
 });
 
 it('pages through a busy channel until it passes the attempt window', async () => {
@@ -54,14 +54,14 @@ it('pages through a busy channel until it passes the attempt window', async () =
   const requests = stubDiscord((_method, path) =>
     path.includes(`after=${idAt(WINDOW.from - 60_000)}`) ? Response.json(early)
       : Response.json([reply(idAt(WINDOW.to), 'parent')]));
-  await expect(findBotReplies(TOKEN, 'chan', 'parent', WINDOW, new DiscordRateLimits()))
+  await expect(findBotReplies(TOKEN, '100000000000000321', 'parent', WINDOW, new DiscordRateLimits()))
     .resolves.toEqual([idAt(WINDOW.to)]);
   expect(requests).toHaveLength(2);
 });
 
 it('finds nothing when the bot id cannot be read from the token', async () => {
   const requests = stubDiscord(() => Response.json([]));
-  await expect(findBotReplies('not-a-token', 'chan', 'parent', WINDOW, new DiscordRateLimits())).resolves.toEqual([]);
+  await expect(findBotReplies('not-a-token', '100000000000000321', 'parent', WINDOW, new DiscordRateLimits())).resolves.toEqual([]);
   expect(requests).toEqual([]);
 });
 
@@ -75,12 +75,12 @@ it('deletes an untracked page left behind when its parent is no longer shown', a
   });
   const result = await syncRosterMessages(TOKEN, [
     // Still tracked (its delete keeps failing), so it must not be swept.
-    { channelId: 'chan', parentMessageId: 'old-parent', page: 1, messageId: kept, deleteAttempts: 1 },
+    { channelId: '100000000000000321', parentMessageId: 'old-parent', page: 1, messageId: kept, deleteAttempts: 1 },
   ], [], new DiscordRateLimits(), [dropped()]);
   expect(result.postAttempts).toEqual([]);
   expect(result.messages.map((ref) => ref.messageId)).toEqual([kept]);
   expect(requests.filter((request) => request.startsWith('DELETE'))).toEqual([
-    `DELETE /channels/chan/messages/${kept}`, `DELETE /channels/chan/messages/${orphan}`,
+    `DELETE /channels/100000000000000321/messages/${kept}`, `DELETE /channels/100000000000000321/messages/${orphan}`,
   ]);
 });
 
@@ -88,9 +88,9 @@ it('never sweeps a parent that is still shown, keeping the uncertain page marker
   const requests = stubDiscord(() => new Response(null, { status: 204 }));
   const parentPage = { embeds: [{ title: 'Synthetic page 0' }] };
   const result = await syncRosterMessages(TOKEN, [
-    { channelId: 'chan', parentMessageId: 'old-parent', page: 0, messageId: 'p0',
+    { channelId: '100000000000000321', parentMessageId: 'old-parent', page: 0, messageId: 'p0',
       onlineEmbed: JSON.stringify(parentPage.embeds[0]) },
-  ], [{ channelId: 'chan', parentMessageId: 'old-parent', ...parentPage }], new DiscordRateLimits(), [dropped({ page: 1 })]);
+  ], [{ channelId: '100000000000000321', parentMessageId: 'old-parent', ...parentPage }], new DiscordRateLimits(), [dropped({ page: 1 })]);
   expect(requests).toEqual([]);
   expect(result.postAttempts).toEqual([dropped({ page: 1 })]);
 });
@@ -115,20 +115,20 @@ it.each([
 });
 
 it('keeps a sweep-only marker when a page posts after an uncertain attempt', async () => {
-  const target = { channelId: 'chan', parentMessageId: 'parent', embeds: [{ title: 'Synthetic page 0' }] };
+  const target = { channelId: '100000000000000321', parentMessageId: 'parent', embeds: [{ title: 'Synthetic page 0' }] };
   stubDiscord(() => Response.json({ id: idAt(NOW) }));
   const result = await syncRosterMessages(TOKEN, [], [target], new DiscordRateLimits(), [
     dropped({ parentMessageId: 'parent' }),
   ]);
   expect(result.messages.map((ref) => ref.messageId)).toEqual([idAt(NOW)]);
   expect(result.postAttempts).toEqual([{
-    channelId: 'chan', parentMessageId: 'parent', page: 0, attempts: 0,
+    channelId: '100000000000000321', parentMessageId: 'parent', page: 0, attempts: 0,
     maybePostedFrom: WINDOW.from, maybePostedTo: WINDOW.to,
   }]);
 });
 
 it('records when a post may have landed unseen, but not for a definite rejection', async () => {
-  const target = { channelId: 'chan', parentMessageId: 'parent', embeds: [{ title: 'Synthetic page 0' }] };
+  const target = { channelId: '100000000000000321', parentMessageId: 'parent', embeds: [{ title: 'Synthetic page 0' }] };
   stubDiscord(() => Response.json({ code: 0 }, { status: 502 }));
   let result = await syncRosterMessages(TOKEN, [], [target], new DiscordRateLimits());
   expect(result.postAttempts[0]).toMatchObject({ maybePostedFrom: NOW, maybePostedTo: NOW });
@@ -140,10 +140,10 @@ it('records when a post may have landed unseen, but not for a definite rejection
 it('logs roster failures by configured channel index, never channel or message IDs', async () => {
   const error = vi.spyOn(console, 'error').mockImplementation(() => {});
   stubDiscord(() => Response.json({ code: 50013 }, { status: 403 }));
-  await syncRosterMessages(TOKEN, [{ channelId: 'chan', parentMessageId: 'old-parent', page: 0, messageId: 'page-id' }],
-    [], new DiscordRateLimits(), [dropped()], ['other', 'chan']);
+  await syncRosterMessages(TOKEN, [{ channelId: '100000000000000321', parentMessageId: 'old-parent', page: 0, messageId: 'page-id' }],
+    [], new DiscordRateLimits(), [dropped()], ['other', '100000000000000321']);
   const logs = error.mock.calls.map((call) => String(call[0]));
   expect(logs).toContainEqual(expect.stringContaining('"event":"roster_continuation_failed","operation":"delete","channelIndex":1'));
   expect(logs).toContainEqual(expect.stringContaining('"event":"roster_orphan_sweep_failed","channelIndex":1'));
-  expect(logs.filter((line) => /"chan"|old-parent|page-id/.test(line))).toEqual([]);
+  expect(logs.filter((line) => /"100000000000000321"|old-parent|page-id/.test(line))).toEqual([]);
 });

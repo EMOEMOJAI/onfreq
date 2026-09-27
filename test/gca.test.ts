@@ -898,7 +898,7 @@ describe('durable GCA delivery', () => {
       if (String(input).endsWith(`/channels/${CHANNEL}/messages`)) {
         return Response.json({ retry_after: 65, global: true }, { status: 429 });
       }
-      if (String(input).endsWith('/channels/public/messages')) return Response.json({ id: '700000000000000001' });
+      if (String(input).endsWith('/channels/100000000000000654/messages')) return Response.json({ id: '700000000000000001' });
       return original(input, init);
     });
     await check([atc()]);
@@ -906,7 +906,7 @@ describe('durable GCA delivery', () => {
     await evictDurableObject(stub());
     const publicPost = () => runInDurableObject(stub(), async (_, ctx) => {
       const limits = await DiscordRateLimits.load(ctx.storage);
-      return postMessage('test-token', 'public', { title: 'Synthetic' }, undefined, undefined, limits);
+      return postMessage('test-token', '100000000000000654', { title: 'Synthetic' }, undefined, undefined, limits);
     });
     now += 60_000;
     await expect(publicPost()).rejects.toMatchObject({ status: 429, requestMade: false });

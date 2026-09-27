@@ -31,7 +31,7 @@ function mid(name: string): string {
 
 function entry(callsign: string, frequency = 118.1): IvaoAtcSummaryEntry {
   return {
-    id: 1, userId: 100, callsign, connectionType: 'ATC',
+    id: 1, userId: 100, callsign,
     atcSession: { frequency, position: callsign.split('_').at(-1)! },
     atcPosition: { atcCallsign: 'Test Station' }, subcenter: null,
   };
