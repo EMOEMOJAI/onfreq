@@ -217,7 +217,11 @@ export interface PendingOffline {
    * within Discord's nonce window (a few minutes), and closed.
    */
   recoverPosts?: Record<string, PostWindow>;
-  /** Legacy shared counter, imported when a destination next needs retrying. */
+  /**
+   * Legacy shared counter, imported when a destination next needs retrying.
+   * Reset to 0 after every delivery pass, so it no longer counts failures;
+   * it stays numeric only so an older Worker can still retry on rollback.
+   */
   attempts?: number;
   /** Failed delivery polls per destination; cooldown waits do not count. */
   attemptsByChannel?: Record<string, number>;

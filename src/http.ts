@@ -1,6 +1,7 @@
 /** Bound both response headers and body reads so a stalled service cannot
- * hold the shared poll coordinator indefinitely. These APIs return small JSON
- * payloads that their callers already consume in full.
+ * hold the shared poll coordinator indefinitely. These APIs return bounded JSON
+ * payloads (default cap 1 MiB, per-caller overrides) that their callers
+ * already consume in full.
  */
 export const REQUEST_TIMEOUT_MS = 10_000;
 

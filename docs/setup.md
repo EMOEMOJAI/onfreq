@@ -45,7 +45,7 @@ npm run deploy:local
 
 The public `npm run deploy` command runs `wrangler deploy --config wrangler.jsonc`. It stops, even with npm scripts ignored, if a private `wrangler.local.jsonc`, `.json` or `.toml` exists in the checkout or, for a Git worktree, in its main checkout; use `deploy:local` for that installation. It also refuses a root `wrangler.json`, `wrangler.toml` or `.wrangler/deploy/config.json`. Keep an existing button installation's generated resource IDs when managing its copied repository.
 
-**Upgrading:** set `FIR_PREFIXES`, and migrate any custom labels to private `FIR_LABELS` before deploying. Preserve the existing Worker, KV namespace, Durable Object class and migration tag in your private config. If its coordinator object name differs from `onfreq`, set the `COORDINATOR_NAME` secret to the exact existing name **before deploying**. Changing identity disconnects stored state. Do not restart an old KV-only deployment against stale state.
+**Upgrading:** set `FIR_PREFIXES`, and migrate any custom labels to private `FIR_LABELS` before deploying. Preserve the existing Worker, KV namespace, Durable Object class and migration tag in your private config. If its coordinator object name differs from `onfreq`, set the `COORDINATOR_NAME` secret to the exact existing name **before deploying**. Changing identity disconnects stored state. Do not restart an old KV-only deployment against stale state. Rolling back to an older Worker after upgrading is lossy: some cards may be left open or posted twice.
 
 ## Optional settings
 
@@ -72,7 +72,7 @@ GCA coverage is private configuration, with no built-in region list. Set `GCA_RE
 
 ## Health and optional Mac fallback
 
-`GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters count as unset: their endpoints return 503. When upgrading, rotate a shorter `POLL_SECRET` and set a distinct `HISTORY_SECRET` before deploying.
+`GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters count as unset: their endpoints return 503. Authenticated routes send `Cache-Control: no-store`, and their error bodies carry a fixed `error` message. When upgrading, rotate a shorter `POLL_SECRET` and set a distinct `HISTORY_SECRET` before deploying.
 
 The Mac helper reads private files under `~/.onfreq` and logs `FAIL permissions` without polling if other accounts can access them. Create the directory:
 

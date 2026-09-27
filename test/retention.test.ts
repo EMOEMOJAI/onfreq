@@ -75,14 +75,18 @@ it('also removes recent unsent copies addressed to anyone but the current staff 
       sql.exec('INSERT INTO gca_occurrences VALUES (?, 1)', key);
       sql.exec("INSERT INTO gca_copies VALUES (?, 'payload', ?, ?)", key, recipient, status);
     }
+    // C9: orphan copies (no parent reminder row). The age rule keeps them, but
+    // the recipient rule removes an unsent one for a previous account anyway.
+    sql.exec("INSERT INTO gca_copies VALUES ('600003:1', 'payload', ?, 'pending'), ('600003:2', 'payload', ?, 'pending')",
+      PREVIOUS, CURRENT);
     // Without a valid current account only the age rule applies.
     expect(cleanupGcaCopies(ctx.storage, true, now, '')).toMatchObject({ deleted: 0 });
     expect(cleanupGcaCopies(ctx.storage, true, now, 'not-an-id')).toMatchObject({ deleted: 0 });
     // The coordinator passes its configured account.
     const coordinator = new PollCoordinator(ctx, { ...env, GCA_COPY_USER_ID: CURRENT });
-    expect(coordinator.cleanupGcaHistory(true)).toMatchObject({ busy: false, deleted: 2 });
+    expect(coordinator.cleanupGcaHistory(true)).toMatchObject({ busy: false, deleted: 3 });
     expect(sql.exec('SELECT session_key FROM gca_copies ORDER BY session_key').toArray().map((row) => row.session_key))
-      .toEqual(['600002:3', '600002:4']);
+      .toEqual(['600002:3', '600002:4', '600003:2']);
     expect(sql.exec('SELECT * FROM gca_reminders').toArray()).toHaveLength(4);
     expect(sql.exec('SELECT * FROM gca_occurrences').toArray()).toHaveLength(4);
   });
