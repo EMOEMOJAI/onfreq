@@ -5,6 +5,9 @@
   "license": "MIT",
   "description": "Self-hosted IVAO air traffic control Discord bot with live ATC session cards and FIR coverage, built with TypeScript on Cloudflare Workers.",
   "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "node scripts/check-deploy.mjs && wrangler deploy --config wrangler.jsonc",
