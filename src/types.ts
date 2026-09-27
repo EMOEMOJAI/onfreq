@@ -20,7 +20,6 @@ export interface IvaoAtcSummaryEntry {
   id: number;
   userId: number;
   callsign: string;
-  connectionType: string;
   atcSession: {
     frequency: number;
     position: string;

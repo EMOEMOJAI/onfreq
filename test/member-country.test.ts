@@ -143,6 +143,91 @@ describe('member profile country enrichment', () => {
     expect(network).not.toHaveBeenCalled();
   });
 
+  it('keeps skipped ids backed off across the next minute-interval poll and retries them after five minutes', async () => {
+    let clock = NOW;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    network.mockImplementation(async () => new Response(null, { status: 429 }));
+    const current = Array.from({ length: 3 }, (_, i) => controller(610 + i, `QCTT_${i}_SKP`));
+    await enrichMemberCountries(current, {}, auth);
+    expect(network).toHaveBeenCalledTimes(1);
+    expect(current.slice(1).map((atc) => atc.memberCountry?.expiresAt)).toEqual([NOW + 300_000, NOW + 300_000]);
+    const snapshot = (): StateMap => Object.fromEntries(current.map((atc) => [atc.callsign, {
+      ...atc, since: new Date(NOW).toISOString(), missed: 0,
+    }]));
+
+    // One cron interval later the skipped ids are still backed off; a 60 s
+    // backoff would have expired and retried them here.
+    network.mockClear();
+    network.mockImplementation(async () => Response.json({ countryId: 'ca' }));
+    clock = NOW + 60_000;
+    await enrichMemberCountries(current, snapshot(), auth);
+    expect(network).not.toHaveBeenCalled();
+
+    // Once the backoff has elapsed they are looked up again (the 429'd id
+    // has its own 15-minute retry backoff and stays out).
+    clock = NOW + 300_000;
+    await enrichMemberCountries(current, snapshot(), auth);
+    expect(network.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://api.ivao.aero/v2/users/611', 'https://api.ivao.aero/v2/users/612',
+    ]);
+  });
+
+  it('gives ids skipped by the lookup deadline the same backoff', async () => {
+    let clock = NOW;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    network.mockImplementation(async () => {
+      clock += 11_000;
+      return Response.json({ countryId: 'ca' });
+    });
+    const current = Array.from({ length: 3 }, (_, i) => controller(710 + i, `QCTT_${i}_DLN`));
+    await enrichMemberCountries(current, {}, auth);
+    expect(network).toHaveBeenCalledTimes(1);
+    expect(current.slice(1).map((atc) => atc.memberCountry?.expiresAt)).toEqual([NOW + 300_000, NOW + 300_000]);
+  });
+
+  it('clamps a stored cache expiry to at most one TTL from now', async () => {
+    values.set('ivao-member-country-v1:100', { countryId: 'GB', expiresAt: NOW + 365 * 86_400_000 });
+    const current = [controller()];
+    await enrichMemberCountries(current, {}, auth);
+    expect(current[0]?.memberCountry).toEqual({ countryId: 'GB', expiresAt: NOW + 86_400_000 });
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it('logs a safe failure reason (status or category), never the error, URL, token or body', async () => {
+    const lines: string[] = [];
+    const warn = vi.spyOn(console, 'warn').mockImplementation((line: unknown) => { lines.push(String(line)); });
+    const reasons = async (setup: () => void, userId: number) => {
+      resetTokenCache();
+      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+      warn.mockClear();
+      setup();
+      await enrichMemberCountries([controller(userId, `QCTT_${userId}_TWR`)], {}, auth);
+      return warn.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .filter((entry) => entry.event === 'member_country_unavailable');
+    };
+    const secret = 'synthetic-private-detail';
+    expect(await reasons(() => network.mockImplementation(async () => new Response(secret, { status: 404 })), 1001))
+      .toEqual([{ event: 'member_country_unavailable', userId: 1001, reason: 404 }]);
+    expect(await reasons(() => network.mockImplementation(async () => {
+      throw new Error('upstream request timed out');
+    }), 1002)).toEqual([{ event: 'member_country_unavailable', userId: 1002, reason: 'timeout' }]);
+    expect(await reasons(() => network.mockImplementation(async () => {
+      throw new TypeError(`${secret} https://api.ivao.aero/v2/users/1003`);
+    }), 1003)).toEqual([{ event: 'member_country_unavailable', userId: 1003, reason: 'network' }]);
+    expect(await reasons(() => network.mockImplementation(async () => new Response(`{"countryId":"${secret}`)), 1004))
+      .toEqual([{ event: 'member_country_unavailable', userId: 1004, reason: 'parse' }]);
+    expect(await reasons(() => vi.mocked(auth.kv.get).mockRejectedValueOnce(new Error(secret)), 1005))
+      .toEqual([{ event: 'member_country_unavailable', userId: 1005, reason: 'kv' }]);
+    expect(await reasons(() => {
+      values.delete(TOKEN_KEY);
+      network.mockImplementation(async () => new Response(secret, { status: 500 }));
+    }, 1006)).toEqual([{ event: 'member_country_unavailable', userId: 1006, reason: 'token' }]);
+    expect(await reasons(() => network.mockImplementation(async () => new Response('x', {
+      headers: { 'content-length': String(4 * 1024 * 1024) },
+    })), 1007)).toEqual([{ event: 'member_country_unavailable', userId: 1007, reason: 'too_large' }]);
+    expect(lines.join('\n')).not.toMatch(/synthetic-private-detail|test-token|api\.ivao\.aero/);
+  });
+
   it('rate-limits profile-401 token resets to at most once per ~30 minutes across many polls, even after an earlier mint', async () => {
     let clock = NOW;
     vi.spyOn(Date, 'now').mockImplementation(() => clock);
