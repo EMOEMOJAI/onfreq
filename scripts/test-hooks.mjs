@@ -9,16 +9,19 @@ import { isolatedEnv } from './check-setup.mjs';
 
 const hook = fileURLToPath(new URL('./hooks/pre-push', import.meta.url));
 const zero = '0'.repeat(40);
+const hasGitleaks = spawnSync('gitleaks', ['version'], { stdio: 'ignore' }).status === 0;
 
-// A synthetic repository with a fake npm that records which checks ran, so the
-// hook's ref and index gating is tested without running the real checks. With
-// realRange, range checks run the real check-privacy.mjs copied into the fixture.
-function fixture(t, { npmExit = 0, realRange = false } = {}) {
+// A synthetic repository with fake npm and gitleaks commands that record their
+// arguments, so the hook's ref and index gating is tested without running the
+// real checks. With realRange, range checks run the real check-privacy.mjs copied
+// into the fixture; gitleaks: 'real' uses the installed Gitleaks, 'missing' none.
+function fixture(t, { npmExit = 0, realRange = false, gitleaks = 'fake', gitleaksExit = 0 } = {}) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-hooks-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const repo = join(dir, 'repo');
   const bin = join(dir, 'bin');
   const env = isolatedEnv({ PATH: `${bin}:${process.env.PATH}`, NPM_LOG: join(dir, 'npm.log'), NPM_EXIT: String(npmExit),
+    GITLEAKS_LOG: join(dir, 'gitleaks.log'), GITLEAKS_EXIT: String(gitleaksExit),
     NODE: process.execPath, REAL_RANGE: realRange ? '1' : '' });
   for (const path of [repo, bin, join(repo, 'scripts')]) mkdirSync(path);
   writeFileSync(join(bin, 'npm'), `#!/bin/sh
@@ -29,6 +32,16 @@ if [ -n "$REAL_RANGE" ] && [ "$3" = check:privacy ] && [ "\${5:-}" = --range ]; 
 fi
 exit "$NPM_EXIT"
 `, { mode: 0o700 });
+  if (gitleaks === 'fake') {
+    writeFileSync(join(bin, 'gitleaks'), `#!/bin/sh
+printf '[%s]' "$@" >> "$GITLEAKS_LOG"
+printf '\\n' >> "$GITLEAKS_LOG"
+if [ "$GITLEAKS_EXIT" != 0 ]; then printf 'synthetic finding: REDACTED\\n' >&2; fi
+exit "$GITLEAKS_EXIT"
+`, { mode: 0o700 });
+  }
+  // The hook checks for Gitleaks before running Git or npm, so only the fake npm is needed.
+  const hookEnv = gitleaks === 'missing' ? { ...env, PATH: bin } : env;
   const email = realRange ? 'synthetic@users.noreply.github.com' : 'synthetic@example.test';
   const git = (...args) => {
     const result = spawnSync('git', ['-c', 'user.name=Synthetic', '-c', `user.email=${email}`,
@@ -58,9 +71,11 @@ exit "$NPM_EXIT"
     first, head, git, repo,
     push(lines, args = ['origin', 'https://example.test/synthetic.git']) {
       rmSync(env.NPM_LOG, { force: true });
+      rmSync(env.GITLEAKS_LOG, { force: true });
       const result = spawnSync('/bin/sh', [hook, ...args],
-        { cwd: repo, env, input: lines.join('\n'), encoding: 'utf8' });
-      return { ...result, npm: existsSync(env.NPM_LOG) ? readFileSync(env.NPM_LOG, 'utf8') : '' };
+        { cwd: repo, env: hookEnv, input: lines.join('\n'), encoding: 'utf8' });
+      const log = (file) => existsSync(file) ? readFileSync(file, 'utf8') : '';
+      return { ...result, npm: log(env.NPM_LOG), gitleaks: log(env.GITLEAKS_LOG) };
     },
   };
 }
@@ -68,6 +83,7 @@ exit "$NPM_EXIT"
 const ref = (oid, name = 'refs/heads/main', remote = zero) => `${name} ${oid} ${name} ${remote}\n`;
 const checks = 'run --silent check:privacy\nrun --silent check:setup\n';
 const rangeCheck = (head, remote = zero, name = 'origin') => `run --silent check:privacy -- --range ${head} ${remote} ${name}\n`;
+const leakScan = (repo, logOpts) => `[git][--redact][--no-banner][--log-opts=${logOpts}][${repo}]\n`;
 
 test('pre-push runs range, privacy and setup checks when the pushed commit is the clean HEAD', (t) => {
   const f = fixture(t);
@@ -75,15 +91,77 @@ test('pre-push runs range, privacy and setup checks when the pushed commit is th
     const result = f.push(lines);
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.npm, rangeCheck(f.head) + checks);
+    assert.equal(result.gitleaks, leakScan(f.repo, f.head));
   }
   let result = f.push([ref(f.head, 'refs/heads/main', f.first)]);
   assert.equal(result.npm, rangeCheck(f.head, f.first) + checks);
+  assert.equal(result.gitleaks, leakScan(f.repo, `${f.head} --not ${f.first}`));
   // A deletion-only push, or a wrapper that omits the remote arguments.
-  assert.equal(f.push([]).npm, checks);
+  result = f.push([]);
+  assert.equal(result.npm, checks);
+  assert.equal(result.gitleaks, '');
   result = f.push([ref(f.head)], []);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.npm, rangeCheck(f.head, zero, '') + checks);
+  assert.equal(result.gitleaks, leakScan(f.repo, f.head));
 });
+
+test('pre-push scans the same pushed range with Gitleaks as the privacy range check (S19-24)', (t) => {
+  const f = fixture(t);
+  f.git('remote', 'add', 'origin', 'https://example.test/synthetic.git');
+  const unknown = 'b'.repeat(40);
+  // Only the named remote's tracking refs and known remote commits are excluded.
+  for (const [remoteOid, args, logOpts] of [
+    [zero, undefined, `${f.head} --not --remotes=origin`],
+    [f.first, undefined, `${f.head} --not ${f.first} --remotes=origin`],
+    [unknown, undefined, `${f.head} --not --remotes=origin`],
+    [f.first, ['https://example.test/synthetic.git', 'https://example.test/synthetic.git'], `${f.head} --not ${f.first}`],
+    [unknown, ['public', 'https://example.test/public.git'], f.head],
+  ]) {
+    const result = f.push([ref(f.head, 'refs/heads/main', remoteOid)], args);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.gitleaks, leakScan(f.repo, logOpts));
+  }
+  const result = f.push([ref(f.head), ref(f.head, 'refs/heads/copy', f.first)]);
+  assert.equal(result.gitleaks, leakScan(f.repo, `${f.head} --not --remotes=origin`) +
+    leakScan(f.repo, `${f.head} --not ${f.first} --remotes=origin`));
+});
+
+test('pre-push blocks when Gitleaks reports a finding or is not installed (S19-24)', (t) => {
+  let f = fixture(t, { gitleaksExit: 1 });
+  let result = f.push([ref(f.head)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /synthetic finding: REDACTED/);
+  assert.match(result.stderr, /pushed commits look like they contain a secret/);
+  f = fixture(t, { gitleaks: 'missing' });
+  result = f.push([ref(f.head)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /install gitleaks before pushing/);
+  assert.equal(result.npm, '');
+});
+
+test('pre-push Gitleaks scan catches a secret committed with --no-verify and redacts it (S19-24)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    // A synthetic AWS-format key assembled at runtime, so this file never contains it.
+    const token = ['AKIA', 'Q7RZ', 'LX2M', 'NB4K', 'TWPJ'].join('');
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\n`);
+    f.git('add', 'config.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret');
+    const secret = f.git('rev-parse', 'HEAD');
+    f.git('rm', '--quiet', 'config.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'remove synthetic secret');
+    const head = f.git('rev-parse', 'HEAD');
+    // Removed from the final tree, but still in a pushed commit.
+    let result = f.push([ref(head)]);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /pushed commits look like they contain a secret/);
+    assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)));
+    assert.equal(result.npm, rangeCheck(head), 'the secret scan blocks before the full checks');
+    // A remote that already has the secret commit is only sent the removal.
+    result = f.push([ref(head, 'refs/heads/main', secret)]);
+    assert.equal(result.status, 0, result.stderr);
+  });
 
 test('pre-push refuses pushed commits other than HEAD before running checks (other:main bypass)', (t) => {
   const f = fixture(t);
@@ -120,6 +198,23 @@ test('pre-push refuses unstaged edits to the checks or package files', (t) => {
     assert.equal(result.npm, '');
     writeFileSync(join(f.repo, file), original);
   }
+  assert.equal(f.push([ref(f.head)]).status, 0);
+});
+
+test('pre-push refuses untracked files under scripts/ (S19-23)', (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.repo, 'scripts/extra.mjs'), '// untracked\n');
+  let result = f.push([ref(f.head)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /untracked files under scripts/);
+  assert.equal(result.npm, '');
+  assert.equal(result.gitleaks, '');
+  // Ignored files under scripts/ and untracked files elsewhere do not change the checks.
+  writeFileSync(join(f.repo, '.gitignore'), 'scripts/extra.mjs\n');
+  result = f.push([ref(f.head)]);
+  assert.equal(result.status, 0, result.stderr);
+  rmSync(join(f.repo, 'scripts/extra.mjs'));
+  writeFileSync(join(f.repo, 'notes.txt'), 'untracked\n');
   assert.equal(f.push([ref(f.head)]).status, 0);
 });
 
@@ -176,6 +271,47 @@ test('pre-push checks every commit in the pushed range, not only HEAD', (t) => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /commit email must use GitHub noreply/);
   assert.doesNotMatch(result.stderr, /private@example/);
+});
+
+test('pre-push range checks content added on a merged side branch and by a merge itself (S19-27)', (t) => {
+  const f = fixture(t, { realRange: true });
+  const value = 'synthetic-private-value';
+  // A side branch adds a private file; it is merged, then deleted on main.
+  f.git('checkout', '--quiet', '-b', 'side');
+  writeFileSync(join(f.repo, '.dev.vars'), `POLL_SECRET=${value}\n`);
+  f.git('add', '-A');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'side adds private');
+  f.git('checkout', '--quiet', 'main');
+  writeFileSync(join(f.repo, 'public.txt'), 'main\n');
+  f.git('commit', '--quiet', '--no-verify', '-am', 'main change');
+  f.git('merge', '--quiet', '--no-ff', '--no-verify', '-m', 'merge side', 'side');
+  f.git('rm', '--quiet', '.dev.vars');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'delete private');
+  const merged = f.git('rev-parse', 'HEAD');
+  let result = f.push([ref(merged, 'refs/heads/main', f.head)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /\.dev\.vars: private file is tracked/);
+  assert.doesNotMatch(result.stderr + result.stdout, new RegExp(value));
+
+  // A merge commit that itself adds a private file; no side-branch commit adds it.
+  f.git('checkout', '--quiet', '-b', 'side2');
+  writeFileSync(join(f.repo, 'side.txt'), 'side\n');
+  f.git('add', '-A');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'side change');
+  f.git('checkout', '--quiet', 'main');
+  writeFileSync(join(f.repo, 'public.txt'), 'main again\n');
+  f.git('commit', '--quiet', '--no-verify', '-am', 'main change again');
+  f.git('merge', '--quiet', '--no-ff', '--no-commit', 'side2');
+  writeFileSync(join(f.repo, 'wrangler.local.jsonc'), '{}\n');
+  f.git('add', '-f', 'wrangler.local.jsonc');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'merge side2');
+  f.git('rm', '--quiet', 'wrangler.local.jsonc');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'delete private config');
+  const head = f.git('rev-parse', 'HEAD');
+  result = f.push([ref(head, 'refs/heads/main', merged)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /wrangler\.local\.jsonc: private file is tracked/);
+  assert.doesNotMatch(result.stderr, /\.dev\.vars/);
 });
 
 test('pre-push blocks when a check fails', (t) => {

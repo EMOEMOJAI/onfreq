@@ -4,7 +4,8 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { imagePrivacy, privateCommitEmails, privatePath, publicConfig, rangeArgs, wranglerConfigErrors } from './check-privacy.mjs';
+import { diffTreeRows, fileErrors, imagePrivacy, privateCommitEmails, privatePath, publicConfig, rangeArgs,
+  wranglerConfigErrors } from './check-privacy.mjs';
 import { checkExternalLinks, checkLocalLinks, documentLinks } from './check-links.mjs';
 import { isolatedEnv, testDeployGuard, validateHooks, validateSetup } from './check-setup.mjs';
 import { jsonc } from './repo-files.mjs';
@@ -61,6 +62,20 @@ test('pushed ranges exclude only known commits and the pushed remote; others che
     [local, '--not', known, '--remotes=origin']);
   assert.deepEqual(rangeArgs(local, [zero, unknown, 'https://example.test/x.git', '', '--all'], ['origin'], hasCommit), [local]);
   for (const bad of [zero, 'HEAD', '--all', undefined]) assert.throws(() => rangeArgs(bad, [], [], hasCommit));
+});
+
+test('range mode parses diff-tree rows and fails closed on unparseable output (S19-27)', () => {
+  const [a, b] = ['a', 'b'].map((c) => c.repeat(40));
+  const row = `:100644 100755 ${a} ${b} M\0nested/file name.txt\0`;
+  assert.deepEqual(diffTreeRows(''), []);
+  assert.deepEqual(diffTreeRows(row + `:000000 120000 ${'0'.repeat(40)} ${a} A\0link\0`), [
+    { mode: '100755', blob: b, file: 'nested/file name.txt' },
+    { mode: '120000', blob: a, file: 'link' },
+  ]);
+  for (const bad of [row.slice(0, -1), `${row}extra`, `${row}${row.split('\0')[0]}\0`, `${a}\0${row}`,
+    `:100644 100644 ${a} ${b}\0file\0`, `:100644 100644 ${a} short M\0file\0`, `:100644 100644 ${a} ${b} M\0\0`]) {
+    assert.throws(() => diffTreeRows(bad), /Unparseable/, JSON.stringify(bad));
+  }
 });
 
 test('checks both raw commit emails and redacts rejected identities', () => {
@@ -141,6 +156,34 @@ test('fails closed on truncated JPEGs, malformed segments and trailing payloads'
   }
 });
 
+test('rejects C2PA provenance, SVG editor metadata and unreviewed image formats (S20-6)', () => {
+  const signature = Buffer.from('89504e470d0a1a0a', 'hex');
+  const png = imagePrivacy('image.png', Buffer.concat([signature, pngChunk('caBX', Buffer.from('private-fixture')), pngChunk('IEND')]));
+  assert.match(png, /metadata/); assert.doesNotMatch(png, /private-fixture/);
+  const jpg = imagePrivacy('image.jpg', Buffer.concat([jpeg.subarray(0, 2),
+    jpegSegment(0xeb, Buffer.from('JP synthetic c2pa manifest')), jpeg.subarray(2)]));
+  assert.match(jpg, /C2PA/); assert.doesNotMatch(jpg, /manifest/);
+  const payload = Buffer.from('private-fixture!');
+  const webp = Buffer.alloc(20 + payload.length);
+  webp.write('RIFF'); webp.writeUInt32LE(webp.length - 8, 4); webp.write('WEBPC2PA', 8);
+  webp.writeUInt32LE(payload.length, 16); payload.copy(webp, 20);
+  assert.match(imagePrivacy('image.webp', webp), /metadata/);
+  webp.write('VP8X', 12);
+  assert.equal(imagePrivacy('image.webp', webp), null);
+
+  const svg = (body) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg">${body}</svg>`);
+  assert.equal(imagePrivacy('image.svg', svg('<title>Synthetic</title><path d="M0 0h1"/>')), null);
+  for (const body of ['<metadata><rdf:RDF/></metadata>', '<g inkscape:label="layer"/>', '<sodipodi:namedview/>',
+    '<image href="/Users/person/private.png"/>', '<image href="file:///home/person/private.png"/>']) {
+    const result = imagePrivacy('Image.SVG', svg(body));
+    assert.match(result, /SVG contains/, body); assert.doesNotMatch(result, /person|private/);
+  }
+  for (const file of ['image.gif', 'image.avif', 'image.heic', 'image.heif', 'image.tif', 'image.TIFF', 'image.bmp']) {
+    assert.deepEqual(fileErrors(file, '100644', () => Buffer.alloc(0)), [`${file}: image format requires review`]);
+  }
+  assert.deepEqual(fileErrors('docs/notes.txt', '100644', () => Buffer.from('/Users/synthetic')), []);
+});
+
 test('validates guided setup and rejects changed prompts, values and deployment identities', () => {
   const config = jsonc(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -206,11 +249,34 @@ test('public deploy guard also sees private config in the main checkout of a Git
   const other = join(base, 'other');
   mkdirSync(other);
   git(other, 'init', '--quiet');
-  const redirected = spawnSync(process.execPath, ['scripts/check-deploy.mjs'],
-    { cwd: linked, env: { ...env, GIT_DIR: join(other, '.git'), GIT_WORK_TREE: other }, encoding: 'utf8' });
-  assert.equal(redirected.status, 1);
-  assert.match(redirected.stderr, /Private deployment config detected/);
+  for (const redirect of [{ GIT_DIR: join(other, '.git'), GIT_WORK_TREE: other }, { GIT_COMMON_DIR: join(other, '.git') }]) {
+    const redirected = spawnSync(process.execPath, ['scripts/check-deploy.mjs'],
+      { cwd: linked, env: { ...env, ...redirect }, encoding: 'utf8' });
+    assert.equal(redirected.status, 1, Object.keys(redirect).join());
+    assert.match(redirected.stderr, /Private deployment config detected/);
+  }
   rmSync(join(main, 'wrangler.local.jsonc'));
+});
+
+test('public deploy guard honours GIT_CEILING_DIRECTORIES around an enclosing private checkout (S19-26)', (t) => {
+  // A fresh public template (not a repository) inside a private checkout: with a
+  // ceiling at the private checkout, Git must not discover it; the test isolation
+  // and fixtures under a TMPDIR inside a private checkout rely on this.
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-ceiling-')));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const outer = join(base, 'private');
+  const inner = join(outer, 'public');
+  mkdirSync(join(inner, 'scripts'), { recursive: true });
+  copyFileSync(new URL('./check-deploy.mjs', import.meta.url), join(inner, 'scripts/check-deploy.mjs'));
+  const env = isolatedEnv();
+  assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: outer, env }).status, 0);
+  writeFileSync(join(outer, 'wrangler.local.jsonc'), '{}');
+  const guard = (ceiling) => spawnSync(process.execPath, ['scripts/check-deploy.mjs'],
+    { cwd: inner, env: { ...env, GIT_CEILING_DIRECTORIES: ceiling }, encoding: 'utf8' });
+  assert.equal(guard(outer).status, 0, 'the ceiling hides the enclosing checkout');
+  const discovered = guard(base);
+  assert.equal(discovered.status, 1, 'without that ceiling the enclosing checkout is still checked');
+  assert.match(discovered.stderr, /Private deployment config detected/);
 });
 
 test('parses Markdown references, nested badge images, HTML and duplicate heading anchors', () => {
