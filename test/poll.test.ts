@@ -13,9 +13,10 @@ import worker from '../src/index';
 import { COORDINATOR_NAME, IVAO_ATC_SUMMARY_URL, POLL_SNAPSHOT_KEY, STATE_KEY } from '../src/config';
 import { PollCoordinator, type PollSnapshot } from '../src/coordinator';
 import { buildOnlineEmbed, messageNonce, type DiscordEmbed } from '../src/discord';
+import { REQUEST_TIMEOUT_MS } from '../src/http';
 import { resetTokenCache } from '../src/ivao';
 import type { IvaoAtcSummaryEntry, PendingOffline, StateMap, TrackedAtc } from '../src/types';
-import { AUTH_HEADERS } from './helpers';
+import { AUTH_HEADERS, BOT_ID, BOT_TOKEN, snowflakeAt } from './helpers';
 
 const START = Date.parse('2026-09-06T10:00:00Z');
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
@@ -205,13 +206,14 @@ afterEach(async () => {
 });
 
 describe('polling through the Durable Object', () => {
+  /** A poll with only the four first-run secrets configured. */
+  const firstRunPoll = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
+    ATC_STATE: env.ATC_STATE, POLL_COORDINATOR: env.POLL_COORDINATOR,
+    OFFLINE_GRACE_POLLS: '2', DISCORD_BOT_TOKEN: env.DISCORD_BOT_TOKEN,
+    DISCORD_CHANNEL_IDS: '900000000000000001', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
+  }).poll());
+
   it('baselines and announces new sessions with only the four first-run secrets', async () => {
-    const minimal: Env = {
-      ATC_STATE: env.ATC_STATE, POLL_COORDINATOR: env.POLL_COORDINATOR,
-      OFFLINE_GRACE_POLLS: '2', DISCORD_BOT_TOKEN: env.DISCORD_BOT_TOKEN,
-      DISCORD_CHANNEL_IDS: '900000000000000001', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
-    };
-    const firstRunPoll = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, minimal).poll());
     feed = [entry(b)];
     await firstRunPoll();
     expect(sent).toHaveLength(0);
@@ -226,12 +228,6 @@ describe('polling through the Durable Object', () => {
   });
 
   it('never posts a fallback OFFLINE card for a session that was only ever silently seeded', async () => {
-    const minimal: Env = {
-      ATC_STATE: env.ATC_STATE, POLL_COORDINATOR: env.POLL_COORDINATOR,
-      OFFLINE_GRACE_POLLS: '2', DISCORD_BOT_TOKEN: env.DISCORD_BOT_TOKEN,
-      DISCORD_CHANNEL_IDS: '900000000000000001', FIR_PREFIXES: 'QC,QE', POLL_SECRET: env.POLL_SECRET,
-    };
-    const firstRunPoll = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, minimal).poll());
     feed = [entry(a)];
     await firstRunPoll();
     expect(sent).toHaveLength(0);
@@ -1119,14 +1115,18 @@ describe('polling through the Durable Object', () => {
     expect(sent.filter((s) => s.method === 'POST')).toHaveLength(2);
   });
 
-  it('handles callsigns named like Object.prototype members without crashing the poll', async () => {
-    await seed({});
-    const valueOf = { ...entry('valueOf'), id: 2, userId: 101 };
-    feed = [entry(a), valueOf];
-    await expect(configuredPoll({ FIR_PREFIXES: 'XA,QC,QE,QF,QG,QH,VA' })).resolves.toMatchObject({ skipped: false });
+  it('closes a stored session keyed like an Object.prototype member without crashing the poll', async () => {
+    // Feed callsigns are uppercased at ingest, so only stored state can still
+    // carry such a key (see state.test for diffState itself).
+    await seed({ valueOf: session('valueOf'), [a]: session(a) });
     feed = [entry(a)];
+    const run = () => configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' });
+    await expect(run()).resolves.toEqual({ skipped: false });
+    expect((await stub().getState())?.valueOf).toMatchObject({ callsign: 'valueOf', missed: 1 });
     now += 60_000;
-    await expect(configuredPoll({ FIR_PREFIXES: 'XA,QC,QE,QF,QG,QH,VA' })).resolves.toMatchObject({ skipped: false });
+    await expect(run()).resolves.toEqual({ skipped: false });
+    expect(cards.get(mid('valueOf'))?.title).toContain('valueOf is OFFLINE');
+    expect(Object.keys((await stub().getState()) ?? {})).toEqual([a]);
   });
 
   it('silently seeds a fresh installation', async () => {
@@ -1471,7 +1471,7 @@ describe('polling through the Durable Object', () => {
   it('refreshes a first card when Discord returns an earlier message for its nonce', async () => {
     await seed({});
     feed = [entry(a)];
-    const earlier = ((BigInt(START - 60_000 - 1_420_070_400_000) << 22n) + 1n).toString();
+    const earlier = snowflakeAt(START - 60_000, 1);
     const original = network.getMockImplementation()!;
     network.mockImplementation(async (input, init) => {
       const response = await original(input, init);
@@ -1564,8 +1564,8 @@ describe('polling through the Durable Object', () => {
   );
 
   it('finds and closes an unseen first card from its post window instead of re-posting it', async () => {
-    const botId = '100000000000000009';
-    const snowflake = (ms: number) => ((BigInt(ms - 1_420_070_400_000) << 22n) + 1n).toString();
+    const botId = BOT_ID;
+    const snowflake = (ms: number) => snowflakeAt(ms, 1);
     const hiddenId = snowflake(START);
     const original = network.getMockImplementation()!;
     network.mockImplementation(async (input, init) => {
@@ -1591,7 +1591,7 @@ describe('polling through the Durable Object', () => {
       return original(input, init);
     });
     const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
-      ...env, DISCORD_BOT_TOKEN: `${btoa(botId)}.synthetic.token`,
+      ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
     }).poll().catch(() => undefined));
     await seed({});
     feed = [entry(a)];
@@ -1613,8 +1613,8 @@ describe('polling through the Durable Object', () => {
   });
 
   it('still closes an earlier unseen copy when a later retry posted a second card', async () => {
-    const botId = '100000000000000009';
-    const snowflake = (ms: number, n: number) => ((BigInt(ms - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
+    const botId = BOT_ID;
+    const snowflake = snowflakeAt;
     const hiddenId = snowflake(START, 1);
     const trackedId = snowflake(START + 60_000, 2);
     const card = (id: string) => ({ id, author: { id: botId },
@@ -1641,7 +1641,7 @@ describe('polling through the Durable Object', () => {
       return original(input, init);
     });
     const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
-      ...env, DISCORD_BOT_TOKEN: `${btoa(botId)}.synthetic.token`,
+      ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
     }).poll().catch(() => undefined));
     await seed({});
     feed = [entry(a)];
@@ -1669,7 +1669,6 @@ describe('polling through the Durable Object', () => {
   });
 
   it('never re-posts during recovery for a channel whose card was tracked, even after that card is closed', async () => {
-    const botId = '100000000000000009';
     await runInDurableObject(stub(), async (_, ctx) => {
       await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
         event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
@@ -1684,10 +1683,91 @@ describe('polling through the Durable Object', () => {
       return original(input, init);
     });
     await runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
-      ...env, DISCORD_BOT_TOKEN: `${btoa(botId)}.synthetic.token`,
+      ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
     }).poll());
     expect(sent.filter((message) => message.method === 'POST')).toHaveLength(0);
     expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  describe('C39: closeout recovery when the channel lookup fails', () => {
+    const channel = '900000000000000001';
+    const window = { from: START - 120_000, to: START - 60_000 };
+    const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
+      ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
+    }).poll());
+    async function seedRecovery(closeOnly = false): Promise<void> {
+      await runInDurableObject(stub(), async (_, ctx) => {
+        await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [{
+          event: { ...session(a), endedAt: new Date(START).toISOString(), durationSeconds: 3600 },
+          messages: [], channelIds: [], recoverPosts: { [channel]: closeOnly ? { ...window, closeOnly: true } : window },
+        }] } satisfies PollSnapshot);
+      });
+    }
+    function scanReturns(response: () => Response): void {
+      const original = network.getMockImplementation()!;
+      network.mockImplementation(async (input, init) =>
+        (init?.method ?? 'GET') === 'GET' && String(input).includes('/messages?after=') ? response() : original(input, init));
+    }
+    const lookups = () => network.mock.calls.filter(([input]) => String(input).includes('/messages?after=')).length;
+    const definite = [
+      ['403', () => Response.json({ message: 'Missing Access', code: 50001 }, { status: 403 })],
+      ['oversized', () => new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } })],
+    ] as const;
+
+    it.each(definite)('re-posts under the original nonce and closes it after a %s lookup', async (_kind, response) => {
+      const error = vi.spyOn(console, 'error');
+      await seedRecovery();
+      scanReturns(response);
+      await expect(run()).resolves.toEqual({ skipped: false });
+      expect(lookups()).toBeGreaterThan(0);
+      const posts = sent.filter((message) => message.method === 'POST');
+      expect(posts).toHaveLength(1);
+      expect(posts[0]!.nonce).toBe(messageNonce(`online:100:${a}:${session(a).since}`, channel));
+      expect(cards.get(posts[0]!.id!)?.title).toContain(`${a} is OFFLINE`);
+      expect(error.mock.calls.some(([line]) => String(line).includes('"event":"offline_recover_lookup_failed"'))).toBe(true);
+      expect((await snapshot())?.pendingOffline).toBeUndefined();
+    });
+
+    it.each(definite)('treats a tracked card\'s channel as done after a %s lookup', async (_kind, response) => {
+      await seedRecovery(true);
+      scanReturns(response);
+      await expect(run()).resolves.toEqual({ skipped: false });
+      expect(lookups()).toBeGreaterThan(0);
+      expect(sent).toHaveLength(0);
+      expect((await snapshot())?.pendingOffline).toBeUndefined();
+    });
+
+    it('keeps the recovery for a later poll after a transient lookup failure', async () => {
+      await seedRecovery();
+      scanReturns(() => Response.json({ message: 'unavailable' }, { status: 503 }));
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const pending = run().catch((err: unknown) => err);
+      // Run the in-request 5xx retry backoff in the object's I/O context.
+      await vi.waitFor(() => expect(lookups()).toBe(1));
+      for (let i = 1; i < 4; i++) {
+        await runInDurableObject(stub(), () => vi.advanceTimersByTimeAsync(2_000).then(() => undefined));
+      }
+      expect(await pending).toMatchObject({ message: 'all Discord notifications failed' });
+      vi.useRealTimers();
+      expect(lookups()).toBe(4);
+      expect(sent).toHaveLength(0);
+      expect((await snapshot())?.pendingOffline).toMatchObject([{
+        recoverPosts: { [channel]: window }, attemptsByChannel: { [channel]: 0 },
+      }]);
+    });
+
+    it('announces the end when the re-posted card is accepted without an id', async () => {
+      const error = vi.spyOn(console, 'error');
+      await seedRecovery();
+      scanReturns(() => Response.json([]));
+      unconfirmed.add('POST');
+      await expect(run()).resolves.toEqual({ skipped: false });
+      expect(sent.map((message) => [message.method, message.embed.title])).toEqual([
+        ['POST', expect.stringContaining(`${a} is now ONLINE`)], ['POST', expect.stringContaining(`${a} went OFFLINE`)],
+      ]);
+      expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_recover_unconfirmed', callsign: a, channelIndex: 0 }));
+      expect((await snapshot())?.pendingOffline).toBeUndefined();
+    });
   });
 
   it('does not try to recover a first card that Discord definitely rejected', async () => {
@@ -1846,13 +1926,13 @@ describe('polling through the Durable Object', () => {
       now += 60_000;
     }
     expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual([]);
-    expect(cards.has(mid(a))).toBe(false);
+    expect([...cards.values()].some((card) => card.title?.includes(a))).toBe(false);
     const attemptsBefore = sent.length;
     failures.clear();
     await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
     // Abandoned: no further attempt is made even once delivery would succeed.
     expect(sent).toHaveLength(attemptsBefore);
-    expect(cards.has(mid(a))).toBe(false);
+    expect([...cards.values()].some((card) => card.title?.includes(a))).toBe(false);
   });
 
   it('never abandons a first online card during a long 5xx outage, but still abandons after repeated 4xx rejections', async () => {
@@ -1867,7 +1947,7 @@ describe('polling through the Durable Object', () => {
     // A prolonged 5xx outage never counts against the online first-card
     // budget: still pending after more polls than the retry budget allows.
     expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual(['900000000000000001']);
-    expect(cards.has(mid(a))).toBe(false);
+    expect([...cards.values()].some((card) => card.title?.includes(a))).toBe(false);
 
     failureStatus = 400;
     for (let i = 0; i < 11; i++) {
@@ -1877,7 +1957,7 @@ describe('polling through the Durable Object', () => {
     // A genuine (non-429) 4xx rejection counts, and the card is abandoned
     // once the same budget is exhausted.
     expect((await stub().getState())?.[a]?.pendingChannelIds).toEqual([]);
-    expect(cards.has(mid(a))).toBe(false);
+    expect([...cards.values()].some((card) => card.title?.includes(a))).toBe(false);
   });
 
   it('does not retry an already-failed edit when a deleted host forces another reconcile pass', async () => {
@@ -2262,7 +2342,7 @@ describe('polling through the Durable Object', () => {
     await vi.waitFor(() => expect(network).toHaveBeenCalled());
     // Run the timeout callback in the object's I/O context, just as a real
     // timer does; advancing it from the test's context cannot abort its fetch.
-    await runInDurableObject(stub(), () => vi.advanceTimersByTimeAsync(10_000).then(() => undefined));
+    await runInDurableObject(stub(), () => vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS).then(() => undefined));
     const response = await pending;
     expect(response.status).toBe(500);
     expect(await response.json()).toMatchObject({ error: 'poll failed' });

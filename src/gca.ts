@@ -508,7 +508,7 @@ function rateLimitDetail(err: unknown): { reason?: DiscordRateLimitReason; reque
 }
 
 /** Same schema, created idempotently from whichever path (reminders or copies) runs first. */
-function ensureGcaSchema(sql: SqlStorage): void {
+export function ensureGcaSchema(sql: SqlStorage): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS gca_reminders (
     session_key TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0

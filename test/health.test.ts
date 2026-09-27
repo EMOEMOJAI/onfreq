@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { POLL_SNAPSHOT_KEY, COORDINATOR_NAME } from '../src/config';
 import { resetConfigInvalidLogForTests } from '../src/auth';
-import { AUTH_HEADERS } from './helpers';
+import { AUTH_HEADERS, callRoute as callPollRoute, HISTORY_ONLY, POLL_ONLY } from './helpers';
 
 const headers = AUTH_HEADERS;
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
@@ -63,11 +63,6 @@ it('returns a generic failure if storage is unavailable', async () => {
 });
 
 // POLL_SECRET-gated routes. Synthetic, distinct secrets prove separation from HISTORY_SECRET.
-const POLL_ONLY = 'synthetic-poll-only-secret-0123456789';
-const HISTORY_ONLY = 'synthetic-history-only-secret-01234567';
-const callPollRoute = (path: string, method: string, token: string, overrides: Partial<Env>) => worker.fetch(
-  new Request(`https://example.com${path}`, { method, headers: { authorization: `Bearer ${token}` } }),
-  { ...env, ...overrides }, {} as ExecutionContext);
 
 it('S2-1: HISTORY_SECRET does not authorize /health or /poll', async () => {
   const overrides = { POLL_SECRET: POLL_ONLY, HISTORY_SECRET: HISTORY_ONLY };
