@@ -88,13 +88,14 @@ EOF
 failed=false
 scan_failed=false
 unreadable=false
+scan_unreadable=false
 for remote_oid in "$@"; do
   if range=$(node scripts/check-privacy.mjs --range-args "$head" "$remote_oid" "$remote" </dev/null); then
     status=0
     output=$(scan_range "$range" 2>&1) || status=$?
     case "$status" in
       0) ;;
-      2) unreadable=true ;;
+      2) scan_unreadable=true ;;
       *) scan_failed=true ;;
     esac
     if [ "$status" != 0 ]; then printf '\n%s\n' "$output" >&2; fi
@@ -105,6 +106,12 @@ for remote_oid in "$@"; do
 done
 if [ "$unreadable" = true ]; then
   printf '\npre-push: BLOCKED — could not read the pushed commits for the secret scan.\n' >&2
+  exit 1
+fi
+# Status 2 can also follow a Gitleaks failure: a Gitleaks that stops reading
+# early makes Git fail on the closed pipe. The scan's output above says which.
+if [ "$scan_unreadable" = true ]; then
+  printf '\npre-push: BLOCKED — could not read the pushed commits for the secret scan, or the scan failed; see the output above.\n' >&2
   exit 1
 fi
 # Gitleaks exits non-zero both for findings and for its own errors.

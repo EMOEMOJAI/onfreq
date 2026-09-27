@@ -12,7 +12,10 @@
 #
 # Exit status: 0 clean; 1 Gitleaks found a secret or failed; 2 the commits
 # could not be read. POSIX sh has no pipefail, so a failed Git or filter stage
-# leaves a marker file instead.
+# leaves a marker file instead. A Gitleaks that exits before reading all its
+# input, for example on a bad configuration, can make those stages fail on the
+# closed pipe, so when both fail the message names both causes; the status is
+# still 2.
 set -eu
 # These variables would replace the repository's Gitleaks rules, for example
 # with an empty rule set; the scan uses only the reviewed configuration.
@@ -35,7 +38,11 @@ status=0
   { LC_ALL=C sed '/^-/d' || : >"$tmp/failed"; } |
   gitleaks stdin --redact --no-banner || status=$?
 if [ -e "$tmp/failed" ]; then
-  printf 'secret-scan: could not read the commits to scan.\n' >&2
+  if [ "$status" != 0 ]; then
+    printf 'secret-scan: the secret scan failed or could not read the commits; see the output above.\n' >&2
+  else
+    printf 'secret-scan: could not read the commits to scan.\n' >&2
+  fi
   exit 2
 fi
 if [ "$status" != 0 ]; then exit 1; fi
