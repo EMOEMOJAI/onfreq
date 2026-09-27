@@ -1,6 +1,7 @@
 import { EMBED_FOOTER, firOf, type FirLabel } from './config';
 import { escapeMarkdown, type DiscordEmbed } from './discord';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
+import { ResponseTooLargeError } from './http';
 import { hasFrequency } from './ivao';
 import { countryCode } from './member-country';
 import type { OnlineAtc } from './types';
@@ -372,11 +373,21 @@ class GcaDeadlineError extends Error {}
 
 /** No inline retries: a slow Discord service must not hold the poll indefinitely. */
 async function discordJson(limits: DiscordRateLimits, token: string, path: string, payload?: unknown): Promise<unknown> {
-  const response = await limits.fetch(path, {
-    method: payload === undefined ? 'GET' : 'POST',
-    headers: { authorization: `Bot ${token}`, 'content-type': 'application/json' },
-    ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
-  });
+  let response: Response;
+  try {
+    response = await limits.fetch(path, {
+      method: payload === undefined ? 'GET' : 'POST',
+      headers: { authorization: `Bot ${token}`, 'content-type': 'application/json' },
+      ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
+    });
+  } catch (err) {
+    if (!(err instanceof ResponseTooLargeError)) throw err;
+    // Discord answered with a body over the cap: a 2xx is still a success
+    // (the DM was delivered) with no usable body; any other status is that
+    // HTTP failure, classified like any other.
+    if (err.status >= 200 && err.status < 300) return null;
+    throw new GcaDiscordError(err.status, 60_000);
+  }
   if (!response.ok) {
     const seconds = Number(response.headers.get('retry-after'));
     throw new GcaDiscordError(response.status,
@@ -514,8 +525,9 @@ type Candidate = { atc: OnlineAtc; key: string; mismatch: GcaMismatch };
  * second, stale copy of the same key). Also prunes long-settled rows.
  */
 function updateSessionsAndCollectCandidates(
-  sql: SqlStorage, current: OnlineAtc[], policy: GcaPolicy, baselineNow: boolean, now: number,
+  storage: DurableObjectStorage, current: OnlineAtc[], policy: GcaPolicy, baselineNow: boolean, now: number,
 ): Map<string, Candidate> {
+  const sql = storage.sql;
   const candidates = new Map<string, Candidate>();
   for (const atc of current) {
     if (!Number.isSafeInteger(atc.userId) || atc.userId <= 0 ||
@@ -534,7 +546,16 @@ function updateSessionsAndCollectCandidates(
   }
   // Keep every possible delivery permanently: even a very old connection ID
   // reappearing after a feed outage must not receive another notification.
-  sql.exec("DELETE FROM gca_reminders WHERE last_seen < ? AND status NOT IN ('sent', 'reserved', 'failed')", now - RETENTION_MS);
+  // A pruned row was never delivered (a DM deferred by a rate limit whose
+  // connection went away, or whose member left the server): its reserved
+  // occurrence goes with it, so a later warning is not numbered past it.
+  // Occurrences of sent, reserved or failed reminders are never touched.
+  const stale = "last_seen < ? AND status NOT IN ('sent', 'reserved', 'failed')";
+  storage.transactionSync(() => {
+    sql.exec(`DELETE FROM gca_occurrences WHERE session_key IN (SELECT session_key FROM gca_reminders WHERE ${stale})`,
+      now - RETENTION_MS);
+    sql.exec(`DELETE FROM gca_reminders WHERE ${stale}`, now - RETENTION_MS);
+  });
   return candidates;
 }
 
@@ -581,7 +602,7 @@ async function sendMemberReminders(
   const stale = lastActive !== undefined && now - lastActive > REBASELINE_GAP_MS;
   await storage.put(LAST_ACTIVE_KEY, now);
   const initialized = await storage.get<boolean>(INITIALIZED_KEY);
-  const candidates = updateSessionsAndCollectCandidates(sql, current, policy, !initialized || stale, now);
+  const candidates = updateSessionsAndCollectCandidates(storage, current, policy, !initialized || stale, now);
   if (!initialized) {
     await storage.put(INITIALIZED_KEY, true);
     console.log(JSON.stringify({ event: 'gca_baseline_seeded', sessions: current.length }));
@@ -664,13 +685,15 @@ async function sendMemberReminders(
     } catch (err) {
       const outcome = classifyDeliveryFailure(err, fresh.attempts, messageAttempted, Date.now());
       // Discord definitely did not deliver this DM (the message POST was
-      // rejected with a non-429 4xx, or a final rate-limit deferral made no
-      // request): the reserved occurrence is released, so the member's next
-      // received warning is not numbered past one they never got. Only this
-      // connection's row is removed; the reminder row keeps deduplicating it.
+      // rejected with a 4xx, or its final attempt was rate-limited, whether
+      // deferred locally or answered with a 429; a 429 is always thrown as a
+      // DiscordRateLimitError, never a GcaDiscordError): the reserved
+      // occurrence is released, so the member's next received warning is not
+      // numbered past one they never got. Only this connection's row is
+      // removed; the reminder row keeps deduplicating it.
       const undelivered = messageAttempted && (
-        (err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && err.status !== 429) ||
-        (err instanceof DiscordRateLimitError && !err.requestMade && outcome.status === 'failed'));
+        (err instanceof GcaDiscordError && err.status >= 400 && err.status < 500) ||
+        (err instanceof DiscordRateLimitError && outcome.status === 'failed'));
       storage.transactionSync(() => {
         sql.exec('UPDATE gca_reminders SET status = ?, attempts = ?, retry_at = ? WHERE session_key = ?',
           outcome.status, outcome.attempts, outcome.retryAt, key);

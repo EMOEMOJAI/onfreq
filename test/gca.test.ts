@@ -500,6 +500,76 @@ describe('durable GCA delivery', () => {
     expect(sent).toHaveLength(4);
   });
 
+  it('releases the occurrence of a DM whose final attempt Discord rate-limited', async () => {
+    const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
+      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+    await check([]);
+    await check([atc({ sessionId: 1 })]);
+    messageStatus = 429;
+    for (let i = 0; i < 5; i++) {
+      now += 200_000;
+      await check([atc({ sessionId: 2 })]);
+    }
+    expect(sent).toHaveLength(6);
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'failed', attempts: 5 });
+    expect(await occurrences()).toEqual([{ session_key: '600001:1', occurrence: 1 }]);
+    messageStatus = 200;
+    now += 200_000;
+    await check([atc({ sessionId: 3 })]);
+    expect(titles().at(-1)).toContain('[2nd occurrence]');
+  });
+
+  it.each(['pending', 'unmapped'])(
+    'releases the occurrence of a deferred DM whose %s row is pruned, keeping sent ones', async (kind) => {
+      const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
+        ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+      await check([]);
+      await check([atc({ sessionId: 1 })]);
+      messageStatus = 429;
+      await check([atc({ sessionId: 2 })]);
+      expect(await occurrences()).toHaveLength(2);
+      messageStatus = 200;
+      if (kind === 'unmapped') {
+        // The member left the server while the DM was deferred.
+        members = [];
+        now += 200_000;
+        await check([atc({ sessionId: 2 })]);
+        members = [member()];
+      }
+      expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: kind });
+      now += 8 * 86_400_000;
+      await check([]);
+      expect((await statuses()).map((row) => row.session_key)).toEqual(['600001:1']);
+      expect(await occurrences()).toEqual([{ session_key: '600001:1', occurrence: 1 }]);
+      now += 60_000;
+      await check([atc({ sessionId: 3 })]);
+      expect(titles().at(-1)).toContain('[2nd occurrence]');
+    },
+  );
+
+  it.each([[200, 'sent', true], [403, 'failed', false], [500, 'failed', true]] as const)(
+    'classifies an oversized HTTP %i reply to the DM message as %s', async (status, outcome, counted) => {
+      await check([]);
+      const original = network.getMockImplementation()!;
+      network.mockImplementation(async (input, init) => {
+        if (String(input).endsWith(`/channels/${CHANNEL}/messages`)) {
+          sent.push(JSON.parse(String(init?.body)));
+          return new Response('x'.repeat(4 * 1024 * 1024 + 1), { status });
+        }
+        return original(input, init);
+      });
+      await check([atc()]);
+      expect(sent).toHaveLength(1);
+      expect((await statuses())[0]).toMatchObject({ status: outcome, attempts: 1 });
+      const rows = await runInDurableObject(stub(), (_instance, ctx) =>
+        ctx.storage.sql.exec('SELECT session_key FROM gca_occurrences').toArray());
+      expect(rows).toHaveLength(counted ? 1 : 0);
+      now += 3_600_000;
+      await check([atc()]);
+      expect(sent).toHaveLength(1);
+    },
+  );
+
   it('caps a huge Retry-After on the member-list lookup at one hour', async () => {
     await check([]);
     const original = network.getMockImplementation()!;

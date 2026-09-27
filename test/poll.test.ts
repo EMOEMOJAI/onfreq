@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { COORDINATOR_NAME, IVAO_ATC_SUMMARY_URL, POLL_SNAPSHOT_KEY, STATE_KEY } from '../src/config';
 import { PollCoordinator, type PollSnapshot } from '../src/coordinator';
-import { buildOnlineEmbed, type DiscordEmbed } from '../src/discord';
+import { buildOnlineEmbed, messageNonce, type DiscordEmbed } from '../src/discord';
 import { resetTokenCache } from '../src/ivao';
 import type { IvaoAtcSummaryEntry, PendingOffline, StateMap, TrackedAtc } from '../src/types';
 import { AUTH_HEADERS } from './helpers';
@@ -443,6 +443,65 @@ describe('polling through the Durable Object', () => {
     expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'expired', count: 1 }));
   });
 
+  it('keeps an expired closeout whose final attempt was deferred without reaching Discord', async () => {
+    const error = vi.spyOn(console, 'error');
+    const c = 'QGLL_TWR';
+    const endedAt = new Date(START - 25 * 3_600_000).toISOString();
+    const job = (callsign: string): PendingOffline => ({
+      event: { ...session(callsign), endedAt, durationSeconds: 3600 },
+      messages: [{ channelId: '900000000000000001', messageId: mid(callsign) }], channelIds: [],
+    });
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: [job(a), job(b), job(c)] } satisfies PollSnapshot);
+    });
+    const original = network.getMockImplementation()!;
+    let edits = 0;
+    network.mockImplementation(async (input, init) => {
+      const response = await original(input, init);
+      if (init?.method !== 'PATCH' || ++edits > 1) return response;
+      // The first edit exhausts the channel's bucket: the others wait this poll.
+      return new Response(await response.text(), { status: response.status, headers: {
+        'content-type': 'application/json', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset-after': '30',
+      } });
+    });
+    const run = () => configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' });
+    await expect(run()).rejects.toThrow('some Discord notifications failed');
+    expect(edits).toBe(1);
+    expect(cards.get(mid(a))?.title).toContain('OFFLINE');
+    expect((await snapshot())?.pendingOffline?.map((pending) => pending.event.callsign)).toEqual([b, c]);
+    expect(error.mock.calls.some(([line]) => String(line).includes('offline_jobs_dropped'))).toBe(false);
+    now += 60_000;
+    await expect(run()).resolves.toEqual({ skipped: false });
+    expect(edits).toBe(3);
+    expect(cards.get(mid(b))?.title).toContain('OFFLINE');
+    expect(cards.get(mid(c))?.title).toContain('OFFLINE');
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('keeps an uncertain first-card window in a removed channel so the card is still closed later', async () => {
+    const window = { from: START - 120_000, to: START - 60_000 };
+    await seed({ [a]: {
+      ...session(a), messages: [], pendingChannelIds: ['900000000000000001'],
+      uncertainPosts: { '900000000000000002': window },
+    } });
+    feed = [entry(a)];
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' })).resolves.toEqual({ skipped: false });
+    expect((await stub().getState())?.[a]?.uncertainPosts).toEqual({ '900000000000000002': window });
+    feed = [];
+    now += 60_000;
+    await expect(configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001', OFFLINE_GRACE_POLLS: '1' }))
+      .resolves.toEqual({ skipped: false });
+    expect((await snapshot())?.pendingOffline?.[0]?.recoverPosts).toEqual({ '900000000000000002': window });
+    expect(network.mock.calls.some(([input]) => String(input).includes('/900000000000000002/'))).toBe(false);
+    // Configuring the channel again recovers the unseen card there and closes it.
+    now += 60_000;
+    await expect(configuredPoll()).resolves.toEqual({ skipped: false });
+    const inRemoved = sent.filter((message) => message.channelId === '900000000000000002');
+    expect(inRemoved.map((message) => message.method)).toEqual(['POST', 'PATCH']);
+    expect(cards.get(inRemoved[0]!.id!)?.title).toContain('OFFLINE');
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
   it('never edits cards, roster pages or closeouts in a channel removed from configuration', async () => {
     const tracked = session(a);
     tracked.messages!.push({ channelId: '900000000000000002', messageId: mid('a-in-b') });
@@ -778,7 +837,7 @@ describe('polling through the Durable Object', () => {
     failures.add(mid(a));
     expect((await poll()).status).toBe(500);
     expect((await snapshot())?.state?.[a]).toMatchObject({ userId: 101, since: new Date(START).toISOString() });
-    expect((await snapshot())?.state?.[a]?.messages?.[0]?.messageId).not.toBe(a);
+    expect((await snapshot())?.state?.[a]?.messages?.[0]?.messageId).not.toBe(mid(a));
     expect((await snapshot())?.pendingOffline?.[0]?.event.userId).toBe(100);
     await abortAllDurableObjects();
     failures.clear();
@@ -1260,6 +1319,82 @@ describe('polling through the Durable Object', () => {
     expect(cards.get(next.id!)?.title).toContain('is now ONLINE');
   });
 
+  it('gives a re-tracked connection its own card while its previous closeout edit is still pending', async () => {
+    await seed({});
+    feed = [entry(a)];
+    await poll();
+    const ended = sent.find((message) => message.method === 'POST')!.id!;
+    feed = [];
+    await nextPoll();
+    failures.add(ended);
+    await nextPoll();
+    expect((await snapshot())?.pendingOffline?.[0]?.messages.map((ref) => ref.messageId)).toEqual([ended]);
+    failures.clear();
+    // The same IVAO connection id comes back while that closeout is pending.
+    feed = [entry(a)];
+    await nextPoll();
+    await nextPoll();
+    const live = (await snapshot())?.state?.[a]?.messages?.map((ref) => ref.messageId);
+    expect(live).toHaveLength(1);
+    expect(live![0]).not.toBe(ended);
+    expect(cards.get(ended)?.title).toContain('OFFLINE');
+    expect(cards.get(live![0]!)?.title).toContain('is now ONLINE');
+    expect(sent.some((message) => message.id === live![0] && message.embed.title?.includes('OFFLINE'))).toBe(false);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('gives a re-tracked connection its own card while its previous closeout is still recovering', async () => {
+    await seed({});
+    feed = [entry(a)];
+    hidden.add('POST');
+    await poll();
+    hidden.clear();
+    const unseen = sent.find((message) => message.method === 'POST')!.id!;
+    const original = network.getMockImplementation()!;
+    let outage = false;
+    network.mockImplementation(async (input, init) =>
+      outage && init?.method === 'POST' && String(input).includes('/channels/')
+        ? new Response('test outage', { status: 503 }) : original(input, init));
+    feed = [];
+    await nextPoll();
+    outage = true;
+    await nextPoll();
+    expect(Object.keys((await snapshot())?.pendingOffline?.[0]?.recoverPosts ?? {})).toEqual(['900000000000000001']);
+    outage = false;
+    feed = [entry(a)];
+    await nextPoll();
+    await nextPoll();
+    const live = (await snapshot())?.state?.[a]?.messages?.map((ref) => ref.messageId);
+    expect(live).toHaveLength(1);
+    expect(live![0]).not.toBe(unseen);
+    expect(cards.get(unseen)?.title).toContain('OFFLINE');
+    expect(cards.get(live![0]!)?.title).toContain('is now ONLINE');
+    expect(sent.some((message) => message.id === live![0] && message.embed.title?.includes('OFFLINE'))).toBe(false);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+
+  it('never lets closeout recovery adopt a card that a live session tracks', async () => {
+    const channel = '900000000000000001';
+    const live = mid('live-card');
+    const ended = { ...session(a), messages: [], firstSessionId: 1, since: new Date(START - 7_200_000).toISOString() };
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, {
+        // A session saved by an earlier release, sharing the ended session's first-card nonce.
+        state: { [a]: { ...session(a), firstSessionId: 1, messages: [{ channelId: channel, messageId: live }] } as TrackedAtc },
+        pendingOffline: [{
+          event: { ...ended, endedAt: new Date(START - 60_000).toISOString(), durationSeconds: 3600 },
+          messages: [], channelIds: [], recoverPosts: { [channel]: { from: START - 7_200_000, to: START - 7_200_000 } },
+        }],
+      } satisfies PollSnapshot);
+    });
+    nonces.set(`${channel}:${messageNonce(`online:100:${a}:session-1`, channel)}`, live);
+    feed = [entry(a)];
+    expect((await poll()).status).toBe(200);
+    expect(sent.some((message) => message.id === live && message.embed.title?.includes('OFFLINE'))).toBe(false);
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    expect((await snapshot())?.state?.[a]?.messages?.map((ref) => ref.messageId)).toEqual([live]);
+  });
+
   it('refreshes a first card when Discord returns an earlier message for its nonce', async () => {
     await seed({});
     feed = [entry(a)];
@@ -1604,6 +1739,28 @@ describe('polling through the Durable Object', () => {
     // every configured channel despite there being nothing left to edit.
     expect(sent.filter((message) => message.method === 'POST')).toHaveLength(postsBefore);
     expect((await stub().getState())?.[a]).toBeUndefined();
+  });
+
+  it('recovers and closes a card whose stored id is not a snowflake instead of forgetting it', async () => {
+    const postedAt = START - 60_000;
+    await seed({ [a]: {
+      ...session(a),
+      messages: [{ channelId: '900000000000000001', messageId: 'not-a-snowflake', postedAt: new Date(postedAt).toISOString() }],
+    } });
+    feed = [entry(a)];
+    expect((await poll()).status).toBe(200);
+    const tracked = (await stub().getState())?.[a];
+    expect(tracked?.messages).toEqual([]);
+    expect(tracked?.uncertainPosts).toEqual({ '900000000000000001': { from: postedAt, to: postedAt + 60_000 } });
+    expect(sent).toHaveLength(0);
+    feed = [];
+    await nextPoll();
+    await nextPoll();
+    // The card cannot be addressed: recovery re-posts it under its nonce and closes it.
+    const posts = sent.filter((message) => message.method === 'POST');
+    expect(posts).toHaveLength(1);
+    expect(cards.get(posts[0]!.id!)?.title).toContain('OFFLINE');
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
   });
 
   it('abandons an online card destination after exhausting its retry budget', async () => {
