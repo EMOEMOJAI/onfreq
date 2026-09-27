@@ -10,7 +10,6 @@ import { isolatedEnv } from './check-setup.mjs';
 const hook = fileURLToPath(new URL('./hooks/pre-push', import.meta.url));
 const hooksDir = fileURLToPath(new URL('./hooks', import.meta.url));
 const preCommit = fileURLToPath(new URL('./hooks/pre-commit', import.meta.url));
-const preCommitShim = fileURLToPath(new URL('./pre-commit', import.meta.url));
 const zero = '0'.repeat(40);
 const hookHelpers = ['check-privacy.mjs', 'repo-files.mjs', 'secret-scan.sh', 'hooks/lib/gitleaks-settings.sh'];
 const hasGitleaks = spawnSync('gitleaks', ['version'], { stdio: 'ignore' }).status === 0;
@@ -634,14 +633,11 @@ function stageSyntheticKey(f) {
   return token;
 }
 
-test('pre-commit passes a clean commit, directly, through the shim and as an installed hook (S19-31)', (t) => {
+test('pre-commit passes a clean commit, directly and as an installed hook (S19-31)', (t) => {
   const f = fixture(t, { gitleaks: hasGitleaks ? 'real' : 'fake' });
   writeFileSync(join(f.repo, 'public.txt'), 'clean\n');
   f.git('add', 'public.txt');
-  for (const path of [preCommit, preCommitShim]) {
-    const result = f.commitHook({ path });
-    assert.equal(result.status, 0, `${path}: ${result.stderr}`);
-  }
+  assert.equal(f.commitHook().status, 0);
   const before = f.git('rev-parse', 'HEAD');
   const result = f.commitHook({ commit: true });
   assert.equal(result.status, 0, result.stderr);
@@ -666,9 +662,9 @@ test('pre-commit Gitleaks scan cannot be emptied by configuration variables (S19
     const token = stageSyntheticKey(f);
     const head = f.git('rev-parse', 'HEAD');
     for (const env of [{}, { GITLEAKS_CONFIG: rules }, { GITLEAKS_CONFIG_TOML: 'title = "no rules"\n' }]) {
-      for (const options of [{ extraEnv: env }, { extraEnv: env, path: preCommitShim }, { extraEnv: env, commit: true }]) {
+      for (const options of [{ extraEnv: env }, { extraEnv: env, commit: true }]) {
         const result = f.commitHook(options);
-        const label = JSON.stringify(Object.keys(env)) + (options.path ? ' shim' : '') + (options.commit ? ' git commit' : '');
+        const label = JSON.stringify(Object.keys(env)) + (options.commit ? ' git commit' : '');
         assert.equal(result.status, 1, `${label}: ${result.stderr}`);
         assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret; see the output above/, label);
         assert.doesNotMatch(result.stderr, /could not read the staged changes/, label);
@@ -690,7 +686,7 @@ test('pre-commit refuses untracked, ignored or unstaged Gitleaks settings (S19-3
     assert.equal(result.gitleaks, '');
     // Ignoring it does not hide it from Gitleaks, so it still blocks.
     writeFileSync(join(f.repo, '.git', 'info', 'exclude'), `${file}\n`);
-    result = f.commitHook({ path: preCommitShim });
+    result = f.commitHook();
     assert.equal(result.status, 1, file);
     assert.match(result.stderr, /would change the secret scan/);
     assert.equal(result.gitleaks, '');
@@ -732,8 +728,8 @@ test('pre-commit reports a Gitleaks that exits before reading a large staged dif
   // Like Gitleaks on a bad configuration: fails without reading standard input.
   writeFileSync(join(f.repo, '..', 'bin', 'gitleaks'), '#!/bin/sh\nprintf \'synthetic gitleaks error\\n\' >&2\nexit 1\n',
     { mode: 0o700 });
-  for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
-    const label = options.path ? 'shim' : options.commit ? 'git commit' : 'hook';
+  for (const options of [{}, { commit: true }]) {
+    const label = options.commit ? 'git commit' : 'hook';
     const result = f.commitHook(options);
     assert.equal(result.status, 1, `${label}: ${result.stderr}`);
     assert.match(result.stderr, /synthetic gitleaks error/, label);
@@ -758,11 +754,11 @@ test('pre-commit passes a commit that removes a committed secret, but blocks an 
     writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = one\n`);
     f.git('add', 'config.txt');
     f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret committed without the hook');
-    const run = (options) => [options.path ? 'shim' : options.commit ? 'git commit' : 'hook', f.commitHook(options)];
+    const run = (options) => [options.commit ? 'git commit' : 'hook', f.commitHook(options)];
     // Removing the secret, as the pre-push advice asks, leaves it as a removed line.
     f.git('rm', '--quiet', '--force', 'config.txt');
     let head = f.git('rev-parse', 'HEAD');
-    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+    for (const options of [{}, { commit: true }]) {
       const [label, result] = run(options);
       assert.equal(result.status, 0, `removal ${label}: ${result.stderr}`);
       assert.doesNotMatch(result.stderr + result.stdout, secret, label);
@@ -775,7 +771,7 @@ test('pre-commit passes a commit that removes a committed secret, but blocks an 
     writeFileSync(join(f.repo, 'other.txt'), `aws_access_key_id = ${token}\n`);
     f.git('add', 'config.txt', 'other.txt');
     head = f.git('rev-parse', 'HEAD');
-    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+    for (const options of [{}, { commit: true }]) {
       const [label, result] = run(options);
       assert.equal(result.status, 1, `addition ${label}: ${result.stderr}`);
       assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret; see the output above/, label);
@@ -796,8 +792,8 @@ test('hunk-header or GIT_DIFF_OPTS context naming a committed secret does not bl
     const scan = (extra, ...args) =>
       spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args], { cwd: f.repo, env: { ...env, ...extra }, encoding: 'utf8' });
     const run = (options) => [(options.extraEnv ? 'GIT_DIFF_OPTS ' : '') +
-      (options.path ? 'shim' : options.commit ? 'git commit' : 'hook'), f.commitHook(options)];
-    const hooks = [{}, { path: preCommitShim }, { extraEnv: diffOpts }, { extraEnv: diffOpts, path: preCommitShim }];
+      (options.commit ? 'git commit' : 'hook'), f.commitHook(options)];
+    const hooks = [{}, { extraEnv: diffOpts }];
     writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\nregion = one\n`);
     f.git('add', 'config.txt');
     f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic secret committed without the hook');
@@ -927,7 +923,7 @@ test('diff.interHunkContext cannot turn a committed secret between two edits int
     const secret = new RegExp(token.slice(4));
     const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
     const scan = (...args) => spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args], { cwd: f.repo, env, encoding: 'utf8' });
-    const run = (options) => [options.path ? 'shim' : options.commit ? 'git commit' : 'hook', f.commitHook(options)];
+    const run = (options) => [options.commit ? 'git commit' : 'hook', f.commitHook(options)];
     f.git('config', 'diff.interHunkContext', '1');
     writeFileSync(join(f.repo, 'config.txt'), `region = one\naws_access_key_id = ${token}\nzone = one\n`);
     f.git('add', 'config.txt');
@@ -938,7 +934,7 @@ test('diff.interHunkContext cannot turn a committed secret between two edits int
     writeFileSync(join(f.repo, 'config.txt'), `region = two\naws_access_key_id = ${token}\nzone = two\n`);
     f.git('add', 'config.txt');
     assert.match(f.git('diff', '--cached', '-U0'), new RegExp(`^ aws_access_key_id = ${token}$`, 'm'));
-    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+    for (const options of [{}, { commit: true }]) {
       const [label, result] = run(options);
       assert.equal(result.status, 0, `edit ${label}: ${result.stderr}`);
       assert.doesNotMatch(result.stderr + result.stdout, secret, label);
@@ -953,7 +949,7 @@ test('diff.interHunkContext cannot turn a committed secret between two edits int
     writeFileSync(join(f.repo, 'config.txt'),
       `region = three\naws_access_key_id = ${token}\nzone = two\naws_access_key_id = ${token} # added\n`);
     f.git('add', 'config.txt');
-    for (const options of [{}, { path: preCommitShim }, { commit: true }]) {
+    for (const options of [{}, { commit: true }]) {
       const [label, result] = run(options);
       assert.equal(result.status, 1, `addition ${label}: ${result.stderr}`);
       assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret; see the output above/, label);

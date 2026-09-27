@@ -1,6 +1,0 @@
-#!/bin/sh
-# Compatibility shim: hooks moved to scripts/hooks/. Existing clones and local
-# hook wrappers may still call this path; it runs the same versioned hook.
-# Point wrappers or core.hooksPath at scripts/hooks, then this file can go.
-set -eu
-exec /bin/sh "$(dirname "$0")/hooks/pre-commit" "$@"

@@ -48,7 +48,7 @@ jobs:
         run: sh scripts/secret-scan.sh HEAD
 
       - name: Check POSIX shell scripts
-        run: shellcheck scripts/pre-commit scripts/secret-scan.sh scripts/hooks/pre-commit scripts/hooks/pre-push scripts/hooks/lib/gitleaks-settings.sh
+        run: shellcheck scripts/secret-scan.sh scripts/hooks/pre-commit scripts/hooks/pre-push scripts/hooks/lib/gitleaks-settings.sh
 
       - name: Check GitHub Actions workflows
         run: actionlint
@@ -68,7 +68,6 @@ jobs:
 
       - name: Check shell syntax
         run: |
-          sh -n scripts/pre-commit
           sh -n scripts/secret-scan.sh
           sh -n scripts/hooks/pre-commit
           sh -n scripts/hooks/pre-push
