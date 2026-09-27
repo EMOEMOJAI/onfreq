@@ -8,15 +8,49 @@
 #   Check `git config --get core.hooksPath` first. Only if unset:
 #     git config core.hooksPath scripts/hooks
 #   Preserve existing hooks and any private-history push guard.
+set -eu
+# These variables would replace the repository's Gitleaks rules, for example
+# with an empty rule set; the scan uses only the reviewed configuration.
+unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
 
 if ! command -v gitleaks >/dev/null 2>&1; then
   printf 'pre-commit: install gitleaks before committing (https://github.com/gitleaks/gitleaks).\n' >&2
   exit 1
 fi
 
+# Gitleaks reads these from the current directory even when untracked or ignored.
+for file in .gitleaks.toml .gitleaksignore; do
+  if { [ -e "$file" ] || [ -L "$file" ]; } && ! git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+    printf 'pre-commit: BLOCKED — untracked or ignored %s would change the secret scan.\n' "$file" >&2
+    printf 'Stage or remove it, then commit.\n' >&2
+    exit 1
+  fi
+done
+if ! git diff --quiet --no-ext-diff --no-textconv -- .gitleaks.toml .gitleaksignore; then
+  printf 'pre-commit: BLOCKED — unstaged changes to Gitleaks settings would change the secret scan.\n' >&2
+  printf 'Stage, stash or discard them, then commit.\n' >&2
+  exit 1
+fi
+
+if ! tmp=$(mktemp -d); then
+  printf 'pre-commit: BLOCKED — could not create a temporary directory.\n' >&2
+  exit 1
+fi
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+
 # Scan the literal staged bytes: external diff drivers, textconv filters and
-# binary attributes could otherwise hide a staged secret from gitleaks.
-if ! output=$(git diff --cached --no-ext-diff --no-textconv --no-color --text | gitleaks stdin --no-banner --redact 2>&1); then
+# binary attributes could otherwise hide a staged secret from gitleaks. A failed
+# Git stage leaves a marker, so unreadable staged changes block the commit.
+status=0
+output=$({ git diff --cached --no-ext-diff --no-textconv --no-color --text </dev/null ||
+    : >"$tmp/failed"; } | gitleaks stdin --no-banner --redact 2>&1) || status=$?
+if [ -e "$tmp/failed" ]; then
+  printf '\n%s\n' "$output" >&2
+  printf '\npre-commit: BLOCKED — could not read the staged changes for the secret scan.\n' >&2
+  exit 1
+fi
+if [ "$status" != 0 ]; then
   printf '\n%s\n' "$output" >&2
   printf '\npre-commit: BLOCKED — staged changes look like they contain a secret.\n' >&2
   printf 'Unstage it, move the value into .dev.vars (gitignored) or a Wrangler secret.\n' >&2

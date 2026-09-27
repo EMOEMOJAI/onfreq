@@ -8,6 +8,9 @@ import { spawnSync } from 'node:child_process';
 import { isolatedEnv } from './check-setup.mjs';
 
 const hook = fileURLToPath(new URL('./hooks/pre-push', import.meta.url));
+const hooksDir = fileURLToPath(new URL('./hooks', import.meta.url));
+const preCommit = fileURLToPath(new URL('./hooks/pre-commit', import.meta.url));
+const preCommitShim = fileURLToPath(new URL('./pre-commit', import.meta.url));
 const zero = '0'.repeat(40);
 const hasGitleaks = spawnSync('gitleaks', ['version'], { stdio: 'ignore' }).status === 0;
 // A synthetic AWS-format key assembled at runtime, so this file never contains it.
@@ -83,7 +86,38 @@ exit "$GITLEAKS_EXIT"
       const log = (file) => existsSync(file) ? readFileSync(file, 'utf8') : '';
       return { ...result, npm: log(env.NPM_LOG), gitleaks: log(env.GITLEAKS_LOG) };
     },
+    // Runs a pre-commit hook script directly, or with commit: true runs a real
+    // `git commit` with the versioned hooks directory installed.
+    commitHook({ extraEnv = {}, path = preCommit, commit = false } = {}) {
+      rmSync(env.GITLEAKS_LOG, { force: true });
+      const options = { cwd: repo, env: { ...hookEnv, ...extraEnv }, encoding: 'utf8' };
+      const result = commit
+        ? spawnSync('git', ['-c', 'user.name=Synthetic', '-c', `user.email=${email}`, '-c', 'commit.gpgsign=false',
+          '-c', `core.hooksPath=${hooksDir}`, 'commit', '--quiet', '-m', 'hooked commit'], options)
+        : spawnSync('/bin/sh', [path], options);
+      return { ...result, gitleaks: existsSync(env.GITLEAKS_LOG) ? readFileSync(env.GITLEAKS_LOG, 'utf8') : '' };
+    },
   };
+}
+
+// A merge whose own resolution adds the key; no ordinary commit adds it. The
+// key is then removed, so only the merge commit's diff contains it.
+function mergeOnlySecret(f, token) {
+  f.git('checkout', '--quiet', '-b', 'side');
+  writeFileSync(join(f.repo, 'side.txt'), 'side\n');
+  f.git('add', 'side.txt');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'side change');
+  f.git('checkout', '--quiet', 'main');
+  writeFileSync(join(f.repo, 'public.txt'), 'main\n');
+  f.git('commit', '--quiet', '--no-verify', '-am', 'main change');
+  f.git('merge', '--quiet', '--no-ff', '--no-commit', 'side');
+  writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\n`);
+  f.git('add', 'config.txt');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'merge side');
+  const merge = f.git('rev-parse', 'HEAD');
+  f.git('rm', '--quiet', 'config.txt');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'remove synthetic secret');
+  return { merge, head: f.git('rev-parse', 'HEAD') };
 }
 
 const ref = (oid, name = 'refs/heads/main', remote = zero) => `${name} ${oid} ${name} ${remote}\n`;
@@ -211,22 +245,7 @@ test('pre-push Gitleaks scan catches a secret only a merge resolution adds (S19-
   { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
-    f.git('checkout', '--quiet', '-b', 'side');
-    writeFileSync(join(f.repo, 'side.txt'), 'side\n');
-    f.git('add', 'side.txt');
-    f.git('commit', '--quiet', '--no-verify', '-m', 'side change');
-    f.git('checkout', '--quiet', 'main');
-    writeFileSync(join(f.repo, 'public.txt'), 'main\n');
-    f.git('commit', '--quiet', '--no-verify', '-am', 'main change');
-    // No ordinary commit adds the key: only the merge commit's own changes do.
-    f.git('merge', '--quiet', '--no-ff', '--no-commit', 'side');
-    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\n`);
-    f.git('add', 'config.txt');
-    f.git('commit', '--quiet', '--no-verify', '-m', 'merge side');
-    const merge = f.git('rev-parse', 'HEAD');
-    f.git('rm', '--quiet', 'config.txt');
-    f.git('commit', '--quiet', '--no-verify', '-m', 'remove synthetic secret');
-    const head = f.git('rev-parse', 'HEAD');
+    const { merge, head } = mergeOnlySecret(f, token);
     let result = f.push([ref(head, 'refs/heads/main', f.head)]);
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stderr, /pushed commits look like they contain a secret/);
@@ -242,6 +261,19 @@ test('pre-push Gitleaks scan catches a secret only a merge resolution adds (S19-
     f.git('merge', '--quiet', '--no-ff', '--no-verify', '-m', 'merge side2', 'side2');
     result = f.push([ref(f.git('rev-parse', 'HEAD'), 'refs/heads/main', head)]);
     assert.equal(result.status, 0, result.stderr);
+  });
+
+test('pre-push Gitleaks scan still diffs merges when log.diffMerges is off (S19-30)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    const { head } = mergeOnlySecret(f, token);
+    // With this repository setting, `git log -m` shows no merge diffs at all.
+    f.git('config', 'log.diffMerges', 'off');
+    const result = f.push([ref(head, 'refs/heads/main', f.head)]);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /pushed commits look like they contain a secret/);
+    assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)));
   });
 
 test('pre-push blocks when Git cannot produce the pushed log (S19-28)', (t) => {
@@ -466,4 +498,99 @@ test('pre-push blocks when a check fails', (t) => {
   const result = f.push([ref(f.head)]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /privacy or deployment setup checks failed/);
+});
+
+// Stages a synthetic key in the fixture repository.
+function stageSyntheticKey(f) {
+  const token = syntheticKey();
+  writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\n`);
+  f.git('add', 'config.txt');
+  return token;
+}
+
+test('pre-commit passes a clean commit, directly, through the shim and as an installed hook (S19-31)', (t) => {
+  const f = fixture(t, { gitleaks: hasGitleaks ? 'real' : 'fake' });
+  writeFileSync(join(f.repo, 'public.txt'), 'clean\n');
+  f.git('add', 'public.txt');
+  for (const path of [preCommit, preCommitShim]) {
+    const result = f.commitHook({ path });
+    assert.equal(result.status, 0, `${path}: ${result.stderr}`);
+  }
+  const before = f.git('rev-parse', 'HEAD');
+  const result = f.commitHook({ commit: true });
+  assert.equal(result.status, 0, result.stderr);
+  assert.notEqual(f.git('rev-parse', 'HEAD'), before);
+});
+
+test('pre-commit ignores Gitleaks configuration variables (S19-31)', (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.repo, 'public.txt'), 'staged\n');
+  f.git('add', 'public.txt');
+  const result = f.commitHook({ extraEnv: { GITLEAKS_CONFIG: join(f.repo, 'rules.toml'), GITLEAKS_CONFIG_TOML: 'title = "no rules"\n' } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.gitleaks, '[stdin][--no-banner][--redact]\n');
+});
+
+test('pre-commit Gitleaks scan cannot be emptied by configuration variables (S19-31)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    // A configuration with no rules reports nothing when Gitleaks honours it.
+    const rules = join(f.repo, '..', 'rules.toml');
+    writeFileSync(rules, 'title = "no rules"\n');
+    const token = stageSyntheticKey(f);
+    const head = f.git('rev-parse', 'HEAD');
+    for (const env of [{}, { GITLEAKS_CONFIG: rules }, { GITLEAKS_CONFIG_TOML: 'title = "no rules"\n' }]) {
+      for (const options of [{ extraEnv: env }, { extraEnv: env, path: preCommitShim }, { extraEnv: env, commit: true }]) {
+        const result = f.commitHook(options);
+        const label = JSON.stringify(Object.keys(env)) + (options.path ? ' shim' : '') + (options.commit ? ' git commit' : '');
+        assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+        assert.match(result.stderr, /staged changes look like they contain a secret/, label);
+        assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)), label);
+      }
+    }
+    assert.equal(f.git('rev-parse', 'HEAD'), head, 'no commit was made');
+  });
+
+test('pre-commit refuses untracked, ignored or unstaged Gitleaks settings (S19-31)', (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.repo, 'public.txt'), 'staged\n');
+  f.git('add', 'public.txt');
+  for (const file of ['.gitleaks.toml', '.gitleaksignore']) {
+    writeFileSync(join(f.repo, file), 'title = "no rules"\n');
+    let result = f.commitHook();
+    assert.equal(result.status, 1, file);
+    assert.match(result.stderr, new RegExp(`untracked or ignored \\${file} would change the secret scan`));
+    assert.equal(result.gitleaks, '');
+    // Ignoring it does not hide it from Gitleaks, so it still blocks.
+    writeFileSync(join(f.repo, '.git', 'info', 'exclude'), `${file}\n`);
+    result = f.commitHook({ path: preCommitShim });
+    assert.equal(result.status, 1, file);
+    assert.match(result.stderr, /would change the secret scan/);
+    assert.equal(result.gitleaks, '');
+    rmSync(join(f.repo, '.git', 'info', 'exclude'));
+    rmSync(join(f.repo, file));
+  }
+  // A staged configuration is part of the reviewed commit; unstaged edits are not.
+  writeFileSync(join(f.repo, '.gitleaksignore'), '# synthetic\n');
+  f.git('add', '.gitleaksignore');
+  assert.equal(f.commitHook().status, 0);
+  writeFileSync(join(f.repo, '.gitleaksignore'), '# synthetic\nsynthetic-fingerprint\n');
+  const result = f.commitHook();
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /unstaged changes to Gitleaks settings would change the secret scan/);
+  assert.equal(result.gitleaks, '');
+});
+
+test('pre-commit blocks when Git cannot read the staged changes (S19-31)', (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.repo, 'staged.txt'), 'staged only\n');
+  f.git('add', 'staged.txt');
+  // The staged blob is read only by the scan's diff. Git would reuse a matching
+  // working-tree file instead, so the file is removed too.
+  const blob = f.git('rev-parse', ':staged.txt');
+  rmSync(join(f.repo, '.git', 'objects', blob.slice(0, 2), blob.slice(2)));
+  rmSync(join(f.repo, 'staged.txt'));
+  const result = f.commitHook();
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /could not read the staged changes for the secret scan/);
 });
