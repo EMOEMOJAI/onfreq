@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { diffState, newestCardedSession } from '../src/state';
-import type { OnlineAtc, StateMap, TrackedAtc } from '../src/types';
+import { describe, expect, it, vi } from 'vitest';
+import { diffState, loadPendingOffline, loadSessions, newestCardedSession } from '../src/state';
+import type { OnlineAtc, PendingOffline, StateMap, TrackedAtc } from '../src/types';
 
 const NOW = '2026-08-16T12:00:00.000Z';
 const EARLIER = '2026-08-16T10:30:00.000Z';
@@ -98,7 +98,7 @@ describe('diffState', () => {
     const prev: StateMap = {
       QESS_APP: { ...tracked('QESS_APP', { missed: 1 }), roster: true } as TrackedAtc,
     };
-    const result = diffState(prev, [atc('QESS_APP')], NOW, 2);
+    const result = diffState(loadSessions(prev), [atc('QESS_APP')], NOW, 2);
     expect(result.next['QESS_APP']).not.toHaveProperty('roster');
   });
 
@@ -109,7 +109,7 @@ describe('diffState', () => {
     const prev: StateMap = {
       QESS_APP: { ...tracked('QESS_APP'), roster: true } as TrackedAtc,
     };
-    const result = diffState(prev, [], NOW, 2);
+    const result = diffState(loadSessions(prev), [], NOW, 2);
     expect(result.next['QESS_APP']).not.toHaveProperty('roster');
   });
 
@@ -117,8 +117,16 @@ describe('diffState', () => {
     const prev: StateMap = {
       QESS_APP: { ...tracked('QESS_APP', { missed: 1 }), roster: true } as TrackedAtc,
     };
-    const result = diffState(prev, [], NOW, 2);
+    const result = diffState(loadSessions(prev), [], NOW, 2);
     expect(result.wentOffline[0]).not.toHaveProperty('roster');
+  });
+
+  it('C12: gives a never-carded session no closeout, unless a first card may have landed unseen', () => {
+    const neverCarded = tracked('QESS_APP', { missed: 1, pendingChannelIds: [] });
+    expect(diffState({ QESS_APP: neverCarded }, [], NOW, 2).wentOffline).toEqual([]);
+    const uncertain = { ...neverCarded, uncertainPosts: { '900000000000000001': { from: 1, to: 2 } } };
+    expect(diffState({ QESS_APP: uncertain }, [], NOW, 2).wentOffline)
+      .toMatchObject([{ callsign: 'QESS_APP', uncertainPosts: uncertain.uncertainPosts }]);
   });
 
   it('reports offline once the grace window is exhausted', () => {
@@ -213,6 +221,36 @@ describe('diffState', () => {
     };
     const result = diffState(prev, [], NOW, 2);
     expect(result.wentOffline[0]?.durationSeconds).toBe(0);
+  });
+});
+
+describe('loading stored state', () => {
+  it('C16: drops malformed sessions and closeout jobs by count only, keeping valid ones', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const valid = tracked('QCTT_TWR', { messages: [{ channelId: '900000000000000001', messageId: '700000000000000001' }] });
+    const stored = {
+      QCTT_TWR: valid,
+      QESS_APP: { ...tracked('QESS_APP'), messages: [null] },
+      QFRA_TWR: { ...tracked('QFRA_TWR'), callsign: undefined },
+      QGLL_TWR: { ...tracked('QGLL_TWR'), uncertainPosts: { '900000000000000001': { from: 'x', to: 2 } } },
+    } as unknown as StateMap;
+    expect(loadSessions(stored)).toEqual({ QCTT_TWR: valid });
+    const job: PendingOffline = {
+      event: { ...valid, endedAt: NOW, durationSeconds: 60 }, messages: valid.messages!, channelIds: [],
+    };
+    const malformed = [{ ...job, messages: undefined }, { ...job, event: { ...job.event, callsign: 7 } },
+      { ...job, attemptsByChannel: null }, null];
+    expect(loadPendingOffline([malformed[0], job, ...malformed.slice(1)])).toEqual([job]);
+    expect(error.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      { event: 'sessions_dropped', reason: 'invalid', count: 3 },
+      { event: 'offline_jobs_dropped', reason: 'invalid', count: 4 },
+    ]);
+    vi.restoreAllMocks();
+  });
+
+  it('accepts a legacy session with neither messages nor pending markers', () => {
+    const legacy = { QCTT_TWR: tracked('QCTT_TWR', { station: null, location: null }) };
+    expect(loadSessions(legacy)).toEqual(legacy);
   });
 });
 

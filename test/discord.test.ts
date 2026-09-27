@@ -5,6 +5,7 @@ import {
   buildOnlineEmbed,
   buildOnlineEmbeds,
   buildSessionEndedEmbed,
+  countsAgainstBudget,
   DiscordApiError,
   DiscordInvalidChannelIdError,
   DiscordInvalidMessageIdError,
@@ -26,7 +27,8 @@ import {
   SNOWFLAKE_PATTERN,
 } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
-import { countsAgainstBudget, type OfflineEvent, type OnlineAtc, type TrackedAtc } from '../src/types';
+import type { OfflineEvent, OnlineAtc, TrackedAtc } from '../src/types';
+import { BOT_ID, BOT_TOKEN, snowflakeAt } from './helpers';
 
 /** Any unpaired UTF-16 surrogate, which makes a Discord payload invalid text. */
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
@@ -120,7 +122,7 @@ describe('snowflake helpers', () => {
 
   it('decodes the creation time of a snowflake', () => {
     const at = 1_800_000_000_000;
-    const id = ((BigInt(at - 1_420_070_400_000) << 22n) + 4_194_303n).toString();
+    const id = snowflakeAt(at, 4_194_303);
     expect(snowflakeTime(id)).toBe(at);
   });
 });
@@ -576,10 +578,10 @@ describe('REST calls', () => {
     });
 
   it('ignores listed messages whose id is not a snowflake when scanning for unseen posts', async () => {
-    const botId = '100000000000000009';
-    const token = `${btoa(botId)}.synthetic.token`;
+    const botId = BOT_ID;
+    const token = BOT_TOKEN;
     const at = 1_800_000_000_000;
-    const snowflake = ((BigInt(at - 1_420_070_400_000) << 22n) + 1n).toString();
+    const snowflake = snowflakeAt(at, 1);
     stubFetch(Response.json([
       { id: snowflake, author: { id: botId } },
       { id: '123', author: { id: botId } },
@@ -853,8 +855,8 @@ describe('REST calls', () => {
   });
 
   it('treats an oversized channel scan as a budgeted lookup failure without deferring later posts', async () => {
-    const botId = '100000000000000009';
-    const token = `${btoa(botId)}.synthetic.token`;
+    const botId = BOT_ID;
+    const token = BOT_TOKEN;
     const at = 1_800_000_000_000;
     const fetchMock = stubFetch(
       new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
@@ -879,10 +881,10 @@ describe('REST calls', () => {
   });
 
   it('retries an oversized channel scan page with 25 messages and keeps that size for the rest of the scan', async () => {
-    const botId = '100000000000000009';
-    const token = `${btoa(botId)}.synthetic.token`;
+    const botId = BOT_ID;
+    const token = BOT_TOKEN;
     const at = 1_800_000_000_000;
-    const idAt = (n: number) => ((BigInt(at - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
+    const idAt = (n: number) => snowflakeAt(at, n);
     const page = Array.from({ length: 25 }, (_, n) => ({ id: idAt(n + 1), author: { id: n === 7 ? botId : '100000000000000001' } }));
     const fetchMock = stubFetch(
       new Response('[]', { headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
@@ -899,10 +901,10 @@ describe('REST calls', () => {
   });
 
   it('keeps scanning up to 500 messages after falling back to 25-message pages', async () => {
-    const botId = '100000000000000009';
-    const token = `${btoa(botId)}.synthetic.token`;
+    const botId = BOT_ID;
+    const token = BOT_TOKEN;
     const at = 1_800_000_000_000;
-    const idAt = (n: number) => ((BigInt(at - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
+    const idAt = (n: number) => snowflakeAt(at, n);
     const otherId = '100000000000000001';
     // Six full pages of 25 other-user messages; the bot's message is the last one on page 6.
     const pages = Array.from({ length: 6 }, (_, p) => Array.from({ length: 25 }, (_, n) => {
@@ -921,10 +923,10 @@ describe('REST calls', () => {
   });
 
   it('stops a channel scan after 500 messages, whichever page size it uses', async () => {
-    const botId = '100000000000000009';
-    const token = `${btoa(botId)}.synthetic.token`;
+    const botId = BOT_ID;
+    const token = BOT_TOKEN;
     const at = 1_800_000_000_000;
-    const idAt = (n: number) => ((BigInt(at - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
+    const idAt = (n: number) => snowflakeAt(at, n);
     const fullPage = (size: number, p: number) => Array.from({ length: size }, (_, n) => (
       { id: idAt(p * size + n + 1), author: { id: '100000000000000001' } }));
 
@@ -945,8 +947,8 @@ describe('REST calls', () => {
   });
 
   it('does not shrink a channel scan page for a failure other than an oversized response', async () => {
-    const botId = '100000000000000009';
-    const token = `${btoa(botId)}.synthetic.token`;
+    const botId = BOT_ID;
+    const token = BOT_TOKEN;
     const at = 1_800_000_000_000;
     const fetchMock = stubFetch(Response.json({ message: 'Missing Access', code: 50001 }, { status: 403 }));
     const err = await findBotMessages(token, '100000000000000123', { from: at, to: at }, new DiscordRateLimits(), () => true)
@@ -1069,8 +1071,8 @@ describe('REST calls', () => {
 
   it.each(['../100000000000000123', '100000000000000123/messages', '100000000000000123?x=1', 'synthetic-id', '123', '1'.repeat(21), ''])(
     'never places a stored channel id %j that is not a snowflake in a request path', async (channelId) => {
-      const botId = '100000000000000009';
-      const token = `${btoa(botId)}.synthetic.token`;
+      const botId = BOT_ID;
+      const token = BOT_TOKEN;
       const fetchMock = stubFetch(Response.json({ id: '100000000000000999' }), new Response(null, { status: 204 }));
       const limits = new DiscordRateLimits();
       const results = await Promise.all([

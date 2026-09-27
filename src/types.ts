@@ -1,17 +1,3 @@
-import { DiscordApiError } from './discord';
-
-/**
- * A definite Discord-side rejection (a 4xx `DiscordApiError`; a 429 throws a
- * `DiscordRateLimitError` instead) counts against a bounded retry budget.
- * A 5xx (a `DiscordApiError` with status 500 or above), a timeout/network
- * error, or a rate-limit deferral is transient and retried indefinitely. Shared by the online first-card budget,
- * the offline closeout budget, and the roster page budgets so they agree on
- * what "permanent" means.
- */
-export function countsAgainstBudget(err: unknown): boolean {
-  return err instanceof DiscordApiError && err.status >= 400 && err.status <= 499;
-}
-
 /**
  * Shapes returned by https://api.ivao.aero/v2/tracker/now/atc/summary
  * (only the fields this bot uses).
@@ -185,6 +171,13 @@ export interface TrackedAtc extends OnlineAtc {
    * waiting for a frequency and so was carded later than it connected.
    */
   cardAt?: string;
+  /**
+   * The IVAO connection id this session was first seen with, keying its
+   * first-card nonce. Kept through grace-window resumes (which replace
+   * `sessionId`) and onto its offline event; absent on sessions tracked
+   * before it was recorded.
+   */
+  firstSessionId?: number;
 }
 
 /** Persisted session state, keyed by callsign. */

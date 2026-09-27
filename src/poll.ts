@@ -4,15 +4,17 @@ import {
   buildOnlineEmbed,
   buildOnlineEmbeds,
   buildSessionEndedEmbed,
+  countsAgainstBudget,
   DiscordApiError,
-  DiscordInvalidMessageIdError,
   DiscordUnconfirmedPostError,
   editMessage,
   escapeMarkdown,
   findBotMessages,
+  isSnowflake,
   messageNonce,
   parseChannelIds,
   postMessage,
+  snowflakeTime,
 } from './discord';
 import {
   fetchDivisionAtc,
@@ -21,12 +23,11 @@ import {
   parseExcludedCallsigns,
   parsePrefixes,
 } from './ivao';
-import { diffState, newestCardedSession, stripLegacyRoster } from './state';
+import { diffState, loadPendingOffline, loadSessions, newestCardedSession, offlineEventFor } from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
 import { gcaMismatch, gcaRemindersEnabled, parseGcaPolicy, sendGcaReminders, type GcaPolicy } from './gca';
-import { channelIndex, syncRosterMessages, type RosterTarget } from './roster';
+import { channelIndex, mayHavePosted, nextBudget, syncRosterMessages, type RosterTarget } from './roster';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
-import { countsAgainstBudget } from './types';
 import type {
   OfflineEvent, PendingOffline, OnlineAtc, PostedMessage, PostWindow, RosterMessage, RosterPostAttempt, StateMap,
   TrackedAtc,
@@ -38,8 +39,6 @@ function parseGracePolls(raw: string | undefined): number {
   return Math.min(Math.max(n, 1), 10);
 }
 
-/** Extra polls an undeliverable offline update is retried for before it is dropped. */
-const OFFLINE_RETRY_POLLS = 10;
 /**
  * Pending closeouts older than this are attempted once more, then dropped if
  * still undelivered; beyond MAX_OFFLINE_JOBS (oldest first) they are dropped.
@@ -70,7 +69,7 @@ const DEFAULT_MENTION_COOLDOWN_MINUTES = 10;
 function parseMentionRole(raw: string | undefined): string | undefined {
   const text = raw?.trim();
   if (!text) return undefined;
-  if (/^\d{17,20}$/.test(text)) return text;
+  if (isSnowflake(text)) return text;
   console.error(JSON.stringify({ event: 'mention_config_invalid', reason: 'role' }));
   return undefined;
 }
@@ -95,24 +94,15 @@ function logFailure(event: string, callsign: string, channelIds: string[], chann
 }
 
 /**
- * A tracked session plus the IVAO connection id it was first seen with. Kept
- * on the session (and its offline event) through grace-window resumes, which
- * replace `sessionId`; absent on sessions tracked before it was recorded.
- */
-type NonceSession = TrackedAtc & { firstSessionId?: number };
-
-/**
  * Nonce of a session's first ONLINE card in a channel: keyed to the IVAO
  * connection the session was first seen with, not the poll-time `since`, so a
  * re-send after a poll whose state was never saved returns the original card
  * instead of posting a duplicate. Older sessions keep their `since`-based key.
  */
-function onlineNonce(atc: NonceSession, channelId: string): string {
+function onlineNonce(atc: TrackedAtc, channelId: string): string {
   const identity = atc.firstSessionId === undefined ? atc.since : `session-${atc.firstSessionId}`;
   return messageNonce(`online:${atc.userId}:${atc.callsign}:${identity}`, channelId);
 }
-
-const DISCORD_EPOCH_MS = 1_420_070_400_000;
 
 /**
  * Whether a message id returned for a first-card POST was created shortly
@@ -122,12 +112,12 @@ const DISCORD_EPOCH_MS = 1_420_070_400_000;
  * range, or not snowflakes, read as new.
  */
 function createdBeforePoll(messageId: string, pollStartMs: number): boolean {
-  if (!/^\d{17,20}$/.test(messageId)) return false;
-  const createdMs = Number(BigInt(messageId) >> 22n) + DISCORD_EPOCH_MS;
+  if (!isSnowflake(messageId)) return false;
+  const createdMs = snowflakeTime(messageId);
   return createdMs < pollStartMs - 10_000 && createdMs > pollStartMs - 3_600_000;
 }
 
-/** Values constant across every card posted/edited within one poll. */
+/** Values shared by every card posted/edited within one poll. */
 interface PollContext {
   env: Env;
   labels: FirLabel[];
@@ -141,6 +131,21 @@ interface PollContext {
   /** Last role ping per channel (epoch ms) still within its cooldown; updated in place. */
   rolePings: Record<string, number>;
   mentionCooldownMs: number;
+  /** Channels the role was pinged in this poll; updated in place. */
+  mentionedChannels: Set<string>;
+  /** The session expected to hold each channel's roster: the last one carded there this poll. */
+  rosterHolders: Map<string, TrackedAtc>;
+}
+
+/** The part of the poll context closeout delivery needs. */
+type PollBase = Pick<PollContext, 'env' | 'labels' | 'limits' | 'nowIso' | 'channelIds'>;
+
+/** Result of one session's first-card posts. */
+interface FirstCardOutcome {
+  posted: PostedMessage[];
+  failed: Map<string, unknown>;
+  /** Accepted without a usable id: never retried. */
+  unconfirmed: Set<string>;
 }
 
 /**
@@ -149,15 +154,11 @@ interface PollContext {
  * plus the error for each channel that failed.
  */
 async function announceOnline(
-  ctx: PollContext,
-  atc: TrackedAtc,
-  channelIds: string[],
-  mentionedChannels: Set<string>,
-  current: OnlineAtc[],
-  holderChannels: Set<string>,
-  retry: boolean,
-): Promise<{ posted: PostedMessage[]; failed: Map<string, unknown>; unconfirmed: Set<string> }> {
-  const { env, labels, highlightPolicy, limits, nowIso, channelIds: configured, mentionRoleId, rolePings } = ctx;
+  ctx: PollContext, atc: TrackedAtc, channelIds: string[], current: OnlineAtc[], retry: boolean,
+): Promise<FirstCardOutcome> {
+  const {
+    env, labels, highlightPolicy, limits, nowIso, channelIds: configured, mentionRoleId, rolePings, mentionedChannels,
+  } = ctx;
   const mismatch = highlightMismatch(atc, highlightPolicy);
   const plain = buildOnlineEmbed(atc, current, labels, mismatch);
   // The expected roster holder posts its first roster page directly, matching
@@ -183,7 +184,7 @@ async function announceOnline(
       mentionedChannels.add(channelId);
       if (ctx.mentionCooldownMs > 0) rolePings[channelId] = Date.parse(nowIso);
     };
-    const embed = holderChannels.has(channelId) ? holder : plain;
+    const embed = ctx.rosterHolders.get(channelId) === atc ? holder : plain;
     try {
       // A POST whose 5xx hid a success is re-sent next poll; its nonce lets
       // Discord return the original message instead of a duplicate card.
@@ -252,12 +253,12 @@ async function syncOnlineCards(
             ref.onlineEmbed = rendered;
             updated = true;
           } catch (err) {
-            logFailure('roster_edit_failed', callsign, channelIds, ref.channelId, err);
-            if (err instanceof DiscordInvalidMessageIdError) {
-              // A corrupt stored id cannot be addressed, but its card was
-              // posted: record when, so the session's end finds that card
-              // among the bot's messages (or re-posts it under its nonce)
-              // and closes it.
+            logFailure('online_edit_failed', callsign, channelIds, ref.channelId, err);
+            if (err instanceof DiscordApiError && err.isGone && err.status !== 404) {
+              // The card cannot be addressed (a corrupt stored id) or reached
+              // (a 403, access that may return), but it was posted: record
+              // when, so the session's end finds that card among the bot's
+              // messages (or re-posts it under its nonce) and closes it.
               const postedMs = [ref.postedAt, session.cardAt, session.since]
                 .map((at) => Date.parse(at ?? '')).find(Number.isFinite);
               if (postedMs !== undefined) {
@@ -308,13 +309,18 @@ async function announceOffline(
   // request this poll: an expired job is then kept for another attempt.
   let deferred = false;
   const attempts = job.attemptsByChannel ??= {};
-  // Only a definite Discord-side rejection (4xx, excluding the 429
-  // rate-limit deferral) counts towards this budget, via the same predicate
-  // the online first-card and roster page budgets use; a 5xx outage or a
-  // timeout/network error is transient and retried instead, so a prolonged
-  // Discord outage cannot abandon a closeout early. Only the job's overall
-  // age bound (OFFLINE_JOB_MAX_AGE_MS) ends those retries, and a job past it
-  // still gets one final attempt before it is dropped.
+  // A destination is charged at most one failed poll, however many of its
+  // requests fail this poll; once that exhausts its budget, every remaining
+  // request there is given up with it.
+  const charged = new Set<string>();
+  const exhausted = new Set<string>();
+  // Only a definite Discord-side rejection counts towards this budget
+  // (`nextBudget`, shared with the online first-card and roster page
+  // budgets); a 5xx outage or a timeout/network error is transient and
+  // retried instead, so a prolonged Discord outage cannot abandon a closeout
+  // early. Only the job's overall age bound (OFFLINE_JOB_MAX_AGE_MS) ends
+  // those retries, and a job past it still gets one final attempt before it
+  // is dropped.
   const keepForRetry = (channelId: string, err: unknown): boolean => {
     if (err instanceof DiscordUnconfirmedPostError) {
       // Discord accepted the fallback without returning its id: it was
@@ -325,13 +331,15 @@ async function announceOffline(
       return false;
     }
     failed = true;
-    const counts = countsAgainstBudget(err);
-    const used = (attempts[channelId] ?? job.attempts ?? 0) + (counts ? 1 : 0);
-    if (!counts || used <= OFFLINE_RETRY_POLLS) {
+    if (exhausted.has(channelId)) return false;
+    const { used, keep } = nextBudget(attempts[channelId] ?? job.attempts ?? 0, err, !charged.has(channelId));
+    if (countsAgainstBudget(err)) charged.add(channelId);
+    if (keep) {
       attempts[channelId] = used;
       if (err instanceof DiscordRateLimitError && !err.requestMade) deferred = true;
       return true;
     }
+    exhausted.add(channelId);
     delete attempts[channelId];
     console.error(JSON.stringify({ event: 'offline_abandoned', callsign: job.event.callsign, channelIndex: index(channelId) }));
     return false;
@@ -340,6 +348,21 @@ async function announceOffline(
   // IVAO-issued `sessionId`, so a genuinely new session never collides with
   // this one's nonce.
   const offlineKey = `offline:${job.event.userId}:${job.event.callsign}:${job.event.since}`;
+  /** Post the standalone OFFLINE notice; true when the destination is kept for a retry. */
+  const postFallback = async (channelId: string): Promise<boolean> => {
+    try {
+      await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed, undefined, undefined, limits,
+        messageNonce(offlineKey, channelId));
+      delivered++;
+      delete attempts[channelId];
+      return false;
+    } catch (err) {
+      if (!(err instanceof DiscordUnconfirmedPostError)) {
+        logFailure('offline_post_failed', job.event.callsign, channelIds, channelId, err);
+      }
+      return keepForRetry(channelId, err);
+    }
+  };
   // Recover first cards that may exist unseen, so they are closed below:
   // look for them among the bot's messages from the uncertain attempts, and
   // only when none is found re-post with the original nonce (which returns
@@ -411,37 +434,227 @@ async function announceOffline(
         continue;
       }
     }
-    try {
-      await postMessage(env.DISCORD_BOT_TOKEN, ref.channelId, fallbackEmbed, undefined, undefined, limits,
-        messageNonce(offlineKey, ref.channelId));
-      delivered++;
-      delete attempts[ref.channelId];
-    } catch (err) {
-      if (!(err instanceof DiscordUnconfirmedPostError)) {
-        logFailure('offline_post_failed', job.event.callsign, channelIds, ref.channelId, err);
-      }
-      if (keepForRetry(ref.channelId, err)) remaining.push(ref);
-    }
+    if (await postFallback(ref.channelId)) remaining.push(ref);
   }
   job.messages = remaining;
   const remainingChannels: string[] = [];
   for (const channelId of job.channelIds) {
-    try {
-      await postMessage(env.DISCORD_BOT_TOKEN, channelId, fallbackEmbed, undefined, undefined, limits,
-        messageNonce(offlineKey, channelId));
-      delivered++;
-      delete attempts[channelId];
-    } catch (err) {
-      if (!(err instanceof DiscordUnconfirmedPostError)) {
-        logFailure('offline_post_failed', job.event.callsign, channelIds, channelId, err);
-      }
-      if (keepForRetry(channelId, err)) remainingChannels.push(channelId);
-    }
+    if (await postFallback(channelId)) remainingChannels.push(channelId);
   }
   job.channelIds = remainingChannels;
   // Keep a numeric legacy field so an older Worker can still retry on rollback.
   job.attempts = 0;
   return { delivered, failed, deferred };
+}
+
+/** A closeout job's end time; one that cannot be read is treated as current, never expired. */
+function endedMs(job: PendingOffline, nowMs: number): number {
+  const ended = Date.parse(job.event.endedAt);
+  return Number.isFinite(ended) ? ended : nowMs;
+}
+
+/**
+ * This poll's closeout jobs: retried ones, then sessions that just ended.
+ * Destinations in a channel removed from DISCORD_CHANNEL_IDS are never
+ * written to, but are parked untouched with their job until it expires (like
+ * roster pages), so configuring the channel again still closes the card.
+ */
+function buildOfflineJobs(
+  channelIds: string[], previousJobs: PendingOffline[], ended: OfflineEvent[],
+): { jobs: PendingOffline[]; parked: Map<PendingOffline, ParkedDestinations> } {
+  const isConfigured = (id: string) => channelIds.includes(id);
+  const parked = new Map<PendingOffline, ParkedDestinations>();
+  const split = (
+    job: PendingOffline, attemptsByChannel: Record<string, number> = {}, legacyAttempts = 0,
+  ): PendingOffline => {
+    // Card content and post times are never needed to close a card.
+    const refs = job.messages.map(({ channelId, messageId }) => ({ channelId, messageId }));
+    const recover = Object.entries(job.recoverPosts ?? {});
+    const active = {
+      messages: refs.filter((ref) => isConfigured(ref.channelId)),
+      channelIds: job.channelIds.filter(isConfigured),
+      recoverPosts: Object.fromEntries(recover.filter(([id]) => isConfigured(id))),
+    };
+    const kept = {
+      messages: refs.filter((ref) => !isConfigured(ref.channelId)),
+      channelIds: job.channelIds.filter((id) => !isConfigured(id)),
+      recoverPosts: Object.fromEntries(recover.filter(([id]) => !isConfigured(id))),
+    };
+    // A retry counter for a destination no longer in any list (already
+    // resolved) is stale bookkeeping; a parked one keeps its count, including
+    // a legacy shared counter it has not imported yet.
+    const attemptsFor = (destinations: typeof active, legacy: number): Record<string, number> => {
+      const ids = new Set([
+        ...destinations.messages.map((ref) => ref.channelId), ...destinations.channelIds,
+        ...Object.keys(destinations.recoverPosts),
+      ]);
+      return Object.fromEntries([...ids].flatMap((id): [string, number][] =>
+        Object.hasOwn(attemptsByChannel, id) ? [[id, attemptsByChannel[id]!]] : legacy ? [[id, legacy]] : []));
+    };
+    const activeAttempts = attemptsFor(active, 0);
+    const { attemptsByChannel: _oldAttempts, recoverPosts: _oldRecover, ...rest } = job;
+    const result: PendingOffline = {
+      ...rest,
+      messages: active.messages,
+      channelIds: active.channelIds,
+      ...(Object.keys(active.recoverPosts).length ? { recoverPosts: active.recoverPosts } : {}),
+      ...(Object.keys(activeAttempts).length ? { attemptsByChannel: activeAttempts } : {}),
+    };
+    if (hasDestinations(kept)) parked.set(result, { ...kept, attemptsByChannel: attemptsFor(kept, legacyAttempts) });
+    return result;
+  };
+  const jobs: PendingOffline[] = structuredClone(previousJobs)
+    .map((job) => split(job, job.attemptsByChannel, job.attempts))
+    .filter((job) => hasDestinations(job) || parked.has(job));
+  for (const offline of ended) {
+    // Both fields only track retry state for the still-open ONLINE card and
+    // are meaningless once a session has ended; strip them so a closed-out
+    // session doesn't carry stale online-card bookkeeping.
+    const {
+      messages = [], pendingChannelIds: pendingIds, onlineAttemptsByChannel: _onlineAttempts,
+      uncertainPosts = {}, ...event
+    } = offline;
+    // A session with no card and no pending marker is legacy: announce the
+    // end everywhere. Channels whose first card may exist unseen recover it.
+    // A channel whose card is tracked only needs stray copies closed; the
+    // flag survives retries, after which that card may no longer be listed.
+    const recoverPosts = Object.fromEntries(Object.entries(uncertainPosts)
+      .map(([id, window]): [string, PostWindow] => messages.some((ref) => ref.channelId === id)
+        ? [id, { ...window, closeOnly: true }] : [id, window]));
+    const job = split({
+      event,
+      // Only configured channels are written to (others are parked above);
+      // the fallback decision still sees every card the session had.
+      messages,
+      channelIds: messages.length || pendingIds ? [] : [...channelIds],
+      recoverPosts,
+    });
+    if (hasDestinations(job) || parked.has(job)) jobs.push(job);
+  }
+  return { jobs, parked };
+}
+
+/**
+ * Deliver every closeout job, restore its parked destinations, and keep the
+ * undelivered ones, bounded by age and count.
+ */
+async function deliverOfflineJobs(
+  base: PollBase, next: StateMap, jobs: PendingOffline[], parked: Map<PendingOffline, ParkedDestinations>,
+): Promise<{ pendingOffline: PendingOffline[]; attempted: number; delivered: number; failed: boolean }> {
+  const { env, labels, limits, channelIds } = base;
+  const nowMs = Date.parse(base.nowIso);
+  // A long outage must not grow the snapshot without bound: a closeout older
+  // than a day (for example after a long polling outage) still gets this
+  // poll's delivery attempt, and is given up on only if it stays undelivered.
+  const expired = (job: PendingOffline) => nowMs - endedMs(job, nowMs) > OFFLINE_JOB_MAX_AGE_MS;
+  let attempted = 0;
+  let delivered = 0;
+  let failed = false;
+  let pendingOffline: PendingOffline[] = [];
+  let expiredDropped = 0;
+  const liveIds = new Set(Object.values(next).flatMap((session) => (session.messages ?? []).map((ref) => ref.messageId)));
+  const trackedIds = new Set([...liveIds, ...jobs.flatMap((job) => job.messages.map((ref) => ref.messageId))]);
+  for (const job of jobs) {
+    // An expired job is given up only once each remaining destination got a
+    // real request this poll; one deferred without a request (a cooldown
+    // started earlier this poll, say) is kept, still bounded by MAX_OFFLINE_JOBS.
+    let deferred = false;
+    if (hasDestinations(job)) {
+      attempted += job.messages.length + job.channelIds.length + Object.keys(job.recoverPosts ?? {}).length;
+      const result = await announceOffline(env, job, labels, limits, trackedIds, liveIds, channelIds);
+      delivered += result.delivered;
+      failed ||= result.failed;
+      deferred = result.deferred;
+    }
+    const kept = parked.get(job);
+    if (kept) {
+      job.messages.push(...kept.messages);
+      job.channelIds.push(...kept.channelIds);
+      if (Object.keys(kept.recoverPosts).length) job.recoverPosts = { ...job.recoverPosts, ...kept.recoverPosts };
+      if (Object.keys(kept.attemptsByChannel).length) {
+        job.attemptsByChannel = { ...job.attemptsByChannel, ...kept.attemptsByChannel };
+      }
+    }
+    if (!hasDestinations(job)) continue;
+    if (expired(job) && !deferred) expiredDropped++;
+    else pendingOffline.push(job);
+  }
+  if (expiredDropped) {
+    console.error(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'expired', count: expiredDropped }));
+  }
+  if (pendingOffline.length > MAX_OFFLINE_JOBS) {
+    const dropped = new Set([...pendingOffline].sort((x, y) => endedMs(x, nowMs) - endedMs(y, nowMs))
+      .slice(0, pendingOffline.length - MAX_OFFLINE_JOBS));
+    pendingOffline = pendingOffline.filter((job) => !dropped.has(job));
+    console.error(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'limit', count: dropped.size }));
+  }
+  return { pendingOffline, attempted, delivered, failed };
+}
+
+/**
+ * Record a session's first-card attempt: new cards, the retry budget of
+ * destinations still pending, and channels where a card may have landed
+ * unseen. Returns whether any destination is still pending.
+ */
+function recordFirstCardOutcome(
+  ctx: PollContext, entry: TrackedAtc, targets: string[], outcome: FirstCardOutcome,
+): boolean {
+  const { posted, failed, unconfirmed } = outcome;
+  if (posted.length) {
+    entry.messages = [...(entry.messages ?? []), ...posted];
+    entry.cardAt ??= ctx.nowIso;
+  }
+  // A destination that keeps failing to receive the first card is dropped
+  // after the same retry budget as an offline closeout's fallback post
+  // (which likewise has no message to discover "gone"). Only a definite
+  // Discord-side rejection (4xx, excluding the 429 rate-limit deferral)
+  // counts towards that budget; a 5xx outage, a timeout/network error, or
+  // a rate-limit deferral is transient and retried indefinitely instead.
+  // Rebuilt from `targets` only (not copied wholesale) so a destination
+  // that fell out of `targets` (channel removed, or its card finally
+  // landed) never leaves a stale counter behind.
+  const previousAttempts = entry.onlineAttemptsByChannel ?? {};
+  const attempts: Record<string, number> = {};
+  const kept: string[] = [];
+  const uncertain: Record<string, PostWindow> = { ...entry.uncertainPosts };
+  const markUncertain = (id: string) => {
+    const now = Date.now();
+    uncertain[id] = { from: uncertain[id]?.from ?? now, to: now };
+  };
+  for (const id of targets) {
+    // A card that finally posted keeps any uncertain window: an earlier
+    // copy outside Discord's nonce window is still found and closed at the end.
+    if (posted.some((ref) => ref.channelId === id)) continue;
+    // A 2xx-but-unconfirmed destination is dropped outright, same as
+    // one that just exhausted its budget below — never retried, and never
+    // given a counter; its card exists, so it is closed out at the end.
+    if (unconfirmed.has(id)) { markUncertain(id); continue; }
+    const err = failed.get(id);
+    // A 5xx or thrown fetch error may hide a card Discord did create.
+    if (mayHavePosted(err)) markUncertain(id);
+    const { used, keep } = nextBudget(previousAttempts[id] ?? 0, err);
+    if (keep) {
+      attempts[id] = used;
+      kept.push(id);
+    } else {
+      console.error(JSON.stringify({
+        event: 'online_post_abandoned', callsign: entry.callsign, channelIndex: channelIndex(ctx.channelIds, id),
+      }));
+    }
+  }
+  if (Object.keys(attempts).length) entry.onlineAttemptsByChannel = attempts;
+  else delete entry.onlineAttemptsByChannel;
+  // A window in a channel removed from DISCORD_CHANNEL_IDS is kept: at close
+  // it is parked with the closeout, so configuring the channel again still
+  // finds and closes a card that landed unseen there.
+  if (Object.keys(uncertain).length) entry.uncertainPosts = uncertain;
+  else delete entry.uncertainPosts;
+  entry.pendingChannelIds = kept;
+  if (entry.pendingChannelIds.length) return true;
+  if (entry.messages?.length) delete entry.pendingChannelIds;
+  // Keep an empty pending marker if no card was ever sent, so disconnect
+  // cannot manufacture an offline notice after destinations are removed.
+  return false;
 }
 
 export interface PollOutcome {
@@ -492,7 +705,9 @@ export async function runPoll(
   const current = currentAll
     .filter((a) => !isExcludedCallsign(a.callsign, excluded))
     .sort((a, b) => a.callsign.localeCompare(b.callsign));
-  const prev: StateMap = { ...(stored ?? {}) };
+  // Normalized once here: invalid entries are dropped, legacy fields stripped.
+  const prev = loadSessions(stored ?? {});
+  const previousJobs = loadPendingOffline(previousPendingOffline);
   // A callsign carded before it was excluded must have its card closed out,
   // not silently abandoned: it disappears from `prev`/`next` below (so
   // `diffState` cannot see it went offline), so queue a closeout here for
@@ -500,19 +715,12 @@ export async function runPoll(
   const excludedClosures: OfflineEvent[] = [];
   for (const callsign of Object.keys(prev)) {
     if (isExcludedCallsign(callsign, excluded)) {
-      // Strip a legacy `roster` field here too — this session comes
-      // straight from storage, not through `diffState`'s own stripping.
-      const tracked = stripLegacyRoster(prev[callsign]!);
-      if (!tracked.pending && (tracked.messages?.length || Object.keys(tracked.uncertainPosts ?? {}).length)) {
-        // A session already missing (grace window) keeps the poll it went
-        // missing as its end time, matching `diffState`'s `close()`, instead
-        // of stretching the duration to this poll.
-        const endedAt = tracked.missingSince ?? nowIso;
-        const durationSeconds = Math.max(0, Math.round(
-          (Date.parse(endedAt) - Date.parse(tracked.since)) / 1000,
-        ));
-        excludedClosures.push({ ...tracked, missed: 0, missingSince: endedAt, endedAt, durationSeconds });
-      }
+      const tracked = prev[callsign]!;
+      // A session already missing (grace window) keeps the poll it went
+      // missing as its end time, matching `diffState`, instead of stretching
+      // the duration to this poll.
+      const event = offlineEventFor(tracked, 0, tracked.missingSince ?? nowIso);
+      if (event) excludedClosures.push(event);
       delete prev[callsign];
     }
   }
@@ -523,9 +731,10 @@ export async function runPoll(
   if (storage) {
     try {
       await sendGcaReminders(env, current, storage, Date.parse(nowIso), gcaPolicy, labels, limits);
-    } catch {
-      // DM lookup/storage failures must not break the public ATC cards.
-      console.error(JSON.stringify({ event: 'gca_poll_failed' }));
+    } catch (err) {
+      // DM lookup/storage failures must not break the public ATC cards. Only
+      // the error class is logged: a message could carry private details.
+      console.error(JSON.stringify({ event: 'gca_poll_failed', error: err instanceof Error ? err.name : typeof err }));
     }
   }
 
@@ -544,12 +753,12 @@ export async function runPoll(
   // Residual (accepted): if the first card posts but this poll's snapshot is
   // never saved and the controller reconnects under a new IVAO connection id
   // before the next poll, the card is never tracked and so never closed.
-  const closingKey = (event: NonceSession) =>
+  const closingKey = (event: TrackedAtc) =>
     event.firstSessionId === undefined ? undefined : `${event.userId}:${event.callsign}:${event.firstSessionId}`;
   const closing = new Set([
-    ...previousPendingOffline.map((job) => job.event), ...wentOffline, ...excludedClosures,
-  ].map((event) => closingKey(event as NonceSession)));
-  for (const session of Object.values(next) as NonceSession[]) {
+    ...previousJobs.map((job) => job.event), ...wentOffline, ...excludedClosures,
+  ].map(closingKey));
+  for (const session of Object.values(next)) {
     if (session.since === nowIso && session.firstSessionId === undefined &&
         Number.isSafeInteger(session.sessionId) && session.sessionId > 0 &&
         !closing.has(`${session.userId}:${session.callsign}:${session.sessionId}`)) {
@@ -567,14 +776,14 @@ export async function runPoll(
   // a notification for every controller that is already online.
   if (stored === null) {
     console.log(JSON.stringify({ event: 'state_seeded', online: current.length }));
-    // Mark every seeded entry as never-carded, the same invariant `close()`
+    // Mark every seeded entry as never-carded, the same invariant `offlineEventFor`
     // relies on for a failed announcement: without it, a seeded session that
     // later disconnects would silently earn a fallback OFFLINE post despite
     // never having had a real ONLINE card.
     for (const session of Object.values(next)) session.pendingChannelIds ??= [];
     return {
       state: next, rosterMessages: previousRosterMessages, rosterPostAttempts: previousRosterPostAttempts,
-      pendingOffline: previousPendingOffline, rolePings: previousRolePings,
+      pendingOffline: previousJobs, rolePings: previousRolePings,
     };
   }
 
@@ -589,149 +798,32 @@ export async function runPoll(
     newlyOnline = [];
   }
 
-  let attempted = 0;
-  let delivered = 0;
-  let deliveryFailed = false;
-  const coverage = current.map((atc) => (Object.hasOwn(next, atc.callsign) ? next[atc.callsign] : undefined) ?? atc);
-  const mentionedChannels = new Set<string>();
-
   // Close out sessions that ended before announcing any that just started,
   // so a callsign that goes offline and a replacement taking it over the
   // same poll are never shown online before their predecessor's closeout.
-  const nowMs = Date.parse(nowIso);
-  // A job whose end time cannot be read is treated as current, never expired.
-  const endedMs = (job: PendingOffline) => {
-    const ended = Date.parse(job.event.endedAt);
-    return Number.isFinite(ended) ? ended : nowMs;
-  };
-  // A long outage must not grow the snapshot without bound: a closeout older
-  // than a day (for example after a long polling outage) still gets this
-  // poll's delivery attempt, and is given up on only if it stays undelivered.
-  const expired = (job: PendingOffline) => nowMs - endedMs(job) > OFFLINE_JOB_MAX_AGE_MS;
-  const isConfigured = (id: string) => channelIds.includes(id);
-  // Destinations in a channel removed from DISCORD_CHANNEL_IDS are never
-  // written to, but are kept untouched with their job until it expires (like
-  // roster pages), so configuring the channel again still closes the card.
-  const parked = new Map<PendingOffline, ParkedDestinations>();
-  const split = (
-    job: PendingOffline, attemptsByChannel: Record<string, number> = {}, legacyAttempts = 0,
-  ): PendingOffline => {
-    // Card content and post times are never needed to close a card.
-    const refs = job.messages.map(({ channelId, messageId }) => ({ channelId, messageId }));
-    const recover = Object.entries(job.recoverPosts ?? {});
-    const active = {
-      messages: refs.filter((ref) => isConfigured(ref.channelId)),
-      channelIds: job.channelIds.filter(isConfigured),
-      recoverPosts: Object.fromEntries(recover.filter(([id]) => isConfigured(id))),
-    };
-    const kept = {
-      messages: refs.filter((ref) => !isConfigured(ref.channelId)),
-      channelIds: job.channelIds.filter((id) => !isConfigured(id)),
-      recoverPosts: Object.fromEntries(recover.filter(([id]) => !isConfigured(id))),
-    };
-    // A retry counter for a destination no longer in any list (already
-    // resolved) is stale bookkeeping; a parked one keeps its count, including
-    // a legacy shared counter it has not imported yet.
-    const attemptsFor = (destinations: typeof active, legacy: number): Record<string, number> => {
-      const ids = new Set([
-        ...destinations.messages.map((ref) => ref.channelId), ...destinations.channelIds,
-        ...Object.keys(destinations.recoverPosts),
-      ]);
-      return Object.fromEntries([...ids].flatMap((id): [string, number][] =>
-        Object.hasOwn(attemptsByChannel, id) ? [[id, attemptsByChannel[id]!]] : legacy ? [[id, legacy]] : []));
-    };
-    const activeAttempts = attemptsFor(active, 0);
-    const { attemptsByChannel: _oldAttempts, recoverPosts: _oldRecover, ...rest } = job;
-    const result: PendingOffline = {
-      ...rest,
-      messages: active.messages,
-      channelIds: active.channelIds,
-      ...(Object.keys(active.recoverPosts).length ? { recoverPosts: active.recoverPosts } : {}),
-      ...(Object.keys(activeAttempts).length ? { attemptsByChannel: activeAttempts } : {}),
-    };
-    if (hasDestinations(kept)) parked.set(result, { ...kept, attemptsByChannel: attemptsFor(kept, legacyAttempts) });
-    return result;
-  };
-  const jobs: PendingOffline[] = structuredClone(previousPendingOffline)
-    // This event was loaded from storage across a poll boundary, never
-    // through `diffState`'s own stripping — strip it here too.
-    .map((job) => split({ ...job, event: stripLegacyRoster(job.event) }, job.attemptsByChannel, job.attempts))
-    .filter((job) => hasDestinations(job) || parked.has(job));
-  for (const offline of [...wentOffline, ...excludedClosures]) {
-    // Both fields only track retry state for the still-open ONLINE card and
-    // are meaningless once a session has ended; strip them so a closed-out
-    // session doesn't carry stale online-card bookkeeping.
-    const {
-      messages = [], pendingChannelIds: pendingIds, onlineAttemptsByChannel: _onlineAttempts,
-      uncertainPosts = {}, ...event
-    } = offline;
-    // A session with no card and no pending marker is legacy: announce the
-    // end everywhere. Channels whose first card may exist unseen recover it.
-    // A channel whose card is tracked only needs stray copies closed; the
-    // flag survives retries, after which that card may no longer be listed.
-    const recoverPosts = Object.fromEntries(Object.entries(uncertainPosts)
-      .map(([id, window]): [string, PostWindow] => messages.some((ref) => ref.channelId === id)
-        ? [id, { ...window, closeOnly: true }] : [id, window]));
-    const job = split({
-      event,
-      // Only configured channels are written to (others are parked above);
-      // the fallback decision still sees every card the session had.
-      messages,
-      channelIds: messages.length || pendingIds ? [] : [...channelIds],
-      recoverPosts,
-    });
-    if (hasDestinations(job) || parked.has(job)) jobs.push(job);
-  }
-  let pendingOffline: PendingOffline[] = [];
-  let expiredDropped = 0;
-  const liveIds = new Set(Object.values(next).flatMap((session) => (session.messages ?? []).map((ref) => ref.messageId)));
-  const trackedIds = new Set([...liveIds, ...jobs.flatMap((job) => job.messages.map((ref) => ref.messageId))]);
-  for (const job of jobs) {
-    // An expired job is given up only once each remaining destination got a
-    // real request this poll; one deferred without a request (a cooldown
-    // started earlier this poll, say) is kept, still bounded by MAX_OFFLINE_JOBS.
-    let deferred = false;
-    if (hasDestinations(job)) {
-      attempted += job.messages.length + job.channelIds.length + Object.keys(job.recoverPosts ?? {}).length;
-      const result = await announceOffline(env, job, labels, limits, trackedIds, liveIds, channelIds);
-      delivered += result.delivered;
-      deliveryFailed ||= result.failed;
-      deferred = result.deferred;
-    }
-    const kept = parked.get(job);
-    if (kept) {
-      job.messages.push(...kept.messages);
-      job.channelIds.push(...kept.channelIds);
-      if (Object.keys(kept.recoverPosts).length) job.recoverPosts = { ...job.recoverPosts, ...kept.recoverPosts };
-      if (Object.keys(kept.attemptsByChannel).length) {
-        job.attemptsByChannel = { ...job.attemptsByChannel, ...kept.attemptsByChannel };
-      }
-    }
-    if (!hasDestinations(job)) continue;
-    if (expired(job) && !deferred) expiredDropped++;
-    else pendingOffline.push(job);
-  }
-  if (expiredDropped) {
-    console.error(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'expired', count: expiredDropped }));
-  }
-  if (pendingOffline.length > MAX_OFFLINE_JOBS) {
-    const dropped = new Set([...pendingOffline].sort((x, y) => endedMs(x) - endedMs(y))
-      .slice(0, pendingOffline.length - MAX_OFFLINE_JOBS));
-    pendingOffline = pendingOffline.filter((job) => !dropped.has(job));
-    console.error(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'limit', count: dropped.size }));
-  }
+  const base: PollBase = { env, labels, limits, nowIso, channelIds };
+  const { jobs, parked } = buildOfflineJobs(channelIds, previousJobs, [...wentOffline, ...excludedClosures]);
+  const offline = await deliverOfflineJobs(base, next, jobs, parked);
+  const { pendingOffline } = offline;
+  let attempted = offline.attempted;
+  let delivered = offline.delivered;
+  let deliveryFailed = offline.failed;
 
+  const nowMs = Date.parse(nowIso);
   const mentionCooldownMs = parseMentionCooldownMs(env.MENTION_COOLDOWN_MINUTES);
-  // Keep only configured channels still within their cooldown.
+  // Keep only configured channels still within their cooldown. A ping time
+  // in the future (clock skew or corrupt storage) is not trusted.
   const rolePings = Object.fromEntries(Object.entries(previousRolePings).filter(([id, at]) =>
-    channelIds.includes(id) && typeof at === 'number' && nowMs - at < mentionCooldownMs));
+    channelIds.includes(id) && typeof at === 'number' && at <= nowMs && nowMs - at < mentionCooldownMs));
   const ctx: PollContext = {
-    env, labels, limits, nowIso, channelIds, rolePings, mentionCooldownMs,
+    ...base, rolePings, mentionCooldownMs,
     mentionRoleId: parseMentionRole(env.MENTION_ROLE_ID),
     // The public marker reveals private approval records: shown only while
     // reminders themselves are enabled, with a valid policy and valid
     // guild/member-role IDs (the same checks that gate sending them).
     highlightPolicy: gcaRemindersEnabled(env) ? gcaPolicy : null,
+    mentionedChannels: new Set(),
+    rosterHolders: new Map(),
   };
   for (const atc of newlyOnline) next[atc.callsign]!.pendingChannelIds = channelIds;
   const announcements = Object.values(next)
@@ -741,76 +833,21 @@ export async function runPoll(
   // Cards posted this poll share the newest postedAt, and newestCardedSession
   // breaks that tie in favour of the later entry: the last poster per channel
   // is expected to hold the roster.
-  const lastPoster = new Map<string, TrackedAtc>();
-  for (const { entry, targets } of announcements) for (const id of targets) lastPoster.set(id, entry);
+  for (const { entry, targets } of announcements) for (const id of targets) ctx.rosterHolders.set(id, entry);
+  const coverage = current.map((atc) => (Object.hasOwn(next, atc.callsign) ? next[atc.callsign] : undefined) ?? atc);
   for (const { entry, targets } of announcements) {
     attempted += targets.length;
-    const holderChannels = new Set(targets.filter((id) => lastPoster.get(id) === entry));
     // No destination left needing a first card: skip building/posting
-    // embeds and just run the bookkeeping below.
-    const { posted, failed, unconfirmed } = targets.length
-      ? await announceOnline(ctx, entry, targets, mentionedChannels, coverage, holderChannels,
+    // embeds and just run the bookkeeping.
+    const outcome: FirstCardOutcome = targets.length
+      ? await announceOnline(ctx, entry, targets, coverage,
         // A session first seen before this poll may have used its nonce in an
         // earlier attempt, even one whose state was never saved.
         entry.since !== nowIso)
-      : { posted: [] as PostedMessage[], failed: new Map<string, unknown>(), unconfirmed: new Set<string>() };
-    delivered += posted.length + unconfirmed.size;
-    if (failed.size) deliveryFailed = true;
-    if (posted.length) {
-      entry.messages = [...(entry.messages ?? []), ...posted];
-      entry.cardAt ??= nowIso;
-    }
-    // A destination that keeps failing to receive the first card is dropped
-    // after the same retry budget as an offline closeout's fallback post
-    // (which likewise has no message to discover "gone"). Only a definite
-    // Discord-side rejection (4xx, excluding the 429 rate-limit deferral)
-    // counts towards that budget; a 5xx outage, a timeout/network error, or
-    // a rate-limit deferral is transient and retried indefinitely instead.
-    // Rebuilt from `targets` only (not copied wholesale) so a destination
-    // that fell out of `targets` (channel removed, or its card finally
-    // landed) never leaves a stale counter behind.
-    const previousAttempts = entry.onlineAttemptsByChannel ?? {};
-    const attempts: Record<string, number> = {};
-    const kept: string[] = [];
-    const uncertain: Record<string, PostWindow> = { ...entry.uncertainPosts };
-    const markUncertain = (id: string) => {
-      const now = Date.now();
-      uncertain[id] = { from: uncertain[id]?.from ?? now, to: now };
-    };
-    for (const id of targets) {
-      // A card that finally posted keeps any uncertain window: an earlier
-      // copy outside Discord's nonce window is still found and closed at the end.
-      if (posted.some((ref) => ref.channelId === id)) continue;
-      // A 2xx-but-unconfirmed destination is dropped outright, same as
-      // one that just exhausted its budget below — never retried, and never
-      // given a counter; its card exists, so it is closed out at the end.
-      if (unconfirmed.has(id)) { markUncertain(id); continue; }
-      const err = failed.get(id);
-      // A 5xx or thrown fetch error may hide a card Discord did create.
-      if (!(err instanceof DiscordRateLimitError) && !countsAgainstBudget(err)) markUncertain(id);
-      const counts = countsAgainstBudget(err);
-      const used = (previousAttempts[id] ?? 0) + (counts ? 1 : 0);
-      if (!counts || used <= OFFLINE_RETRY_POLLS) {
-        attempts[id] = used;
-        kept.push(id);
-      } else {
-        console.error(JSON.stringify({
-          event: 'online_post_abandoned', callsign: entry.callsign, channelIndex: channelIndex(channelIds, id),
-        }));
-      }
-    }
-    if (Object.keys(attempts).length) entry.onlineAttemptsByChannel = attempts;
-    else delete entry.onlineAttemptsByChannel;
-    // A window in a channel removed from DISCORD_CHANNEL_IDS is kept: at close
-    // it is parked with the closeout, so configuring the channel again still
-    // finds and closes a card that landed unseen there.
-    if (Object.keys(uncertain).length) entry.uncertainPosts = uncertain;
-    else delete entry.uncertainPosts;
-    entry.pendingChannelIds = kept;
-    if (entry.pendingChannelIds.length) deliveryFailed = true;
-    else if (entry.messages?.length) delete entry.pendingChannelIds;
-    // Keep an empty pending marker if no card was ever sent, so disconnect
-    // cannot manufacture an offline notice after destinations are removed.
+      : { posted: [], failed: new Map(), unconfirmed: new Set() };
+    delivered += outcome.posted.length + outcome.unconfirmed.size;
+    if (outcome.failed.size) deliveryFailed = true;
+    if (recordFirstCardOutcome(ctx, entry, targets, outcome)) deliveryFailed = true;
   }
 
   const cards = await syncOnlineCards(ctx, next, current);

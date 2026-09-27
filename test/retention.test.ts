@@ -4,7 +4,7 @@ import { afterEach, expect, it } from 'vitest';
 import { COORDINATOR_NAME } from '../src/config';
 import { PollCoordinator } from '../src/coordinator';
 import { cleanupGcaCopies } from '../src/retention';
-import { HISTORY_AUTH_HEADERS } from './helpers';
+import { HISTORY_AUTH_HEADERS, seedGca } from './helpers';
 
 const headers = HISTORY_AUTH_HEADERS;
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
@@ -12,17 +12,17 @@ const endpoint = 'https://example.com/gca-history/cleanup';
 const now = Date.now();
 afterEach(reset);
 
+const REMINDER = 'INSERT INTO gca_reminders (session_key, status, last_seen, attempts) VALUES (?, ?, ?, ?)';
+const OCCURRENCE = 'INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, ?, ?)';
+const COPY = 'INSERT INTO gca_copies (session_key, payload, recipient_id, status) VALUES (?, ?, ?, ?)';
+
 async function seed(count = 1) {
-  await runInDurableObject(stub(), (_, ctx) => {
-    const sql = ctx.storage.sql;
-    sql.exec('CREATE TABLE gca_reminders (session_key TEXT PRIMARY KEY, status TEXT, last_seen INTEGER, attempts INTEGER)');
-    sql.exec('CREATE TABLE gca_occurrences (session_key TEXT PRIMARY KEY, occurrence INTEGER)');
-    sql.exec('CREATE TABLE gca_copies (session_key TEXT PRIMARY KEY, payload TEXT, recipient_id TEXT, status TEXT)');
+  await seedGca((sql) => {
     for (let i = 0; i < count; i++) {
       const key = `600001:${1000 + i}`;
-      sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, ?)', key, 'sent', now - 31 * 86_400_000, 1);
-      sql.exec('INSERT INTO gca_occurrences VALUES (?, ?)', key, i + 1);
-      sql.exec('INSERT INTO gca_copies VALUES (?, ?, ?, ?)', key, 'synthetic message', 'synthetic recipient', 'pending');
+      sql.exec(REMINDER, key, 'sent', now - 31 * 86_400_000, 1);
+      sql.exec(OCCURRENCE, key, 600001, i + 1);
+      sql.exec(COPY, key, 'synthetic message', 'synthetic recipient', 'pending');
     }
   });
 }
@@ -52,10 +52,10 @@ it('keeps recent copies, copies without known age, and nonterminal reminders', a
       ['600002:1', 'sent', now - 30 * 86_400_000],
       ['600003:1', 'pending', now - 40 * 86_400_000],
     ] as const) {
-      sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, 0)', key, status, lastSeen);
-      sql.exec("INSERT INTO gca_copies VALUES (?, 'payload', 'recipient', 'pending')", key);
+      sql.exec(REMINDER, key, status, lastSeen, 0);
+      sql.exec(COPY, key, 'payload', 'recipient', 'pending');
     }
-    sql.exec("INSERT INTO gca_copies VALUES ('600004:1', 'payload', 'recipient', 'reserved')");
+    sql.exec(COPY, '600004:1', 'payload', 'recipient', 'reserved');
     expect(cleanupGcaCopies(ctx.storage, true, now)).toMatchObject({ deleted: 1 });
     expect(sql.exec('SELECT * FROM gca_copies').toArray()).toHaveLength(3);
   });
@@ -67,18 +67,18 @@ it('also removes recent unsent copies addressed to anyone but the current staff 
   await seed(0);
   await runInDurableObject(stub(), (_instance, ctx) => {
     const sql = ctx.storage.sql;
-    for (const [key, recipient, status] of [
+    for (const [i, [key, recipient, status]] of ([
       ['600002:1', PREVIOUS, 'pending'], ['600002:2', PREVIOUS, 'reserved'], ['600002:3', PREVIOUS, 'sent'],
       ['600002:4', CURRENT, 'pending'],
-    ] as const) {
-      sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, 1)', key, 'sent', now);
-      sql.exec('INSERT INTO gca_occurrences VALUES (?, 1)', key);
-      sql.exec("INSERT INTO gca_copies VALUES (?, 'payload', ?, ?)", key, recipient, status);
+    ] as const).entries()) {
+      sql.exec(REMINDER, key, 'sent', now, 1);
+      sql.exec(OCCURRENCE, key, 600002, i + 1);
+      sql.exec(COPY, key, 'payload', recipient, status);
     }
     // C9: orphan copies (no parent reminder row). The age rule keeps them, but
     // the recipient rule removes an unsent one for a previous account anyway.
-    sql.exec("INSERT INTO gca_copies VALUES ('600003:1', 'payload', ?, 'pending'), ('600003:2', 'payload', ?, 'pending')",
-      PREVIOUS, CURRENT);
+    sql.exec(COPY, '600003:1', 'payload', PREVIOUS, 'pending');
+    sql.exec(COPY, '600003:2', 'payload', CURRENT, 'pending');
     // Without a valid current account only the age rule applies.
     expect(cleanupGcaCopies(ctx.storage, true, now, '')).toMatchObject({ deleted: 0 });
     expect(cleanupGcaCopies(ctx.storage, true, now, 'not-an-id')).toMatchObject({ deleted: 0 });

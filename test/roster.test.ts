@@ -3,20 +3,13 @@ import { findBotReplies } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
 import { syncRosterMessages } from '../src/roster';
 import type { RosterPostAttempt } from '../src/types';
+import { BOT_ID, BOT_TOKEN as TOKEN, snowflakeAt as idAt } from './helpers';
 
-// The first token segment is base64 of the bot's synthetic user id.
-const BOT_ID = '100000000000000009';
-const TOKEN = `${btoa(BOT_ID)}.synthetic.token`;
 const NOW = 1_800_000_000_000;
 const WINDOW = { from: NOW - 120_000, to: NOW - 60_000 };
 
 beforeEach(() => { vi.spyOn(Date, 'now').mockReturnValue(NOW); });
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
-
-/** A snowflake for a synthetic message created at the given time. */
-function idAt(ms: number, n = 0): string {
-  return ((BigInt(ms - 1_420_070_400_000) << 22n) + BigInt(n)).toString();
-}
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 function reply(id: string, parent: string, author = BOT_ID) {
   return { id, author: { id: author }, message_reference: { message_id: parent } };
@@ -108,8 +101,14 @@ it.each([
   { status: 503, kept: true },
   { status: 403, kept: false },
 ])('keeps sweeping after a transient failure but gives up on a 4xx (%j)', async ({ status, kept }) => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   stubDiscord(() => Response.json({ code: 0 }, { status }));
-  const result = await syncRosterMessages(TOKEN, [], [], new DiscordRateLimits(), [dropped({ abandoned: true })]);
+  const pending = syncRosterMessages(TOKEN, [], [], new DiscordRateLimits(), [dropped({ abandoned: true })]);
+  // A 5xx scan is retried in-request with backoff: advance it instead of waiting.
+  await vi.advanceTimersByTimeAsync(4_000);
+  const result = await pending;
+  // C20: a failed sweep fails the poll like any other roster update.
+  expect(result.failed).toBe(true);
   // Only the time window is kept, so a returning parent posts the page fresh.
   expect(result.postAttempts).toEqual(kept ? [dropped({ nonceKey: undefined })].map(({ nonceKey: _n, ...rest }) => rest) : []);
 });
@@ -139,11 +138,14 @@ it('records when a post may have landed unseen, but not for a definite rejection
 
 it('logs roster failures by configured channel index, never channel or message IDs', async () => {
   const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-  stubDiscord(() => Response.json({ code: 50013 }, { status: 403 }));
-  await syncRosterMessages(TOKEN, [{ channelId: '100000000000000321', parentMessageId: 'old-parent', page: 0, messageId: 'page-id' }],
+  const requests = stubDiscord(() => Response.json({ code: 50013 }, { status: 403 }));
+  const pageId = idAt(WINDOW.from, 5);
+  await syncRosterMessages(TOKEN, [{ channelId: '100000000000000321', parentMessageId: 'old-parent', page: 0, messageId: pageId }],
     [], new DiscordRateLimits(), [dropped()], ['other', '100000000000000321']);
+  // The delete reaches Discord and is refused there.
+  expect(requests).toContain(`DELETE /channels/100000000000000321/messages/${pageId}`);
   const logs = error.mock.calls.map((call) => String(call[0]));
   expect(logs).toContainEqual(expect.stringContaining('"event":"roster_continuation_failed","operation":"delete","channelIndex":1'));
   expect(logs).toContainEqual(expect.stringContaining('"event":"roster_orphan_sweep_failed","channelIndex":1'));
-  expect(logs.filter((line) => /"100000000000000321"|old-parent|page-id/.test(line))).toEqual([]);
+  expect(logs.filter((line) => ['100000000000000321', 'old-parent', pageId].some((id) => line.includes(id)))).toEqual([]);
 });

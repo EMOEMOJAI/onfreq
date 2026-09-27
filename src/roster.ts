@@ -1,8 +1,8 @@
 import {
-  deleteMessage, DiscordApiError, DiscordUnconfirmedPostError, editMessage, findBotReplies, messageNonce, postMessage,
-  type DiscordEmbed,
+  countsAgainstBudget, deleteMessage, DiscordApiError, DiscordUnconfirmedPostError, editMessage, findBotReplies,
+  messageNonce, postMessage, type DiscordEmbed,
 } from './discord';
-import { countsAgainstBudget, type RosterMessage, type RosterPostAttempt } from './types';
+import type { RosterMessage, RosterPostAttempt } from './types';
 import { DiscordRateLimitError, type DiscordRateLimits } from './discord-rate-limit';
 
 export interface RosterTarget {
@@ -12,11 +12,26 @@ export interface RosterTarget {
   embeds?: DiscordEmbed[];
 }
 
-/** Extra polls an undeletable or permanently failing roster page is retried for before it is given up on. */
-const DELETE_RETRY_POLLS = 10;
+/**
+ * Extra polls a destination Discord definitely rejects (`countsAgainstBudget`)
+ * is retried for before it is given up on: an online first card, an offline
+ * closeout, or a roster page edit, post or delete.
+ */
+export const REJECTION_RETRY_POLLS = 10;
+
+/**
+ * The failure count after `err`, and whether to keep retrying. Only a
+ * definite rejection counts (unless `charge` is false: already counted this
+ * poll); a 5xx, a timeout or a rate-limit deferral is retried indefinitely.
+ */
+export function nextBudget(previous: number, err: unknown, charge = true): { used: number; keep: boolean } {
+  const counts = countsAgainstBudget(err);
+  const used = previous + (counts && charge ? 1 : 0);
+  return { used, keep: !counts || used <= REJECTION_RETRY_POLLS };
+}
 
 /** A failed POST that may still have created its message (a 5xx, a timeout, or a 2xx without an id). */
-function mayHavePosted(err: unknown): boolean {
+export function mayHavePosted(err: unknown): boolean {
   return err instanceof DiscordUnconfirmedPostError ||
     (!(err instanceof DiscordRateLimitError) && !countsAgainstBudget(err));
 }
@@ -76,12 +91,10 @@ export async function syncRosterMessages(
       await deleteMessage(botToken, ref.channelId, ref.messageId, limits);
     } catch (err) {
       // A permanently forbidden channel (403) must not be retried every poll
-      // forever: cap it the same way every other roster/offline budget is,
-      // via the shared 4xx-only predicate.
-      const counts = countsAgainstBudget(err);
-      const used = (ref.deleteAttempts ?? 0) + (counts ? 1 : 0);
+      // forever: cap it the same way every other roster/offline budget is.
+      const { used, keep } = nextBudget(ref.deleteAttempts ?? 0, err);
       logFailure('delete', ref.channelId, err);
-      if (!counts || used <= DELETE_RETRY_POLLS) {
+      if (keep) {
         messages.push({ ...ref, deleteAttempts: used });
       } else {
         console.error(JSON.stringify({ event: 'roster_delete_abandoned', channelIndex: logIndex(ref.channelId) }));
@@ -107,10 +120,9 @@ export async function syncRosterMessages(
       // way an undeletable continuation is, excluding rate-limit deferrals
       // and 5xx/timeouts via the shared predicate.
       const giveUp = (err: unknown): void => {
-        const counts = countsAgainstBudget(err);
         if (index >= 0) {
-          const used = (messages[index]!.pageAttempts ?? 0) + (counts ? 1 : 0);
-          if (!counts || used <= DELETE_RETRY_POLLS) {
+          const { used, keep } = nextBudget(messages[index]!.pageAttempts ?? 0, err);
+          if (keep) {
             messages[index] = { ...messages[index]!, pageAttempts: used };
             return;
           }
@@ -125,12 +137,12 @@ export async function syncRosterMessages(
         // This page has never once posted successfully: give it the
         // same budget via the sibling attempt map instead.
         const previousAttempt = postAttemptsByKey.get(key);
-        const used = (previousAttempt?.attempts ?? 0) + (counts ? 1 : 0);
+        const { used, keep } = nextBudget(previousAttempt?.attempts ?? 0, err);
         const entry = markMaybePosted(
           { channelId: target.channelId, parentMessageId: target.parentMessageId, page, attempts: used, nonceKey },
           previousAttempt, err,
         );
-        if (!counts || used <= DELETE_RETRY_POLLS) {
+        if (keep) {
           postAttemptsByKey.set(key, entry);
           return;
         }
@@ -225,6 +237,7 @@ export async function syncRosterMessages(
         if (!tracked.has(id)) await deleteMessage(botToken, channelId, id, limits);
       }
     } catch (err) {
+      failed = true;
       console.error(JSON.stringify({ event: 'roster_orphan_sweep_failed', channelIndex: logIndex(channelId), error: String(err) }));
       // Keep only the time windows: should the parent be shown again, its
       // pages post fresh rather than stay frozen with stale content.

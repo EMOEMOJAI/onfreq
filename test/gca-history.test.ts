@@ -4,23 +4,24 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { COORDINATOR_NAME } from '../src/config';
 import { resetConfigInvalidLogForTests } from '../src/auth';
-import { AUTH_HEADERS, HISTORY_AUTH_HEADERS } from './helpers';
+import { AUTH_HEADERS, callRoute, HISTORY_AUTH_HEADERS, HISTORY_ONLY, POLL_ONLY, seedGca } from './helpers';
 
 const headers = HISTORY_AUTH_HEADERS;
 beforeEach(resetConfigInvalidLogForTests);
 afterEach(async () => { vi.restoreAllMocks(); await reset(); });
 
+const REMINDER = 'INSERT INTO gca_reminders (session_key, status, attempts, last_seen) VALUES (?, ?, ?, ?)';
+
 async function seed(count = 1) {
-  await runInDurableObject(env.POLL_COORDINATOR.getByName(COORDINATOR_NAME), (_instance, ctx) => {
-    const sql = ctx.storage.sql;
-    sql.exec('CREATE TABLE gca_reminders (session_key TEXT PRIMARY KEY, status TEXT, attempts INTEGER, last_seen INTEGER)');
-    sql.exec('CREATE TABLE gca_occurrences (session_key TEXT PRIMARY KEY, occurrence INTEGER)');
+  await seedGca((sql) => {
     for (let i = 0; i < count; i++) {
       const key = `600001:${123456 + i}`;
-      sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, ?)', key, 'sent', 1, 1000);
-      sql.exec('INSERT INTO gca_occurrences VALUES (?, ?)', key, i + 1);
+      sql.exec(REMINDER, key, 'sent', 1, 1000);
+      sql.exec('INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, ?, ?)', key, 600001, i + 1);
     }
-    sql.exec("INSERT INTO gca_reminders VALUES ('111111:1', 'baseline', 0, 1000), ('222222:1', 'unmapped', 0, 1000), ('333333:1', 'pending', 0, 1000)");
+    for (const [key, status] of [['111111:1', 'baseline'], ['222222:1', 'unmapped'], ['333333:1', 'pending']]) {
+      sql.exec(REMINDER, key, status, 0, 1000);
+    }
   });
 }
 
@@ -39,13 +40,9 @@ it('is disabled without the secret', async () => {
   expect(response.status).toBe(503);
 });
 
-// Synthetic, distinct secrets with explicit overrides so separation does not depend on the fixture.
-const POLL_ONLY = 'synthetic-poll-only-secret-0123456789';
-const HISTORY_ONLY = 'synthetic-history-only-secret-01234567';
 const historyRoutes = [['/gca-history', 'GET'], ['/gca-history/cleanup', 'GET'], ['/gca-history/cleanup', 'POST']] as const;
-const call = (path: string, method: string, token: string, overrides: Partial<Env>) => worker.fetch(
-  new Request(`https://example.com${path}`, { method, headers: { authorization: `Bearer ${token}`, 'x-onfreq-confirm': 'delete-old-copies' } }),
-  { ...env, ...overrides }, {} as ExecutionContext);
+const call = (path: string, method: string, token: string, overrides: Partial<Env>) =>
+  callRoute(path, method, token, overrides, { 'x-onfreq-confirm': 'delete-old-copies' });
 
 it.each(historyRoutes)('S2-1: POLL_SECRET no longer authorizes %s %s', async (path, method) => {
   await seed();
@@ -168,11 +165,9 @@ it('S20-5: pagination cursors are opaque and never carry member ids', async () =
 
 it('S20-5: pages follow stable first-detection order, independent of member ids and later updates', async () => {
   const keys = ['900009:1', '100001:5', '500005:3', '100001:2'];
-  await runInDurableObject(env.POLL_COORDINATOR.getByName(COORDINATOR_NAME), (_instance, ctx) => {
-    const sql = ctx.storage.sql;
-    sql.exec('CREATE TABLE gca_reminders (session_key TEXT PRIMARY KEY, status TEXT, attempts INTEGER, last_seen INTEGER)');
-    for (const key of keys) sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, ?)', key, 'sent', 1, 1000);
-    for (let i = 0; i < 100; i++) sql.exec('INSERT INTO gca_reminders VALUES (?, ?, ?, ?)', `700007:${i}`, 'failed', 1, 1000);
+  await seedGca((sql) => {
+    for (const key of keys) sql.exec(REMINDER, key, 'sent', 1, 1000);
+    for (let i = 0; i < 100; i++) sql.exec(REMINDER, `700007:${i}`, 'failed', 1, 1000);
   });
   const first = await (await SELF.fetch('https://example.com/gca-history', { headers })).json() as { records: { sessionKey: string }[]; nextCursor: string };
   expect(first.records.slice(0, 4).map((record) => record.sessionKey)).toEqual(keys);

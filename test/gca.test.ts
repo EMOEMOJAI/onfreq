@@ -486,9 +486,7 @@ describe('durable GCA delivery', () => {
     expect(titles()).toHaveLength(1);
     // The member's first received warning is never labelled a repeat.
     expect(titles()[0]).not.toContain('occurrence');
-    const rows = await runInDurableObject(stub(), (_instance, ctx) =>
-      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences').toArray());
-    expect(rows).toEqual([{ session_key: '600001:2', occurrence: 1 }]);
+    expect(await occurrences()).toEqual([{ session_key: '600001:2', occurrence: 1 }]);
   });
 
   it('checks lowercase callsigns the same way as the public marker', async () => {
@@ -640,9 +638,7 @@ describe('durable GCA delivery', () => {
       await check([atc()]);
       expect(sent).toHaveLength(1);
       expect((await statuses())[0]).toMatchObject({ status: outcome, attempts: 1 });
-      const rows = await runInDurableObject(stub(), (_instance, ctx) =>
-        ctx.storage.sql.exec('SELECT session_key FROM gca_occurrences').toArray());
-      expect(rows).toHaveLength(counted ? 1 : 0);
+      expect(await occurrences()).toHaveLength(counted ? 1 : 0);
       now += 3_600_000;
       await check([atc()]);
       expect(sent).toHaveLength(1);

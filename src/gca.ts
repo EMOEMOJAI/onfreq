@@ -1,5 +1,5 @@
 import { EMBED_FOOTER, firOf, type FirLabel } from './config';
-import { escapeMarkdown, type DiscordEmbed } from './discord';
+import { escapeMarkdown, isSnowflake, type DiscordEmbed } from './discord';
 import { DiscordRateLimitError, DiscordRateLimits, type DiscordRateLimitReason } from './discord-rate-limit';
 import { ResponseTooLargeError } from './http';
 import { hasFrequency } from './ivao';
@@ -275,7 +275,7 @@ export function parseGcaPolicy(env: Env): GcaPolicy | null {
     return null;
   }
   const verifiedRoleId = env.GCA_VERIFIED_ROLE_ID?.trim();
-  if (verifiedRoleId && !/^\d{17,20}$/.test(verifiedRoleId)) {
+  if (verifiedRoleId && !isSnowflake(verifiedRoleId)) {
     console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'verified_role' }));
     return null;
   }
@@ -425,7 +425,7 @@ async function openDm(limits: DiscordRateLimits, token: string, recipient: strin
     // than permanently drop the reminder.
     throw new Error('Unparseable DM channel response');
   }
-  if (typeof channel.id !== 'string' || !/^\d{17,20}$/.test(channel.id) ||
+  if (!isSnowflake(channel.id) ||
       channel.type !== 1 || !Array.isArray(channel.recipients) ||
       channel.recipients.length !== 1 || channel.recipients[0]?.id !== recipient) {
     // Deterministic for this VID/channel: retrying wastes a round trip every poll.
@@ -437,7 +437,7 @@ async function openDm(limits: DiscordRateLimits, token: string, recipient: strin
 function isMember(value: unknown): value is GuildMember {
   if (!value || typeof value !== 'object') return false;
   const m = value as Partial<GuildMember>;
-  return !!m.user && typeof m.user.id === 'string' && /^\d{17,20}$/.test(m.user.id) &&
+  return !!m.user && isSnowflake(m.user.id) &&
     (m.user.bot === undefined || typeof m.user.bot === 'boolean') &&
     (m.nick === undefined || m.nick === null || typeof m.nick === 'string') &&
     Array.isArray(m.roles) && m.roles.every((role) => typeof role === 'string');
@@ -508,7 +508,7 @@ function rateLimitDetail(err: unknown): { reason?: DiscordRateLimitReason; reque
 }
 
 /** Same schema, created idempotently from whichever path (reminders or copies) runs first. */
-function ensureGcaSchema(sql: SqlStorage): void {
+export function ensureGcaSchema(sql: SqlStorage): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS gca_reminders (
     session_key TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
@@ -585,7 +585,7 @@ function updateSessionsAndCollectCandidates(
 }
 
 function validGuildAndRole(env: Env): boolean {
-  return /^\d{17,20}$/.test(env.GCA_DISCORD_GUILD_ID ?? '') && /^\d{17,20}$/.test(env.GCA_MEMBER_ROLE_ID ?? '');
+  return isSnowflake(env.GCA_DISCORD_GUILD_ID) && isSnowflake(env.GCA_MEMBER_ROLE_ID);
 }
 
 /**
@@ -671,7 +671,7 @@ function recordSent(
   const sql = storage.sql;
   storage.transactionSync(() => {
     sql.exec("UPDATE gca_reminders SET status = 'sent' WHERE session_key = ?", key);
-    if (/^\d{17,20}$/.test(env.GCA_COPY_USER_ID ?? '') && env.GCA_COPY_USER_ID !== recipient) {
+    if (isSnowflake(env.GCA_COPY_USER_ID) && env.GCA_COPY_USER_ID !== recipient) {
       // Save the exact sent embed: later retries must not rebuild it from a new feed/profile.
       sql.exec(`INSERT OR IGNORE INTO gca_copies (session_key, recipient_id, payload, status)
         VALUES (?, ?, ?, 'pending')`, key, env.GCA_COPY_USER_ID,
@@ -790,7 +790,7 @@ async function sendMemberReminders(
 type CopyRow = ReminderRow & { session_key: string; recipient_id: string; payload: string };
 
 async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits, deadline: number): Promise<void> {
-  if (!/^\d{17,20}$/.test(env.GCA_COPY_USER_ID ?? '') ||
+  if (!isSnowflake(env.GCA_COPY_USER_ID) ||
       await readBackoff(storage, BACKOFF_KEY, Date.now()) > Date.now()) return;
   const sql = storage.sql;
   ensureGcaSchema(sql);

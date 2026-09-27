@@ -13,6 +13,7 @@ import {
   resetTokenCache,
 } from '../src/ivao';
 import { diffState } from '../src/state';
+import { fakeKv, ivaoAuth as auth } from './helpers';
 import type { IvaoAtcSummaryEntry, StateMap } from '../src/types';
 
 describe('parsePrefixes', () => {
@@ -96,22 +97,6 @@ describe('isDivisionCallsign', () => {
 });
 
 describe('getAccessToken', () => {
-  function fakeKv() {
-    const store = new Map<string, string>();
-    return {
-      store,
-      get: vi.fn(async (key: string) => {
-        const raw = store.get(key);
-        return raw ? JSON.parse(raw) : null;
-      }),
-      put: vi.fn(async (key: string, value: string) => void store.set(key, value)),
-      delete: vi.fn(async (key: string) => void store.delete(key)),
-    };
-  }
-
-  function auth(kv: ReturnType<typeof fakeKv>) {
-    return { clientId: 'id', clientSecret: 'secret', kv: kv as unknown as KVNamespace };
-  }
 
   function tokenResponse(token: string, expiresIn = 1800) {
     return Response.json({ access_token: token, token_type: 'Bearer', expires_in: expiresIn });
@@ -402,22 +387,6 @@ describe('normalizeAtc', () => {
 });
 
 describe('fetchDivisionAtc', () => {
-  function fakeKv(initial: Record<string, unknown> = {}) {
-    const store = new Map<string, string>(Object.entries(initial).map(([k, v]) => [k, JSON.stringify(v)]));
-    return {
-      store,
-      get: vi.fn(async (key: string) => {
-        const raw = store.get(key);
-        return raw ? JSON.parse(raw) : null;
-      }),
-      put: vi.fn(async (key: string, value: string) => void store.set(key, value)),
-      delete: vi.fn(async (key: string) => void store.delete(key)),
-    };
-  }
-
-  function auth(kv: ReturnType<typeof fakeKv>) {
-    return { clientId: 'id', clientSecret: 'secret', kv: kv as unknown as KVNamespace };
-  }
 
   function rawEntry(over: Record<string, unknown> = {}): Record<string, unknown> {
     return {

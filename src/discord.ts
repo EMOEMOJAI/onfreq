@@ -416,6 +416,18 @@ export class DiscordApiError extends Error {
 }
 
 /**
+ * A definite Discord-side rejection (a 4xx `DiscordApiError`; a 429 throws a
+ * `DiscordRateLimitError` instead) counts against a bounded retry budget.
+ * A 5xx (a `DiscordApiError` with status 500 or above), a timeout/network
+ * error, or a rate-limit deferral is transient and retried indefinitely.
+ * Shared by the online first-card budget, the offline closeout budget, and
+ * the roster page budgets so they agree on what "permanent" means.
+ */
+export function countsAgainstBudget(err: unknown): boolean {
+  return err instanceof DiscordApiError && err.status >= 400 && err.status <= 499;
+}
+
+/**
  * Discord answered with a body over the response cap (a channel scan whose
  * messages were stuffed with large content, say). Discord is reachable, so
  * this never marks an outage; it is classified as a definite 4xx-like
