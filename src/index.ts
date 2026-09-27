@@ -109,12 +109,13 @@ export default {
       if (request.method !== 'GET') return new Response('Use GET', { status: 405, headers: { ...headers, allow: 'GET' } });
       const denied = await requireSecret(request, env, 'HISTORY_SECRET', { error: 'history endpoint disabled' }, { error: 'unauthorized' }, headers);
       if (denied) return denied;
+      // Opaque numeric cursor only: member ids must never appear in request URLs.
       const after = url.searchParams.get('after') ?? '';
-      if (after && !/^\d{1,16}:\d{1,16}$/.test(after)) {
+      if (after && !/^\d{1,12}$/.test(after)) {
         return Response.json({ error: 'invalid cursor' }, { status: 400, headers });
       }
       try {
-        const history = await getCoordinator(env).getGcaHistory(after);
+        const history = await getCoordinator(env).getGcaHistory(after ? Number(after) : 0);
         return Response.json({ ...history, note: 'lastSeenAt is the last observed connection time, not the delivery time. Failed/reserved attempts may have delivered; counts are detections, not confirmed offences.' }, { headers });
       } catch {
         // History responses must never expose stored errors or identifiers.
