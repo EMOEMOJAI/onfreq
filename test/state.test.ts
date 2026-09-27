@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { diffState, loadPendingOffline, loadSessions, newestCardedSession } from '../src/state';
-import type { OnlineAtc, PendingOffline, StateMap, TrackedAtc } from '../src/types';
+import {
+  diffState, loadPendingOffline, loadRolePings, loadRosterMessages, loadRosterPostAttempts, loadSessions,
+  newestCardedSession,
+} from '../src/state';
+import type { OnlineAtc, PendingOffline, RosterMessage, RosterPostAttempt, StateMap, TrackedAtc } from '../src/types';
 
 const NOW = '2026-08-16T12:00:00.000Z';
 const EARLIER = '2026-08-16T10:30:00.000Z';
@@ -244,6 +247,77 @@ describe('loading stored state', () => {
     expect(error.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
       { event: 'sessions_dropped', reason: 'invalid', count: 3 },
       { event: 'offline_jobs_dropped', reason: 'invalid', count: 4 },
+    ]);
+    vi.restoreAllMocks();
+  });
+
+  it('C58: strips a legacy roster field from a stored closeout event', () => {
+    const event = { ...tracked('QCTT_TWR'), endedAt: NOW, durationSeconds: 60, roster: true };
+    const [loaded] = loadPendingOffline([{ event, messages: [], channelIds: [] }]);
+    expect(loaded).toBeDefined();
+    expect(loaded!.event).not.toHaveProperty('roster');
+    expect(loaded!.event).toEqual({ ...tracked('QCTT_TWR'), endedAt: NOW, durationSeconds: 60 });
+  });
+
+  it('C57: drops a session or closeout job whose post window is not whole epoch ms', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const valid = tracked('QCTT_TWR', { uncertainPosts: { '900000000000000001': { from: 1_000, to: 2_000 } } });
+    const stored: StateMap = {
+      QCTT_TWR: valid,
+      QESS_APP: tracked('QESS_APP', { uncertainPosts: { '900000000000000001': { from: 1_000.5, to: 2_000 } } }),
+      QFRA_TWR: tracked('QFRA_TWR', { uncertainPosts: { '900000000000000001': { from: 1_000, to: Number.NaN } } }),
+    };
+    expect(loadSessions(stored)).toEqual({ QCTT_TWR: valid });
+    const job: PendingOffline = {
+      event: { ...tracked('QGLL_TWR'), endedAt: NOW, durationSeconds: 60 }, messages: [], channelIds: [],
+      recoverPosts: { '900000000000000001': { from: 1_000, to: 2_000 } },
+    };
+    const fractional = { ...job, recoverPosts: { '900000000000000001': { from: 1_000, to: 2_000.25 } } };
+    expect(loadPendingOffline([fractional, job])).toEqual([job]);
+    expect(error.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      { event: 'sessions_dropped', reason: 'invalid', count: 2 },
+      { event: 'offline_jobs_dropped', reason: 'invalid', count: 1 },
+    ]);
+    vi.restoreAllMocks();
+  });
+
+  it('C57: drops malformed roster pages and post attempts by count only', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const page: RosterMessage = {
+      channelId: '900000000000000001', parentMessageId: '700000000000000001', messageId: '700000000000000002', page: 0,
+    };
+    const pages = [null, page, { ...page, page: 1.5 }, { ...page, parentMessageId: undefined },
+      { ...page, messageId: 7 }, { ...page, channelId: null }, { ...page, page: '1' }];
+    expect(loadRosterMessages(pages)).toEqual([page]);
+    expect(loadRosterMessages({ 0: page })).toEqual([]);
+    const attempt: RosterPostAttempt = {
+      channelId: '900000000000000001', parentMessageId: '700000000000000001', page: 1, attempts: 0,
+      maybePostedFrom: 1_000, maybePostedTo: 2_000,
+    };
+    const neverPosted: RosterPostAttempt = { ...attempt, maybePostedFrom: undefined, maybePostedTo: undefined, attempts: 2 };
+    const attempts = [attempt, neverPosted, { ...attempt, maybePostedFrom: 1_000.5 },
+      { ...attempt, maybePostedTo: Number.NaN }, { ...attempt, maybePostedFrom: '1000' },
+      { ...attempt, maybePostedTo: 2 ** 60 }, { ...attempt, channelId: undefined }, { ...attempt, page: undefined }, 7];
+    expect(loadRosterPostAttempts(attempts)).toEqual([attempt, neverPosted]);
+    expect(error.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      { event: 'roster_messages_dropped', reason: 'invalid', count: 6 },
+      { event: 'roster_messages_dropped', reason: 'invalid', count: 1 },
+      { event: 'roster_post_attempts_dropped', reason: 'invalid', count: 7 },
+    ]);
+    // Private IDs never reach the logs.
+    expect(error.mock.calls.flat().join('')).not.toMatch(/9000|7000/);
+    vi.restoreAllMocks();
+  });
+
+  it('C57: keeps only numeric role ping times from a plain object', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(loadRolePings({ '900000000000000001': 1_000, '900000000000000002': '1000', '900000000000000003': null }))
+      .toEqual({ '900000000000000001': 1_000 });
+    expect(loadRolePings({})).toEqual({});
+    for (const stored of [null, [1_000], 1_000]) expect(loadRolePings(stored)).toEqual({});
+    expect(error.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      { event: 'role_pings_dropped', reason: 'invalid', count: 2 },
+      ...Array.from({ length: 3 }, () => ({ event: 'role_pings_dropped', reason: 'invalid', count: 1 })),
     ]);
     vi.restoreAllMocks();
   });
