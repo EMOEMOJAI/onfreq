@@ -107,18 +107,23 @@ export function privateCommitEmails(log) {
   });
 }
 
+/** Checks one file version by path, mode and blob; never prints its contents. */
+export function fileErrors(file, mode, read) {
+  if (privatePath(file)) return [`${file}: private file is tracked`];
+  if (!['100644', '100755'].includes(mode)) return [`${file}: symlink or submodule requires review`];
+  const data = read();
+  const errors = [];
+  if (/\.png$|\.jpe?g$|\.webp$/i.test(file)) {
+    const error = imagePrivacy(file, data);
+    if (error) errors.push(`${file}: ${error}`);
+  }
+  errors.push(...wranglerConfigErrors(file, data));
+  return errors;
+}
+
 export function checkPrivacy() {
   const errors = [];
-  for (const [file, { mode }] of indexedFiles()) {
-    if (privatePath(file)) { errors.push(`${file}: private file is tracked`); continue; }
-    if (!['100644', '100755'].includes(mode)) { errors.push(`${file}: symlink or submodule requires review`); continue; }
-    const data = readIndexed(file);
-    if (/\.png$|\.jpe?g$|\.webp$/i.test(file)) {
-      const error = imagePrivacy(file, data);
-      if (error) errors.push(`${file}: ${error}`);
-    }
-    errors.push(...wranglerConfigErrors(file, data));
-  }
+  for (const [file, { mode }] of indexedFiles()) errors.push(...fileErrors(file, mode, () => readIndexed(file)));
   if (git('rev-parse', '--is-shallow-repository').toString().trim() === 'true') {
     errors.push('Full reachable history is required; fetch with depth 0');
   } else {
@@ -127,9 +132,65 @@ export function checkPrivacy() {
   return errors;
 }
 
+const oid = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Revision arguments for the commits a push publishes: <local> minus the remote
+ * ref's old commit and the pushed remote's tracking refs. Only the named remote
+ * counts as public (another remote may hold private history); anything else,
+ * such as a URL or an unknown commit, is ignored, so more history is checked.
+ */
+export function rangeArgs(local, excludes, remotes, hasCommit) {
+  if (!oid.test(local ?? '') || /^0+$/.test(local)) throw new Error('Pushed commit must be a full object ID');
+  const not = [];
+  for (const exclude of excludes) {
+    if (oid.test(exclude)) { if (!/^0+$/.test(exclude) && hasCommit(exclude)) not.push(exclude); }
+    else if (remotes.includes(exclude)) not.push(`--remotes=${exclude}`);
+  }
+  return not.length ? [local, '--not', ...not] : [local];
+}
+
+/** Check every file version added or modified, and every commit email, in a pushed range. */
+export function checkRange(local, excludes) {
+  const hasCommit = (hash) => {
+    try { git('cat-file', '-e', `${hash}^{commit}`); return true; } catch { return false; }
+  };
+  const remotes = git('remote').toString().split('\n').filter(Boolean);
+  const range = rangeArgs(local, excludes, remotes, hasCommit);
+  const commits = git('rev-list', ...range).toString().split('\n').filter(Boolean);
+  const errors = [];
+  const seen = new Set();
+  for (const commit of commits) {
+    // -m compares merges with each parent, so content introduced by a merge is checked too.
+    const raw = git('diff-tree', '-r', '-m', '--root', '--no-commit-id', '--no-renames', '--diff-filter=d', '-z', commit)
+      .toString().split('\0');
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      const [, mode, , blob] = raw[i].split(' ');
+      const file = raw[i + 1];
+      if (!mode || seen.has(`${mode} ${blob} ${file}`)) continue;
+      seen.add(`${mode} ${blob} ${file}`);
+      for (const error of fileErrors(file, mode, () => git('cat-file', 'blob', blob))) {
+        errors.push(`${commit.slice(0, 12)} ${error}`);
+      }
+    }
+  }
+  errors.push(...privateCommitEmails(git('log', '--format=%H%x09%ae%x09%ce', ...range).toString()));
+  return [...new Set(errors)];
+}
+
 if (isMain(import.meta.url)) {
-  const errors = checkPrivacy();
+  const args = process.argv.slice(2);
+  let errors;
+  let scope = 'indexed files and HEAD history';
+  if (args[0] === '--range') {
+    scope = 'pushed commits';
+    try { errors = checkRange(args[1], args.slice(2)); } catch { errors = ['Could not list the pushed commits; refusing to continue']; }
+  } else if (args.length) {
+    errors = ['Usage: check-privacy.mjs [--range <local-oid> [<remote-oid-or-name>...]]'];
+  } else {
+    errors = checkPrivacy();
+  }
   for (const error of errors) console.error(error);
-  console.log(`Privacy checks: ${errors.length ? 'FAILED' : 'passed'} (indexed files and HEAD history)`);
+  console.log(`Privacy checks: ${errors.length ? 'FAILED' : 'passed'} (${scope})`);
   process.exitCode = errors.length ? 1 : 0;
 }
