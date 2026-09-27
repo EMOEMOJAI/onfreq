@@ -70,36 +70,14 @@ GCA coverage is private configuration, with no built-in region list. Set `GCA_RE
 
 `OFFLINE_GRACE_POLLS` is the only plain Wrangler variable; the default is two missed polls. Public cards retry failed destinations without resetting connection times. Offline updates retry for up to a day after the session ended; an older one, such as after a long polling outage, is dropped after one final attempt that reaches Discord; a rate-limit wait does not count. Updates for a channel removed from `DISCORD_CHANNEL_IDS` wait untouched within that day in case it is added back. More than 50 new connections in one poll are treated as a feed glitch (logged as `feed_anomaly`) and tracked silently: those sessions never get an online or offline card. Card posts carry a Discord nonce keyed to the IVAO connection being announced, so a re-send after a crash between Discord acceptance and storage is deduped by Discord within its own nonce window (a few minutes); crashes outside that window can still cause duplicates. If a first card posts but that poll's save is lost and the controller reconnects under a new IVAO connection before the next poll, that card is never tracked or closed.
 
-## Health and optional Mac fallback
+## Health
 
 `GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes, otherwise 503. It does not prove optional GCA delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters count as unset: their endpoints return 503. Authenticated routes send `Cache-Control: no-store`, and their error bodies carry a fixed `error` message. When upgrading, rotate a shorter `POLL_SECRET` and set a distinct `HISTORY_SECRET` before deploying.
-
-The Mac helper reads private files under `~/.onfreq` and logs `FAIL permissions` without polling if other accounts can access them. Create the directory:
-
-```sh
-install -d -m 700 ~/.onfreq
-```
-
-Store your HTTPS `/poll` URL in `~/.onfreq/poll-endpoint` and the URL-safe token in `~/.onfreq/poll-secret` using a local editor. Then install, or upgrade, the agent; `bootout` first unloads any existing agent:
-
-```sh
-chmod 600 ~/.onfreq/poll-endpoint ~/.onfreq/poll-secret
-launchctl bootout "gui/$(id -u)/com.onfreq.poll" 2>/dev/null || true
-mkdir -p ~/Library/Logs ~/Library/LaunchAgents
-[ ! -f ~/Library/Logs/onfreq-poll.err.log ] || chmod 600 ~/Library/Logs/onfreq-poll.err.log
-cp scripts/poll-trigger.sh ~/.onfreq/
-chmod 700 ~/.onfreq/poll-trigger.sh
-sed "s|__HOME__|$HOME|g" scripts/com.onfreq.poll.plist > "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
-chmod 600 "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.onfreq.poll.plist"
-```
-
-The agent runs every minute with `/bin/sh` while the Mac is awake and logged in. The files must be owned by your account, with no group or other access and, on macOS, no ACL entries (check with `ls -lde ~/.onfreq; ls -le ~/.onfreq`). Rerun the whole block to upgrade or move files; it preserves the endpoint and secret and avoids loading duplicate pollers.
 
 For failures, check `npm run tail` (CLI installations; otherwise Worker Logs in the Cloudflare dashboard). A 401 means the token is wrong; a 403 from Discord usually means channel permissions are missing. Never post unredacted logs publicly.
 
 ## Private history maintenance
 
-`GET /gca-history` and `/gca-history/cleanup` require `Authorization: Bearer <HISTORY_SECRET>`, a separate secret of at least 32 characters; `POLL_SECRET` does not grant access. Without it, or when it equals `POLL_SECRET`, these endpoints return 503. History is private member data; keep this token off monitors and the Mac helper.
+`GET /gca-history` and `/gca-history/cleanup` require `Authorization: Bearer <HISTORY_SECRET>`, a separate secret of at least 32 characters; `POLL_SECRET` does not grant access. Without it, or when it equals `POLL_SECRET`, these endpoints return 503. History is private member data; keep this token off monitors.
 
 Preview old staff-copy cleanup with `GET /gca-history/cleanup`. Applying it requires `POST` plus `X-Onfreq-Confirm: delete-old-copies`; it removes at most 500 eligible copies older than 30 days, plus unsent copies addressed to an account other than the current valid `GCA_COPY_USER_ID`, and may cancel pending copies. Nothing runs it automatically: run it periodically and after changing `GCA_COPY_USER_ID`. A 409 means a poll is running. It preserves reminder/occurrence ledgers and does not erase Discord messages or all member data.

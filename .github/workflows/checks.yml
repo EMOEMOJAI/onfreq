@@ -48,13 +48,13 @@ jobs:
         run: sh scripts/secret-scan.sh HEAD
 
       - name: Check POSIX shell scripts
-        run: shellcheck scripts/poll-trigger.sh scripts/pre-commit scripts/secret-scan.sh scripts/hooks/pre-commit scripts/hooks/pre-push scripts/hooks/lib/gitleaks-settings.sh
+        run: shellcheck scripts/pre-commit scripts/secret-scan.sh scripts/hooks/pre-commit scripts/hooks/pre-push scripts/hooks/lib/gitleaks-settings.sh
 
       - name: Check GitHub Actions workflows
         run: actionlint
 
-  macos-monitor:
-    name: macOS monitor and launchd checks
+  macos-hooks:
+    name: macOS Git hook checks
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -66,20 +66,13 @@ jobs:
         with:
           node-version: 24
 
-      - name: Validate launchd plists and shell syntax
+      - name: Check shell syntax
         run: |
-          plutil -lint scripts/com.onfreq.poll.plist
-          sh -n scripts/poll-trigger.sh
           sh -n scripts/pre-commit
           sh -n scripts/secret-scan.sh
           sh -n scripts/hooks/pre-commit
           sh -n scripts/hooks/pre-push
           sh -n scripts/hooks/lib/gitleaks-settings.sh
-
-      # The test harness uses temporary files and mocked curl.
-      # It never installs agents or calls production.
-      - name: Test Mac polling
-        run: node --test scripts/test-poll-trigger.mjs
 
       # Hook tests import the repository checks, which need jsonc-parser.
       - name: Install check dependencies without lifecycle scripts

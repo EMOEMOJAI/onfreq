@@ -7,7 +7,7 @@ Use it to show controller connections, disconnections and flight information reg
 ## Documentation
 
 - [Overview](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/README.md): Features and contribution workflow.
-- [Setup](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/docs/setup.md): Deploy to Cloudflare guided setup, manual deployment, health checks, an optional Mac polling fallback and maintenance.
+- [Setup](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/docs/setup.md): Deploy to Cloudflare guided setup, manual deployment, health checks and maintenance.
 - [Optional settings](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/config/optional-secrets.example): Private configuration formats for optional features.
 - [Agent instructions](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/AGENTS.md): Source map, commands, privacy rules and implementation invariants shared across coding tools.
 - [Security](https://raw.githubusercontent.com/EMOEMOJAI/onfreq/main/SECURITY.md): Sensitive reporting and data retention.

@@ -4,11 +4,11 @@ TypeScript Discord bot on Cloudflare Workers. Read [README.md](README.md) and [s
 
 ## Source map
 
-[src/index.ts](src/index.ts) routes HTTP and cron events; [src/coordinator.ts](src/coordinator.ts) serializes polling. [src/poll.ts](src/poll.ts), [src/state.ts](src/state.ts) and [src/roster.ts](src/roster.ts) handle notification delivery. [src/gca.ts](src/gca.ts) handles optional reminders. Tests live in [test/](test/); deployment and Mac helpers live in [scripts/](scripts/).
+[src/index.ts](src/index.ts) routes HTTP and cron events; [src/coordinator.ts](src/coordinator.ts) serializes polling. [src/poll.ts](src/poll.ts), [src/state.ts](src/state.ts) and [src/roster.ts](src/roster.ts) handle notification delivery. [src/gca.ts](src/gca.ts) handles optional reminders. Tests live in [test/](test/); deployment and Git hook scripts live in [scripts/](scripts/).
 
 ## Checks
 
-Use Node.js 24. Run `npm ci`; copy `.dev.vars.example` to `.dev.vars` only if absent. Run `npm run lint:docs`, `npm run typecheck`, `npm test` and `npx wrangler deploy --dry-run`. Durable Object "uncaught exception" lines during `npm test` come from deliberately failing polls and are expected. Script changes also need ShellCheck (POSIX files), actionlint, `sh -n` syntax checks and macOS plist validation. Maintainer deployment uses `npm run deploy:local` with ignored `wrangler.local.jsonc` and requires task authorization. The public `deploy` script is for new installations and must refuse a checkout containing private deployment config.
+Use Node.js 24. Run `npm ci`; copy `.dev.vars.example` to `.dev.vars` only if absent. Run `npm run lint:docs`, `npm run typecheck`, `npm test` and `npx wrangler deploy --dry-run`. Durable Object "uncaught exception" lines during `npm test` come from deliberately failing polls and are expected. Script changes also need ShellCheck (POSIX files), actionlint and `sh -n` syntax checks. Maintainer deployment uses `npm run deploy:local` with ignored `wrangler.local.jsonc` and requires task authorization. The public `deploy` script is for new installations and must refuse a checkout containing private deployment config.
 
 After staging changes, run `npm run check:repo` for privacy, deployment setup and local documentation links. These checks read the Git index and the commit emails in reachable HEAD history; they exclude ignored files. The pre-push hook also checks every file version and commit email in the pushed commits. External links are checked weekly and on manual CI runs; HTTP 401/403/429 results are reported as unverified.
 
@@ -18,7 +18,6 @@ After staging changes, run `npm run check:repo` for privacy, deployment setup an
 - `src/state.ts` handles sessions; `poll.ts` and `roster.ts` handle delivery. Public delivery is at least once.
 - `gca.ts` parses private region coverage and approvals, and manages durable DM reservations. Invalid policy disables reminders; cleanup must preserve deduplication and occurrence ledgers.
 - Health reads never poll or refresh success time. Cleanup must not race polling.
-- Mac monitoring must not log credentials, private URLs or response bodies.
 
 ## Workflow and privacy
 

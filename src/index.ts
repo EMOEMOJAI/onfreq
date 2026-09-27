@@ -22,7 +22,7 @@ const errorResponse = (error: string, status: number, headers?: Record<string, s
  * `null` when the request is authenticated and handling should continue.
  * Unset or too-short secrets disable the endpoint. A HISTORY_SECRET equal to
  * POLL_SECRET also disables the history routes, since the poll token is held
- * by monitors and the Mac helper.
+ * by monitors.
  */
 async function requireSecret(request: Request, env: Env, name: Route['secret']): Promise<Response | null> {
   let expected = configuredSecret(env[name], name);
