@@ -9,7 +9,10 @@
 # filters and binary or -diff attributes cannot hide content. Removed lines, and
 # the existing line Git appends to each hunk header (@@ -2 +2 @@ <line>), are
 # dropped, so removing content or editing below it does not re-flag what is
-# already published. Added lines start with "+", so no content is dropped.
+# already published; --inter-hunk-context=0 keeps diff.interHunkContext from
+# merging nearby hunks, which would add existing lines back as context. Added
+# lines start with "+", and --pretty=medium, which overrides format.pretty,
+# prints every commit message line indented, so the filters never drop them.
 # Gitleaks redacts findings.
 #
 # Exit status: 0 clean; 1 Gitleaks found a secret or failed; 2 the commits
@@ -35,7 +38,7 @@ trap 'rm -rf "$tmp"' EXIT
 trap 'exit 2' HUP INT TERM
 
 status=0
-{ git log -p -U0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null ||
+{ git log --pretty=medium -p -U0 --inter-hunk-context=0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null ||
     : >"$tmp/failed"; } |
   { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
   gitleaks stdin --redact --no-banner || status=$?
