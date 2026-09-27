@@ -13,7 +13,9 @@
     "crons": ["* * * * *"]
   },
   "durable_objects": {
-    "bindings": [{ "name": "POLL_COORDINATOR", "class_name": "PollCoordinator" }]
+    "bindings": [{ "name": "POLL_COORDINATOR", "class_name": "PollCoordinator" }],
+    // Apply new code immediately, as before Wrangler 4.141 made deferred updates the default.
+    "code_update_strategy": { "mode": "immediate" }
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PollCoordinator"] }],
   "kv_namespaces": [
