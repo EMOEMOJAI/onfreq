@@ -889,6 +889,37 @@ test('secret-scan.sh scans commit messages whatever format.pretty prints (C65)',
     }
   });
 
+test('secret-scan.sh scans commit messages whatever encoding header the commit declares (C69)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    const secret = new RegExp(token.slice(4));
+    const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+    const scan = (...args) => spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args], { cwd: f.repo, env, encoding: 'utf8' });
+    const base = f.git('rev-parse', 'HEAD');
+    // The message bytes are ASCII, but the header declares UTF-16; with an
+    // even-length body, converting to UTF-8 pairs the bytes into other characters.
+    let body = `aws_access_key_id = ${token}`;
+    if (body.length % 2) body += '.';
+    f.git('-c', 'i18n.commitEncoding=UTF-16', 'commit', '--quiet', '--no-verify', '--allow-empty',
+      '-m', 'x', '-m', body);
+    const commit = f.git('rev-parse', 'HEAD');
+    assert.match(f.git('cat-file', 'commit', commit), /^encoding UTF-16$/m);
+    // Precondition: re-encoding hides the key, so this commit exercises the bypass.
+    assert.doesNotMatch(f.git('log', '-1', '--encoding=UTF-8', commit), secret);
+    for (const encoding of [null, 'UTF-16', 'ISO-8859-1']) {
+      const label = encoding ?? 'default';
+      if (encoding) f.git('config', 'i18n.logOutputEncoding', encoding);
+      let result = scan(commit, '--not', base);
+      assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+      result = f.push([ref(commit, 'refs/heads/main', base)]);
+      assert.equal(result.status, 1, `${label} push: ${result.stderr}`);
+      assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/, label);
+      assert.doesNotMatch(result.stderr + result.stdout, secret, label);
+    }
+  });
+
 test('diff.interHunkContext cannot turn a committed secret between two edits into scanned context (C66)',
   { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
