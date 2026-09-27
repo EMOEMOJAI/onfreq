@@ -72,6 +72,26 @@ function titles(): string[] {
   return sent.map((payload) => (payload.embeds as DiscordEmbed[])[0]!.title!);
 }
 
+function occurrences() {
+  return runInDurableObject(stub(), (_instance, ctx) =>
+    ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+}
+
+/** The occurrence an earlier version kept for a DM deferred by a 429. */
+function seedLegacyOccurrence(sessionId: number, occurrence: number) {
+  return runInDurableObject(stub(), (_instance, ctx) => {
+    ctx.storage.sql.exec('INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, 600001, ?)',
+      `600001:${sessionId}`, occurrence);
+  });
+}
+
+/** Parsed JSON log lines for one event. */
+function logged(spy: { mock: { calls: unknown[][] } }, event: string): Record<string, unknown>[] {
+  return spy.mock.calls
+    .map(([line]) => { try { return JSON.parse(String(line)) as Record<string, unknown>; } catch { return {}; } })
+    .filter((entry) => entry.event === event);
+}
+
 beforeEach(() => {
   now = START;
   members = [member()];
@@ -342,12 +362,18 @@ describe('GCA policy configuration', () => {
     expect(sent).toHaveLength(1);
   });
 
-  it('sends nothing when approvals are missing or unusable', async () => {
+  it('sends nothing when approvals or the guild ID are missing or unusable', async () => {
+    const error = vi.spyOn(console, 'error');
+    // Baseline first: otherwise the first valid run would only baseline anyway.
+    await check([]);
     await check([atc()], { ...settings(), GCA_APPROVALS: '' });
-    await check([atc()], { ...settings(), GCA_APPROVALS: '' });
-    expect(sent).toHaveLength(0);
-    await check([atc()], { ...settings(), GCA_DISCORD_GUILD_ID: 'not-a-guild' });
-    expect(sent).toHaveLength(0);
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'gca_config_invalid', reason: 'policy' }));
+    await check([atc({ sessionId: 2 })], { ...settings(), GCA_DISCORD_GUILD_ID: 'not-a-guild' });
+    expect(network).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'gca_config_invalid', reason: 'guild_or_role' }));
+    // Positive control: the same connection is warned once configuration is valid.
+    await check([atc({ sessionId: 2 })]);
+    expect(sent).toHaveLength(1);
   });
 });
 
@@ -427,20 +453,27 @@ describe('durable GCA delivery', () => {
     expect(titles()[2]).toContain('[3rd occurrence]');
   });
 
-  it('keeps a stable occurrence on 429 retries even if a newer connection is processed first', async () => {
+  it('releases a 429-deferred occurrence, numbering warnings in the order the member receives them', async () => {
     await check([]);
     await check([atc()]);
     messageStatus = 429;
     await check([atc({ sessionId: 2 })]);
+    // Rejected by Discord, so never received: its occurrence is not kept.
     expect(titles()[1]).toContain('[2nd occurrence]');
+    expect(await occurrences()).toEqual([{ session_key: '600001:123456', occurrence: 1 }]);
     await evictDurableObject(stub());
     now += 180_000;
     messageStatus = 200;
+    // A newer connection processed first takes the next number.
     await check([atc({ sessionId: 3 }), atc({ sessionId: 2 })]);
-    expect(titles()[2]).toContain('[3rd occurrence]');
-    expect(titles()[3]).toContain('[2nd occurrence]');
     await check([atc({ sessionId: 4 })]);
-    expect(titles()[4]).toContain('[4th occurrence]');
+    const received = titles().filter((_title, i) => i !== 1);
+    expect(received[0]).not.toContain('occurrence');
+    expect(received.slice(1).map((title) => /\[(\w+) occurrence\]/.exec(title)?.[1])).toEqual(['2nd', '3rd', '4th']);
+    expect(await occurrences()).toEqual([
+      { session_key: '600001:123456', occurrence: 1 }, { session_key: '600001:2', occurrence: 3 },
+      { session_key: '600001:3', occurrence: 2 }, { session_key: '600001:4', occurrence: 4 },
+    ]);
   });
 
   it('does not count a connection whose DM was never attempted', async () => {
@@ -473,8 +506,6 @@ describe('durable GCA delivery', () => {
   );
 
   it('releases the occurrence of a DM Discord definitely rejected, keeping the others', async () => {
-    const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
-      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
     await check([]);
     await check([atc({ sessionId: 1 })]);
     messageStatus = 403;
@@ -501,8 +532,6 @@ describe('durable GCA delivery', () => {
   });
 
   it('releases the occurrence of a DM whose final attempt Discord rate-limited', async () => {
-    const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
-      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
     await check([]);
     await check([atc({ sessionId: 1 })]);
     messageStatus = 429;
@@ -519,36 +548,45 @@ describe('durable GCA delivery', () => {
     expect(titles().at(-1)).toContain('[2nd occurrence]');
   });
 
-  it('releases the occurrence of a rate-limited DM that later fails before its message POST', async () => {
-    const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
-      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+  it.each([
+    ['opening the DM is refused (403)', 2],
+    ['the DM channel has an unexpected recipient', 2],
+    ['opening the DM fails with 5xx until attempts run out', 5],
+  ] as const)('releases the occurrence of a rate-limited DM that later fails before its message POST: %s', async (mode, attempts) => {
     await check([]);
     await check([atc({ sessionId: 1 })]);
     messageStatus = 429;
     await check([atc({ sessionId: 2 })]);
-    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'pending' });
-    expect(await occurrences()).toHaveLength(2);
-    // The retry never reaches the message POST: opening the DM is now refused.
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'pending', attempts: 1 });
+    expect(await occurrences()).toEqual([{ session_key: '600001:1', occurrence: 1 }]);
+    // A row left by an earlier version still holds the deferred occurrence.
+    await seedLegacyOccurrence(2, 2);
+    // The retries never reach the message POST again.
     messageStatus = 200;
-    openStatus = 403;
-    now += 200_000;
-    await check([atc({ sessionId: 2 })]);
+    if (mode.includes('403')) openStatus = 403;
+    else if (mode.includes('recipient')) returnedRecipient = '111111111111111111';
+    else openStatus = 500;
+    for (let i = 0; i < 4 && (await statuses()).find((row) => row.session_key === '600001:2')?.status === 'pending'; i++) {
+      now += 200_000;
+      await check([atc({ sessionId: 2 })]);
+    }
     expect(sent).toHaveLength(2);
-    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'failed' });
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'failed', attempts });
+    expect(network.mock.calls.filter(([url]) => String(url).endsWith('/users/@me/channels'))).toHaveLength(attempts + 1);
     expect(await occurrences()).toEqual([{ session_key: '600001:1', occurrence: 1 }]);
     openStatus = 200;
+    returnedRecipient = USER;
     now += 60_000;
     await check([atc({ sessionId: 3 })]);
     expect(titles().at(-1)).toContain('[2nd occurrence]');
   });
 
-  it('releases the occurrence of a rate-limited DM whose member left the server', async () => {
-    const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
-      ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+  it('releases the legacy occurrence of a rate-limited DM whose member left the server', async () => {
     await check([]);
     await check([atc({ sessionId: 1 })]);
     messageStatus = 429;
     await check([atc({ sessionId: 2 })]);
+    await seedLegacyOccurrence(2, 2);
     messageStatus = 200;
     members = [];
     now += 200_000;
@@ -562,13 +600,12 @@ describe('durable GCA delivery', () => {
   });
 
   it.each(['pending', 'unmapped'])(
-    'releases the occurrence of a deferred DM whose %s row is pruned, keeping sent ones', async (kind) => {
-      const occurrences = () => runInDurableObject(stub(), (_instance, ctx) =>
-        ctx.storage.sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY session_key').toArray());
+    'releases the legacy occurrence of a deferred DM whose %s row is pruned, keeping sent ones', async (kind) => {
       await check([]);
       await check([atc({ sessionId: 1 })]);
       messageStatus = 429;
       await check([atc({ sessionId: 2 })]);
+      await seedLegacyOccurrence(2, 2);
       expect(await occurrences()).toHaveLength(2);
       messageStatus = 200;
       if (kind === 'unmapped') {
@@ -784,9 +821,11 @@ describe('durable GCA delivery', () => {
 
   it.each([403, 500])('does not use a partial member list after HTTP %s', async (status) => {
     await check([]);
+    const warn = vi.spyOn(console, 'warn');
     listStatus = status;
     await expect(check([atc()])).rejects.toThrow('Discord status');
     expect(sent).toHaveLength(0);
+    expect(logged(warn, 'gca_member_list_failed')).toEqual([{ event: 'gca_member_list_failed', reason: 'http', status }]);
     listStatus = 200;
     now += 60_000;
     await check([atc()]);
@@ -948,7 +987,7 @@ describe('durable GCA delivery', () => {
       return original(input, init);
     });
     await expect(check([atc()])).rejects.toThrow('Invalid Discord member list');
-    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'gca_member_list_failed' }));
+    expect(logged(warn, 'gca_member_list_failed')).toEqual([{ event: 'gca_member_list_failed', reason: 'invalid', status: 'unavailable' }]);
     const calls = network.mock.calls.length;
     await check([atc({ sessionId: 2 })]);
     expect(network).toHaveBeenCalledTimes(calls); // still backed off, no repeated member-list lookup
@@ -978,6 +1017,65 @@ describe('durable GCA delivery', () => {
     expect(memberListCalls).toBe(2);
   });
 
+  it('backs off a member-list lookup that runs out of the poll deadline twice in a row', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    const fullPage: GuildMember[] = Array.from({ length: 1000 }, (_, i) =>
+      member(700000 + i, String(400000000000000000n + BigInt(i))));
+    const original = network.getMockImplementation()!;
+    let memberListCalls = 0;
+    let slow = true;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).includes('/members?')) {
+        memberListCalls++;
+        if (slow) {
+          now += 30_000;
+          return Response.json(fullPage);
+        }
+      }
+      return original(input, init);
+    });
+    await expect(check([atc()])).rejects.toThrow('exceeded poll budget');
+    await expect(check([atc()])).rejects.toThrow('exceeded poll budget');
+    expect(logged(warn, 'gca_member_list_failed')).toEqual(Array(2).fill(
+      { event: 'gca_member_list_failed', reason: 'deadline', status: 'unavailable' }));
+    // The third poll skips the lookup instead of spending its budget again.
+    await check([atc()]);
+    expect(memberListCalls).toBe(2);
+    now += 5 * 60_000;
+    slow = false;
+    await check([atc()]);
+    expect(memberListCalls).toBe(3);
+    expect(sent).toHaveLength(1);
+    // A success resets the count: the next slow lookup is retried at once again.
+    slow = true;
+    await expect(check([atc({ sessionId: 2 })])).rejects.toThrow('exceeded poll budget');
+    await expect(check([atc({ sessionId: 2 })])).rejects.toThrow('exceeded poll budget');
+    expect(memberListCalls).toBe(5);
+  });
+
+  it('logs a page_limit reason for a server with more than 10,000 members', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    const original = network.getMockImplementation()!;
+    let memberListCalls = 0;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.includes('/members?')) {
+        memberListCalls++;
+        const after = BigInt(new URL(url).searchParams.get('after')!);
+        const first = after === 0n ? 400000000000000000n : after + 1n;
+        return Response.json(Array.from({ length: 1000 }, (_, i) =>
+          ({ user: { id: String(first + BigInt(i)) }, nick: null, roles: [] })));
+      }
+      return original(input, init);
+    });
+    await expect(check([atc()])).rejects.toThrow('Discord member list exceeded page limit');
+    expect(memberListCalls).toBe(10);
+    expect(sent).toHaveLength(0);
+    expect(logged(warn, 'gca_member_list_failed')).toEqual([{ event: 'gca_member_list_failed', reason: 'page_limit', status: 'unavailable' }]);
+  });
+
   it('re-baselines sessions discovered after a long gap instead of warning them immediately', async () => {
     await check([]);
     await check([atc()]);
@@ -990,6 +1088,62 @@ describe('durable GCA delivery', () => {
     now += 60_000;
     await check([atc({ sessionId: 2, callsign: 'XFAA_APP' })]);
     expect(sent).toHaveLength(1); // a baselined session never warns, even once settled in
+  });
+
+  it('re-baselines new sessions after an upgrade from a version without a last-active record', async () => {
+    await check([]);
+    await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.delete('gca-last-active-v1'));
+    const log = vi.spyOn(console, 'log');
+    await check([atc()]);
+    expect(network).not.toHaveBeenCalled();
+    expect((await statuses())[0]).toMatchObject({ status: 'baseline' });
+    expect(log).toHaveBeenCalledWith(JSON.stringify({ event: 'gca_rebaselined', sessions: 1 }));
+    now += 60_000;
+    await check([atc(), atc({ sessionId: 2 })]);
+    expect(sent).toHaveLength(1);
+    expect((await statuses()).map((row) => [row.session_key, row.status])).toEqual([
+      ['600001:123456', 'baseline'], ['600001:2', 'sent']]);
+  });
+
+  it('logs whether a rate-limited DM reached Discord or was deferred locally', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    messageStatus = 500;
+    await check([atc({ sessionId: 1 })]);
+    messageStatus = 429;
+    await check([atc({ sessionId: 2 })]);
+    // The route cooldown now defers this one without contacting Discord.
+    await check([atc({ sessionId: 3 })]);
+    expect(sent).toHaveLength(2);
+    expect(logged(warn, 'gca_dm_failed')).toEqual([
+      { event: 'gca_dm_failed', status: 500, retry: false },
+      { event: 'gca_dm_failed', status: 429, retry: true, reason: 'rate_limit', requestMade: true },
+      { event: 'gca_dm_failed', status: 429, retry: true, reason: 'rate_limit', requestMade: false },
+    ]);
+  });
+
+  it('defers a DM locally after an exhausted-bucket reply, without counting it', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).endsWith(`/channels/${CHANNEL}/messages`)) {
+        sent.push(JSON.parse(String(init?.body)));
+        return Response.json({ id: '300000000000000002' },
+          { headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset-after': '30' } });
+      }
+      return original(input, init);
+    });
+    await check([atc({ sessionId: 1 }), atc({ sessionId: 2 })]);
+    expect(sent).toHaveLength(1);
+    expect(logged(warn, 'gca_dm_failed')).toEqual([
+      { event: 'gca_dm_failed', status: 429, retry: true, reason: 'soft', requestMade: false }]);
+    expect((await statuses()).find((row) => row.session_key === '600001:2')).toMatchObject({ status: 'pending', attempts: 0 });
+    expect(await occurrences()).toEqual([{ session_key: '600001:1', occurrence: 1 }]);
+    now += 30_000;
+    await check([atc({ sessionId: 1 }), atc({ sessionId: 2 })]);
+    expect(titles()).toHaveLength(2);
+    expect(titles()[1]).toContain('[2nd occurrence]');
   });
 
   it('does not let a single DM route\'s rate limit widen the shared backoff the way a global one does', async () => {
@@ -1116,6 +1270,17 @@ describe('staff copies', () => {
     await check([atc()], config());
     expect(copies).toHaveLength(2);
     expect(sent).toHaveLength(1);
+  });
+
+  it.each([
+    [429, { status: 429, retry: true, reason: 'rate_limit', requestMade: true }],
+    [500, { status: 500, retry: false }],
+  ] as const)('logs a failed %i copy with rate-limit detail only when rate-limited', async (status, expected) => {
+    await check([], config());
+    const warn = vi.spyOn(console, 'warn');
+    copyStatus = status;
+    await check([atc()], config());
+    expect(logged(warn, 'gca_copy_failed')).toEqual([{ event: 'gca_copy_failed', ...expected }]);
   });
 
   it.each([403, 500, 'timeout'])('never repeats a possibly delivered or permanently rejected copy (%s)', async (status) => {
