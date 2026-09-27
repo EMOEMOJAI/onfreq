@@ -22,7 +22,7 @@ const MEMBER_LIST_BACKOFF_KEY = 'gca-member-list-backoff-v1';
 const MEMBER_LIST_DEADLINE_KEY = 'gca-member-list-deadline-failures-v1';
 /** A slow lookup is retried at once, but backs off from this many in a row. */
 const MEMBER_LIST_DEADLINE_LIMIT = 2;
-/** Backoff for a member-list failure that carries no Discord-reported delay. */
+/** Minimum backoff for a member-list failure that is not a rate limit (e.g. a 403 or 5xx). */
 const MEMBER_LIST_FALLBACK_BACKOFF_MS = 5 * 60_000;
 const LAST_ACTIVE_KEY = 'gca-last-active-v1';
 const RETENTION_MS = 7 * 86_400_000;
@@ -609,8 +609,16 @@ async function fetchMembersWithBackoff(
   const guildId = env.GCA_DISCORD_GUILD_ID ?? '';
   const members = await fetchMembers(limits, env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
     const httpError = err instanceof GcaDiscordError || err instanceof DiscordRateLimitError;
-    const reason = err instanceof GcaDeadlineError ? 'deadline' : err instanceof GcaMemberListError ? err.reason : 'http';
-    console.warn(JSON.stringify({ event: 'gca_member_list_failed', reason, status: httpError ? err.status : 'unavailable' }));
+    // A rate-limit error reports status 429 even when this poll deferred the
+    // lookup locally: its own reason and requestMade say what happened. A
+    // thrown fetch (timeout, connection failure) never got an HTTP status.
+    const reason = err instanceof GcaDeadlineError ? 'deadline'
+      : err instanceof GcaMemberListError ? err.reason
+      : err instanceof GcaDiscordError ? 'http'
+      : 'network';
+    console.warn(JSON.stringify({
+      event: 'gca_member_list_failed', reason, status: httpError ? err.status : 'unavailable', ...rateLimitDetail(err),
+    }));
     if (err instanceof GcaDeadlineError) {
       // Running out of the poll deadline is not a Discord failure: a one-off
       // slow lookup is simply retried next poll. Only a lookup that keeps
@@ -623,12 +631,17 @@ async function fetchMembersWithBackoff(
       throw err;
     }
     await storage.delete(MEMBER_LIST_DEADLINE_KEY);
-    // Any other member-list failure — HTTP or a malformed/incomplete page —
-    // must back off, but only the member-list lookup itself; otherwise the
-    // same lookup is retried on every poll indefinitely instead of roughly
-    // every few minutes. Only a genuinely global rate limit also widens the
-    // shared BACKOFF_KEY that gates unrelated staff copies.
-    const retryMs = Math.min(httpError ? err.retryMs : MEMBER_LIST_FALLBACK_BACKOFF_MS, GCA_MAX_BACKOFF_MS);
+    // Any other member-list failure — HTTP, network or a malformed/incomplete
+    // page — must back off, but only the member-list lookup itself; otherwise
+    // the same lookup is retried on every poll indefinitely. A rate limit
+    // waits exactly its reported delay. Any other failure waits at least
+    // MEMBER_LIST_FALLBACK_BACKOFF_MS (longer if Retry-After asks), so a
+    // persistent 403 (missing permission) or 5xx is retried every few
+    // minutes, not every poll. Only a genuinely global rate limit also
+    // widens the shared BACKOFF_KEY that gates unrelated staff copies.
+    const retryMs = Math.min(err instanceof DiscordRateLimitError ? err.retryMs
+      : err instanceof GcaDiscordError ? Math.max(err.retryMs, MEMBER_LIST_FALLBACK_BACKOFF_MS)
+      : MEMBER_LIST_FALLBACK_BACKOFF_MS, GCA_MAX_BACKOFF_MS);
     await storage.put(MEMBER_LIST_BACKOFF_KEY, Date.now() + retryMs);
     if (err instanceof DiscordRateLimitError && err.global) {
       await storage.put(BACKOFF_KEY, Date.now() + retryMs);
