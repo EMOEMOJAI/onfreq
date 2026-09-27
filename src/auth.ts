@@ -1,12 +1,14 @@
 /**
- * Shared-secret authentication for the manual poll endpoint.
+ * Shared-secret authentication for the bearer-gated HTTP routes: POLL_SECRET
+ * protects /poll and /health; HISTORY_SECRET protects /gca-history and
+ * /gca-history/cleanup.
  *
- * The endpoint exists as a fallback for when Cloudflare's cron scheduler
- * stops firing (as it did on 2026-08-17): any external scheduler can drive
- * the poll over HTTP instead.
+ * /poll exists as a fallback for when Cloudflare's cron scheduler stops
+ * firing (as it did on 2026-08-17): any external scheduler can drive the poll
+ * over HTTP instead.
  */
 
-/** Shorter bearer secrets are too guessable for an unthrottled endpoint. */
+/** Shorter bearer secrets are too guessable for these unthrottled endpoints. */
 export const MIN_SECRET_LENGTH = 32;
 
 /**

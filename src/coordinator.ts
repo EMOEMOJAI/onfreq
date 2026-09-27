@@ -118,42 +118,48 @@ export class PollCoordinator extends DurableObject<Env> {
         previousRolePings: snapshot.rolePings,
       });
     } catch (err) {
-      // A config/precondition throw never reached the outcome object below,
-      // so record the same lastPollStartedAt/error shape by hand: otherwise
-      // a misconfigured bot bypasses MIN_POLL_INTERVAL on every invocation.
-      // A failure while recording that shape must never mask the original
-      // runPoll error — log it (without bodies) and rethrow `err` regardless.
+      // runPoll threw (a config/precondition failure or any other error), so
+      // this poll's results are discarded: carry the previous snapshot forward
+      // and record only the cadence and error. Otherwise a misconfigured bot
+      // bypasses MIN_POLL_INTERVAL on every invocation.
+      // A failure while recording that must never mask the original runPoll
+      // error — log it (without bodies) and rethrow `err` regardless.
       try {
-        await this.ctx.storage.put(POLL_SNAPSHOT_KEY, {
-          state: snapshot.state,
-          ...(snapshot.pendingOffline?.length ? { pendingOffline: snapshot.pendingOffline } : {}),
-          ...(snapshot.rosterMessages?.length ? { rosterMessages: snapshot.rosterMessages } : {}),
-          ...(snapshot.rosterPostAttempts?.length ? { rosterPostAttempts: snapshot.rosterPostAttempts } : {}),
-          ...(snapshot.rolePings && Object.keys(snapshot.rolePings).length ? { rolePings: snapshot.rolePings } : {}),
-          lastPollStartedAt: startedAt,
-          ...(snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt }),
-          error: err instanceof Error ? err.message : String(err),
-        } satisfies PollSnapshot);
+        await this.persist(snapshot, startedAt, snapshot.lastSuccessfulPollAt,
+          err instanceof Error ? err.message : String(err));
       } catch (putErr) {
         console.error(JSON.stringify({ event: 'poll_snapshot_put_failed', error: String(putErr) }));
       }
       throw err;
     }
-    // One durable write commits the state, cadence, and outcome together.
     // No successful response or in-memory checkpoint precedes persistence.
-    await this.ctx.storage.put(POLL_SNAPSHOT_KEY, {
-      state: outcome.state,
-      ...(outcome.pendingOffline.length ? { pendingOffline: outcome.pendingOffline } : {}),
-      ...(outcome.rosterMessages.length ? { rosterMessages: outcome.rosterMessages } : {}),
-      ...(outcome.rosterPostAttempts.length ? { rosterPostAttempts: outcome.rosterPostAttempts } : {}),
-      ...(Object.keys(outcome.rolePings).length ? { rolePings: outcome.rolePings } : {}),
-      lastPollStartedAt: startedAt,
-      ...(outcome.error
-        ? (snapshot.lastSuccessfulPollAt === undefined ? {} : { lastSuccessfulPollAt: snapshot.lastSuccessfulPollAt })
-        : { lastSuccessfulPollAt: Date.now() }),
-      ...(outcome.error ? { error: outcome.error } : {}),
-    } satisfies PollSnapshot);
+    await this.persist(outcome, startedAt,
+      outcome.error ? snapshot.lastSuccessfulPollAt : Date.now(), outcome.error);
     if (outcome.error) throw new Error(outcome.error);
     return { skipped: false };
+  }
+
+  /**
+   * One durable write commits the state, cadence, and outcome together. Both
+   * the success and the error path use it, and every PollSnapshot key must be
+   * listed below (the mapped type fails to compile otherwise), so no path can
+   * silently erase a field. Empty lists/maps and unset values are omitted.
+   */
+  private persist(carried: Omit<PollSnapshot, 'lastPollStartedAt' | 'lastSuccessfulPollAt' | 'error'>,
+    lastPollStartedAt: number, lastSuccessfulPollAt: number | undefined, error: string | undefined): Promise<void> {
+    const nonEmpty = <T>(list: T[] | undefined) => (list?.length ? list : undefined);
+    const next: { [K in keyof Required<PollSnapshot>]: PollSnapshot[K] } = {
+      state: carried.state,
+      pendingOffline: nonEmpty(carried.pendingOffline),
+      rosterMessages: nonEmpty(carried.rosterMessages),
+      rosterPostAttempts: nonEmpty(carried.rosterPostAttempts),
+      rolePings: carried.rolePings && Object.keys(carried.rolePings).length ? carried.rolePings : undefined,
+      lastPollStartedAt,
+      lastSuccessfulPollAt,
+      error: error || undefined,
+    };
+    // Dropping undefined keys only removes optional fields, so the result is still a PollSnapshot.
+    return this.ctx.storage.put(POLL_SNAPSHOT_KEY,
+      Object.fromEntries(Object.entries(next).filter(([, value]) => value !== undefined)) as unknown as PollSnapshot);
   }
 }

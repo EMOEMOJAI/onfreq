@@ -79,7 +79,9 @@ it('S2-1: HISTORY_SECRET does not authorize /health or /poll', async () => {
 it('S14-1: disabled poll and health responses do not name the secret', async () => {
   const poll = await callPollRoute('/poll', 'POST', 'anything', { POLL_SECRET: '' });
   expect(poll.status).toBe(503);
-  expect(await poll.json()).toEqual({ ok: false, error: 'poll endpoint disabled' });
+  // C1: every bearer-gated route shares the `{ error }` shape and no-store.
+  expect(poll.headers.get('cache-control')).toBe('no-store');
+  expect(await poll.json()).toEqual({ error: 'endpoint disabled' });
   const health = await callPollRoute('/health', 'GET', 'anything', { POLL_SECRET: undefined });
   expect(health.status).toBe(503);
   expect(await health.json()).toEqual({ error: 'endpoint disabled' });
@@ -90,7 +92,7 @@ it('S1-1: a short POLL_SECRET disables /poll and /health even when the token mat
   const weak = 'a';
   const poll = await callPollRoute('/poll', 'POST', weak, { POLL_SECRET: weak });
   expect(poll.status).toBe(503);
-  expect(await poll.json()).toEqual({ ok: false, error: 'poll endpoint disabled' });
+  expect(await poll.json()).toEqual({ error: 'endpoint disabled' });
   const almost = 'p'.repeat(31);
   const health = await callPollRoute('/health', 'GET', almost, { POLL_SECRET: ` ${almost} ` });
   expect(health.status).toBe(503);
