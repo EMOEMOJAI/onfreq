@@ -962,3 +962,94 @@ test('diff.interHunkContext cannot turn a committed secret between two edits int
     assert.equal(result.status, 1, result.stderr);
     assert.doesNotMatch(result.stderr + result.stdout, secret);
   });
+
+// T1-5: the repository's own Gitleaks rule for its secret names. Assignments are
+// assembled at runtime, so this file never contains one.
+const repoRules = () => readFileSync(new URL('../.gitleaks.toml', import.meta.url));
+const assignment = (name, value) => `${name}="${value}"\n`;
+function commitRules(f, rules) {
+  writeFileSync(join(f.repo, '.gitleaks.toml'), rules);
+  f.git('add', '.gitleaks.toml');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'gitleaks rules');
+}
+// Stages `text` and returns the pre-commit results (direct and as git commit),
+// then commits it without the hook and returns the scan of that commit alone.
+function scanAssignment(f, text) {
+  writeFileSync(join(f.repo, 'settings.env'), text);
+  f.git('add', 'settings.env');
+  const hook = [f.commitHook(), f.commitHook({ commit: true })];
+  f.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m', 'synthetic settings');
+  const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+  const scan = spawnSync('/bin/sh', ['scripts/secret-scan.sh', 'HEAD^!'], { cwd: f.repo, env, encoding: 'utf8' });
+  f.git('rm', '--quiet', 'settings.env');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'remove synthetic settings');
+  return { hook, scan };
+}
+
+test('the repository Gitleaks rule blocks low-entropy values of its secret names (T1-5)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    // Gitleaks' default allowlist treats one repeated character as a placeholder,
+    // so the low-entropy fixture alternates two.
+    const value = 'ab'.repeat(10);
+    const text = assignment('IVAO_WEBHOOK_SECRET', value);
+    // Default rules alone miss it, so only the repository rule can block it.
+    commitRules(f, '[extend]\nuseDefault = true\n');
+    let { hook, scan } = scanAssignment(f, text);
+    for (const result of hook) assert.equal(result.status, 0, result.stderr);
+    assert.equal(scan.status, 0, scan.stderr);
+    commitRules(f, repoRules());
+    for (const [name, quoted] of [['IVAO_WEBHOOK_SECRET', text], ['POLL_SECRET', `POLL_SECRET: '${value}',\n`],
+      ['HISTORY_SECRET', `export HISTORY_SECRET=${value}\n`], ['IVAO_CLIENT_SECRET', `"IVAO_CLIENT_SECRET": "${value}"\n`],
+      ['DISCORD_BOT_TOKEN', `DISCORD_BOT_TOKEN = ${value}\n`]]) {
+      ({ hook, scan } = scanAssignment(f, quoted));
+      for (const result of hook) {
+        assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+        assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret/, name);
+        assert.doesNotMatch(result.stderr + result.stdout, new RegExp(value), name);
+      }
+      assert.equal(scan.status, 1, `${name}: ${scan.stderr}`);
+      assert.doesNotMatch(scan.stderr + scan.stdout, new RegExp(value), name);
+    }
+    // Shorter values and empty placeholders are not flagged.
+    ({ hook, scan } = scanAssignment(f, assignment('POLL_SECRET', 'a'.repeat(15)) + assignment('HISTORY_SECRET', '')));
+    for (const result of hook) assert.equal(result.status, 0, result.stderr);
+    assert.equal(scan.status, 0, scan.stderr);
+  });
+
+test('the repository Gitleaks allowlist matches whole synthetic fixture values only (T1-5)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const value of ['aaaaaaaa-synthetic-aaaaaaaa', 'notsynthetic-aaaaaaaaaaaa', 'synthetic-aaaaaaaa.aaaaaaaa',
+      'aaaatest-poll-secret', 'test-poll-secret-aaaa', 'env.POLL_SECRET.aaaaaaaa', 'aaaaaaaa.env.POLL_SECRET']) {
+      const { hook, scan } = scanAssignment(f, assignment('IVAO_WEBHOOK_SECRET', value));
+      for (const result of hook) assert.equal(result.status, 1, `${value}: ${result.stderr}`);
+      assert.equal(scan.status, 1, `${value}: ${scan.stderr}`);
+    }
+    // A fixture value, and a code reference to a binding rather than a value.
+    const reference = (name) => `${name}: env.${name},\n`;
+    const { hook, scan } = scanAssignment(f, assignment('IVAO_WEBHOOK_SECRET', 'synthetic-webhook-fixture-0123')
+      + reference('POLL_SECRET'));
+    for (const result of hook) assert.equal(result.status, 0, result.stderr);
+    assert.equal(scan.status, 0, scan.stderr);
+  });
+
+test('privacy checks reject private emails in commit trailers, allowing noreply co-authors (T1-5)', (t) => {
+  const f = fixture(t, { realRange: true });
+  const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+  const check = (...args) => spawnSync(process.execPath, ['scripts/check-privacy.mjs', ...args], { cwd: f.repo, env, encoding: 'utf8' });
+  f.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m',
+    'co-authored\n\nCo-Authored-By: Synthetic Model <noreply@anthropic.com>');
+  const allowed = f.git('rev-parse', 'HEAD');
+  assert.equal(check().status, 0, check().stderr);
+  assert.equal(f.push([ref(allowed)]).status, 0);
+  f.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m',
+    'co-authored\n\nCo-authored-by: Person <person@example.test>');
+  const head = f.git('rev-parse', 'HEAD');
+  for (const result of [check(), check('--range', head, zero, 'origin'), f.push([ref(head, 'refs/heads/main', allowed)])]) {
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /commit trailer email must use a noreply address/);
+    assert.doesNotMatch(result.stderr + result.stdout, /person@example/);
+  }
+});

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_MAX_RESPONSE_BYTES, fetchBuffered, ResponseTooLargeError } from '../src/http';
+import { BodyTooLargeError, DEFAULT_MAX_RESPONSE_BYTES, fetchBuffered, readCapped, ResponseTooLargeError } from '../src/http';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -57,6 +57,50 @@ describe('response size cap', () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(chunked(64 * 1024, 32))));
     await expect(fetchBuffered(URL, undefined, { maxBytes: 3 * 1024 * 1024 })).resolves.toMatchObject({ status: 200 });
     await expect(fetchBuffered(URL, undefined, { maxBytes: 1024 })).rejects.toThrow('exceeded size limit');
+  });
+});
+
+describe('readCapped', () => {
+  it('returns an empty buffer for a null body', async () => {
+    expect(await readCapped(null, 0)).toEqual(new Uint8Array(0));
+  });
+
+  it('concatenates chunks up to and including the cap', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2]));
+        controller.enqueue(new Uint8Array([3]));
+        controller.close();
+      },
+    });
+    expect(await readCapped(body, 3)).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it('cancels the stream and throws once the total passes the cap', async () => {
+    const cancel = vi.fn();
+    const err = await readCapped(chunked(4, 3, cancel), 11).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(BodyTooLargeError);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+});
+
+describe('bodyless and undeclared responses', () => {
+  it.each([204, 304])('returns a %i with a null body', async (status) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status, headers: { etag: '"synthetic"' } })));
+    const res = await fetchBuffered(URL);
+    expect(res.status).toBe(status);
+    expect(res.body).toBeNull();
+    expect(res.headers.get('etag')).toBe('"synthetic"');
+  });
+
+  it('falls back to the streamed cap when content-length is not a number', async () => {
+    const cancel = vi.fn();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(chunked(64 * 1024, 1000, cancel), {
+      headers: { 'content-length': 'not-a-number' },
+    })));
+    const err = await fetchBuffered(URL).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ResponseTooLargeError);
+    expect(cancel).toHaveBeenCalled();
   });
 });
 

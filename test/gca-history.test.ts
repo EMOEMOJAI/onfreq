@@ -100,6 +100,28 @@ it.each(historyRoutes)('S2-3: %s %s fails closed when HISTORY_SECRET reuses POLL
   expect(await health.json()).toMatchObject({ maxAgeSeconds: 300 });
 });
 
+it.each(historyRoutes)('T1-1: %s %s fails closed when HISTORY_SECRET reuses IVAO_WEBHOOK_SECRET', async (path, method) => {
+  await seed();
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  // The webhook signing secret is trimmed before comparison, like the bearer secrets.
+  for (const webhook of [HISTORY_ONLY, ` ${HISTORY_ONLY}\n`]) {
+    const response = await call(path, method, HISTORY_ONLY,
+      { POLL_SECRET: POLL_ONLY, HISTORY_SECRET: HISTORY_ONLY, IVAO_WEBHOOK_SECRET: webhook });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const body = await response.text();
+    expect(JSON.parse(body)).toEqual({ error: 'endpoint disabled' });
+    expect(body).not.toContain('600001');
+  }
+  expect(log.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+    { event: 'config_invalid', reason: 'HISTORY_SECRET_reuses_IVAO_WEBHOOK_SECRET' },
+  ]);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(HISTORY_ONLY);
+  // A distinct webhook secret leaves the history routes enabled.
+  expect((await call(path, method, HISTORY_ONLY, { POLL_SECRET: POLL_ONLY, HISTORY_SECRET: HISTORY_ONLY,
+    IVAO_WEBHOOK_SECRET: 'synthetic-distinct-webhook-secret-0123456789' })).status).toBe(200);
+});
+
 it('S2-3: the shared test fixture uses distinct poll and history secrets', async () => {
   expect(headers.authorization).not.toBe(AUTH_HEADERS.authorization);
   expect((await SELF.fetch('https://example.com/gca-history', { headers: AUTH_HEADERS })).status).toBe(401);

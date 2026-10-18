@@ -15,7 +15,7 @@ interface Route {
   handle(request: Request, url: URL, env: Env): Promise<Response>;
 }
 
-/** Every response of a protected route, including errors, is marked no-store. */
+/** Every response, including errors, the root banner and 404s, is marked no-store. */
 function noStore(response: Response): Response {
   const headers = new Headers(response.headers);
   headers.set('cache-control', 'no-store');
@@ -39,13 +39,18 @@ function routeFailed(url: URL, err: unknown): Response {
  * `null` when the request is authenticated and handling should continue.
  * Unset or too-short secrets disable the endpoint. A HISTORY_SECRET equal to
  * POLL_SECRET also disables the history routes, since the poll token is held
- * by monitors.
+ * by monitors. A bearer secret equal to IVAO_WEBHOOK_SECRET disables its
+ * routes, since that signing secret is also held by IVAO's webhook service.
  */
 async function requireSecret(request: Request, env: Env, name: Route['secret']): Promise<Response | null> {
   let expected = configuredSecret(env[name], name);
   if (expected && name === 'HISTORY_SECRET' && expected === env.POLL_SECRET?.trim()) {
     // Reusing the poll token would silently undo the privilege split: fail closed.
     logConfigInvalidOnce('HISTORY_SECRET_reuses_POLL_SECRET');
+    expected = '';
+  }
+  if (expected && expected === env.IVAO_WEBHOOK_SECRET?.trim()) {
+    logConfigInvalidOnce(`${name}_reuses_IVAO_WEBHOOK_SECRET`);
     expected = '';
   }
   if (!expected) return errorResponse('endpoint disabled', 503);
@@ -150,12 +155,12 @@ export default {
     }
 
     if (request.method === 'GET' && url.pathname === '/') {
-      return new Response('onfreq HTTP endpoint is reachable. Poll freshness requires authenticated GET /health.\n', {
+      return noStore(new Response('onfreq HTTP endpoint is reachable. Poll freshness requires authenticated GET /health.\n', {
         headers: { 'content-type': 'text/plain; charset=utf-8' },
-      });
+      }));
     }
 
-    return new Response('Not found', { status: 404 });
+    return noStore(new Response('Not found', { status: 404 }));
   },
 
   async scheduled(controller, env, _ctx): Promise<void> {

@@ -114,3 +114,24 @@ it('S8-3: unauthenticated requests cannot multiply config_invalid log lines', as
   expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual({ event: 'config_invalid', reason: 'POLL_SECRET_too_short' });
   expect(JSON.stringify(log.mock.calls)).not.toContain(weak);
 });
+
+it('T1-1: a POLL_SECRET equal to IVAO_WEBHOOK_SECRET disables /health and /poll', async () => {
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  for (const webhook of [POLL_ONLY, `\t${POLL_ONLY} `]) {
+    const overrides = { POLL_SECRET: POLL_ONLY, HISTORY_SECRET: HISTORY_ONLY, IVAO_WEBHOOK_SECRET: webhook };
+    for (const [path, method] of [['/health', 'GET'], ['/poll', 'POST']] as const) {
+      const response = await callPollRoute(path, method, POLL_ONLY, overrides);
+      expect(response.status).toBe(503);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(await response.json()).toEqual({ error: 'endpoint disabled' });
+    }
+  }
+  expect(log.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+    { event: 'config_invalid', reason: 'POLL_SECRET_reuses_IVAO_WEBHOOK_SECRET' },
+  ]);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(POLL_ONLY);
+  // A distinct webhook secret leaves health enabled.
+  const health = await callPollRoute('/health', 'GET', POLL_ONLY,
+    { POLL_SECRET: POLL_ONLY, IVAO_WEBHOOK_SECRET: 'synthetic-distinct-webhook-secret-0123456789' });
+  expect(await health.json()).toMatchObject({ ok: false, maxAgeSeconds: 300 });
+});

@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
-import { parse } from 'jsonc-parser';
+import { parse, visit } from 'jsonc-parser';
 
 export const root = fileURLToPath(new URL('../', import.meta.url));
 export const git = (...args) => execFileSync('git', args, { cwd: root, maxBuffer: 32 * 1024 * 1024 });
@@ -14,10 +14,22 @@ export function indexedFiles() {
   }));
 }
 export const readIndexed = (file) => git('show', `:${file}`);
+// A parsed `__proto__` key, escaped or not, becomes the object's prototype: its
+// settings would still be read but hidden from key checks, so it is refused.
 export function jsonc(text) {
   const errors = [];
   const value = parse(text, errors, { allowTrailingComma: true });
   if (errors.length || !value || typeof value !== 'object') throw new Error('Invalid JSON configuration');
+  let proto = false;
+  visit(text, { onObjectProperty: (name) => { if (name === '__proto__') proto = true; } }, { allowTrailingComma: true });
+  if (proto) throw new Error('__proto__ keys are not allowed');
   return value;
 }
-export const isMain = (url) => process.argv[1] && fileURLToPath(url) === resolve(process.argv[1]);
+// Node runs a symlinked script from its real path, so compare real paths.
+export function isMain(url) {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(fileURLToPath(url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}

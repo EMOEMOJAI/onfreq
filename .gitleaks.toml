@@ -1,0 +1,27 @@
+# Gitleaks configuration for the hooks and CI (scripts/secret-scan.sh). The
+# default rules miss low-entropy values, so this repository's own secret names
+# are flagged whenever they are assigned a value of 16 or more characters.
+title = "onfreq"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "onfreq-secret-assignment"
+description = "onfreq secret assigned a non-empty value"
+regex = '''\b(?:POLL_SECRET|HISTORY_SECRET|IVAO_WEBHOOK_SECRET|IVAO_CLIENT_SECRET|DISCORD_BOT_TOKEN)\b["']?\s*[=:]\s*["'`]?([^\s"'`]{16,})'''
+secretGroup = 1
+keywords = ["poll_secret", "history_secret", "ivao_webhook_secret", "ivao_client_secret", "discord_bot_token"]
+
+# Content-based only: hooks and CI scan `gitleaks stdin`, which has no paths.
+# Test fixtures use values that begin with "synthetic-"; the other entries are
+# published synthetic fixtures and code references to bindings, not values.
+[[rules.allowlists]]
+description = "Synthetic test fixtures and binding references"
+regexTarget = "secret"
+regexes = [
+  '''^synthetic-[A-Za-z0-9-]*$''',
+  '''^test-poll-secret$''',
+  '''^\$\{btoa\(\w+\)\}\.synthetic\.token$''',
+  '''^env\.[A-Z][A-Z0-9_]*,?$''',
+]

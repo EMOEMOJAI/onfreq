@@ -50,6 +50,15 @@ it.each([
   ['/health', 'POST', 'GET'],
   ['/gca-history', 'POST', 'GET'],
   ['/gca-history/cleanup', 'DELETE', 'GET, POST'],
+  // GET does not imply HEAD, and no route answers CORS preflights.
+  ['/poll', 'HEAD', 'POST'],
+  ['/health', 'HEAD', 'GET'],
+  ['/gca-history', 'HEAD', 'GET'],
+  ['/gca-history/cleanup', 'HEAD', 'GET, POST'],
+  ['/poll', 'OPTIONS', 'POST'],
+  ['/health', 'OPTIONS', 'GET'],
+  ['/gca-history', 'OPTIONS', 'GET'],
+  ['/gca-history/cleanup', 'OPTIONS', 'GET, POST'],
 ])('C1: %s rejects %s with one 405 shape before auth or the coordinator', async (path, method, allow) => {
   const { getByName, env: target } = withCoordinator({});
   const response = await send(path, method, target, { authorization: '' });
@@ -170,7 +179,17 @@ it('reports GET / as reachable without authentication', async () => {
   const response = await worker.fetch(new Request('https://example.test/'), env, createExecutionContext());
   expect(response.status).toBe(200);
   expect(response.headers.get('content-type')).toContain('text/plain');
+  expect(response.headers.get('cache-control')).toBe('no-store');
   expect(await response.text()).toContain('onfreq HTTP endpoint is reachable');
+});
+
+it('marks 404 responses no-store', async () => {
+  for (const [path, method] of [['/missing', 'GET'], ['/', 'POST'], ['/health/', 'GET']]) {
+    const response = await worker.fetch(new Request(`https://example.test${path}`, { method }), env, createExecutionContext());
+    expect(response.status).toBe(404);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(await response.text()).toBe('Not found');
+  }
 });
 
 it('reads existing durable state through the override without starting a new coordinator', async () => {

@@ -44,3 +44,7 @@ CLAUDE.local.md
 .local/
 docs/pr-audit-*.md
 /nano-banana-*.png
+
+# Operator settings; only the public .example templates are tracked.
+config/*
+!config/*.example

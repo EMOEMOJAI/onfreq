@@ -7,7 +7,9 @@ export function privatePath(file) {
     /(?:\.local\.(?:sh|jsonc?|md)|\.(?:pem|key|p12|pfx|log)|-secret(?:\.txt)?)$/i.test(name) ||
     /^(?:secrets\.json|poll-secret|poll-endpoint|settings\.local\.json|gitleaks-report\..*)$/.test(name) ||
     /^(?:wrangler\.local\..*|\.npmrc|\.DS_Store)$/.test(name) ||
-    /^docs\/pr-audit-[^/]*\.md$/.test(file);
+    /^docs\/pr-audit-[^/]*\.md$/.test(file) ||
+    // config/ holds operator settings; only its top-level .example templates are public.
+    /^config\//.test(file) && !/^config\/[^/]+\.example$/.test(file);
 }
 
 /** Validate every tracked Wrangler config without printing its values; TOML cannot be checked. */
@@ -107,14 +109,32 @@ export function imagePrivacy(file, data) {
   return null;
 }
 
+/**
+ * `git log -z` with COMMIT_EMAIL_FORMAT: hash, author email, committer email
+ * and the message trailers, unfolded and separated by \x1f.
+ */
+export const COMMIT_EMAIL_FORMAT = '--format=%H%x09%ae%x09%ce%x09%(trailers:only,unfold,separator=%x1f)';
+
+// GitHub creates merge commits with noreply@github.com as the committer; it is
+// a public service identity, unlike a maintainer's private address.
+const noreply = /^(?:[^\s@]+@users\.noreply\.github\.com|noreply@github\.com)$/i;
+// Co-author trailers may also name a public service identity.
+const trailerNoreply = /^(?:[^\s@]+@users\.noreply\.github\.com|noreply@github\.com|noreply@anthropic\.com)$/i;
+
 export function privateCommitEmails(log) {
-  return log.trim().split('\n').filter(Boolean).flatMap((row) => {
-    const [hash, author, committer] = row.split('\t');
-    // GitHub creates merge commits with noreply@github.com as the committer;
-    // it is a public service identity, unlike a maintainer's private address.
-    const allowed = (email) => /^(?:[^\s@]+@users\.noreply\.github\.com|noreply@github\.com)$/i.test(email ?? '');
-    return [author, committer].every(allowed)
-      ? [] : [`${hash.slice(0, 12)}: commit email must use GitHub noreply`];
+  return log.split('\0').filter(Boolean).flatMap((row) => {
+    const [hash = '', author, committer, ...rest] = row.split('\t');
+    const errors = [];
+    if (![author, committer].every((email) => noreply.test(email ?? ''))) {
+      errors.push(`${hash.slice(0, 12)}: commit email must use GitHub noreply`);
+    }
+    // Any address in a trailer (Co-authored-by, Signed-off-by...) is published too.
+    const trailers = rest.join('\t');
+    const emails = [...trailers.matchAll(/[^\s<>()"',;\x1f]+@[^\s<>()"',;\x1f]+/g)].map(([email]) => email);
+    if (!emails.every((email) => trailerNoreply.test(email))) {
+      errors.push(`${hash.slice(0, 12)}: commit trailer email must use a noreply address`);
+    }
+    return errors;
   });
 }
 
@@ -136,7 +156,7 @@ export function checkPrivacy() {
   if (git('rev-parse', '--is-shallow-repository').toString().trim() === 'true') {
     errors.push('Full reachable history is required; fetch with depth 0');
   } else {
-    errors.push(...privateCommitEmails(git('log', '--no-show-signature', '--format=%H%x09%ae%x09%ce', 'HEAD').toString()));
+    errors.push(...privateCommitEmails(git('log', '-z', '--no-show-signature', COMMIT_EMAIL_FORMAT, 'HEAD').toString()));
   }
   return errors;
 }
@@ -200,7 +220,7 @@ export function checkRange(local, excludes) {
     }
   }
   // log.showSignature would add signature lines that parse as commits.
-  errors.push(...privateCommitEmails(git('log', '--no-show-signature', '--format=%H%x09%ae%x09%ce', ...range).toString()));
+  errors.push(...privateCommitEmails(git('log', '-z', '--no-show-signature', COMMIT_EMAIL_FORMAT, ...range).toString()));
   return [...new Set(errors)];
 }
 

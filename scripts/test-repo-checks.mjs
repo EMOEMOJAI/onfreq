@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { diffTreeRows, fileErrors, imagePrivacy, privateCommitEmails, privatePath, publicConfig, rangeArgs,
   wranglerConfigErrors } from './check-privacy.mjs';
 import { checkExternalLinks, checkLocalLinks, documentLinks } from './check-links.mjs';
-import { isolatedEnv, testDeployGuard, validateHooks, validateSetup } from './check-setup.mjs';
-import { jsonc } from './repo-files.mjs';
+import { isolatedEnv, optionalSecretNames, testDeployGuard, validateHooks, validateOptionalSecrets, validateSetup,
+  validateTestBindings } from './check-setup.mjs';
+import { isMain, jsonc } from './repo-files.mjs';
 import { CONFIG, lintDocs } from './lint-docs.mjs';
 
 test('rejects private paths independently of gitignore, allowing public templates', () => {
@@ -16,9 +18,11 @@ test('rejects private paths independently of gitignore, allowing public template
     'wrangler.local.json', 'wrangler.local.toml', 'nested/wrangler.local.yaml', '.npmrc', 'nested/.npmrc',
     'set-secrets.local.sh', '.local/report.txt', '.wrangler/state.db', 'poll-secret', 'poll-endpoint',
     'key.pem', 'private.key', 'trace.log', '.claude/settings.local.json', '.DS_Store', 'assets/.DS_Store',
-    'docs/pr-audit-2026-09.md', 'docs/pr-audit-.md']) assert.equal(privatePath(file), true, file);
+    'docs/pr-audit-2026-09.md', 'docs/pr-audit-.md', 'config/optional-secrets', 'config/production.env',
+    'config/optional-secrets.example.bak', 'config/nested/settings.example', 'config/.example']) assert.equal(privatePath(file), true, file);
   for (const file of ['.dev.vars.example', '.env.example', 'wrangler.jsonc', 'config/optional-secrets.example',
-    'docs/setup.md', 'docs/pr-audit.md', 'nested/docs/pr-audit-notes.md', 'docs/pr-audit-notes.txt']) {
+    'config/other.example', 'nested/config/settings.json', 'docs/setup.md', 'docs/pr-audit.md',
+    'nested/docs/pr-audit-notes.md', 'docs/pr-audit-notes.txt']) {
     assert.equal(privatePath(file), false, file);
   }
 });
@@ -38,6 +42,42 @@ test('checks every tracked Wrangler config, including nested and JSON files, and
   assert.match(wranglerConfigErrors('wrangler.json', Buffer.from('{ synthetic-private-value'))[0], /invalid/);
   assert.doesNotMatch(wranglerConfigErrors('wrangler.json', Buffer.from('{ synthetic-private-value'))[0], /synthetic/);
   assert.deepEqual(wranglerConfigErrors('docs/not-wrangler.json', leaked), []);
+});
+
+test('JSON configuration refuses __proto__ keys at any depth, so tracked Wrangler configs fail closed', (t) => {
+  for (const text of ['{ "__proto__": { "account_id": "synthetic-private-value" } }',
+    '{ "kv_namespaces": [{ "binding": "ATC_STATE", "__proto__": { "id": "synthetic-private-value" } }] }',
+    '{ "\\u005f_proto__": { "routes": [] }, }']) {
+    assert.throws(() => jsonc(text), /__proto__ keys are not allowed/, text);
+    const errors = wranglerConfigErrors('wrangler.jsonc', Buffer.from(text));
+    assert.deepEqual(errors, ['wrangler.jsonc: invalid Wrangler configuration'], text);
+    assert.deepEqual(fileErrors('nested/wrangler.json', '100644', () => Buffer.from(text)),
+      ['nested/wrangler.json: invalid Wrangler configuration'], text);
+  }
+  assert.deepEqual(jsonc('{ "proto": { "__proto": 1 }, }'), { proto: { __proto: 1 } });
+
+  // End to end: a tracked wrangler.jsonc whose prototype hides an operator ID fails the privacy check.
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-proto-')));
+  t.after(() => rmSync(repo, { recursive: true, force: true }));
+  mkdirSync(join(repo, 'scripts'));
+  for (const name of ['check-privacy.mjs', 'repo-files.mjs']) copyFileSync(new URL(`./${name}`, import.meta.url), join(repo, 'scripts', name));
+  symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(repo, 'node_modules'));
+  writeFileSync(join(repo, '.gitignore'), 'node_modules\n');
+  writeFileSync(join(repo, 'wrangler.jsonc'), '{ "__proto__": { "account_id": "synthetic-private-value" } }\n');
+  const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+  const git = (...args) => assert.equal(spawnSync('git', ['-c', 'user.name=Synthetic',
+    '-c', 'user.email=synthetic@users.noreply.github.com', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
+    ...args], { cwd: repo, env }).status, 0, `git ${args[0]} failed`);
+  git('init', '--quiet');
+  git('add', '.');
+  git('commit', '--quiet', '--no-verify', '-m', 'synthetic');
+  const result = spawnSync(process.execPath, ['scripts/check-privacy.mjs'], { cwd: repo, env, encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /^wrangler\.jsonc: invalid Wrangler configuration$/m);
+  assert.doesNotMatch(result.stderr + result.stdout, /synthetic-private-value/);
+  writeFileSync(join(repo, 'wrangler.jsonc'), '{ "kv_namespaces": [] }\n');
+  git('commit', '--quiet', '--no-verify', '-am', 'clean');
+  assert.equal(spawnSync(process.execPath, ['scripts/check-privacy.mjs'], { cwd: repo, env }).status, 0);
 });
 
 test('requires versioned hooks tracked as executable under scripts/hooks', () => {
@@ -77,6 +117,24 @@ test('range mode parses diff-tree rows and fails closed on unparseable output (S
     `:100644 100644 ${a} ${b}\0file\0`, `:100644 100644 ${a} short M\0file\0`, `:100644 100644 ${a} ${b} M\0\0`]) {
     assert.throws(() => diffTreeRows(bad), /Unparseable/, JSON.stringify(bad));
   }
+});
+
+test('checks commit trailer emails, allowing only noreply identities, and redacts them (T1-5)', () => {
+  const row = (trailers) => ['c'.repeat(40), '1+example@users.noreply.github.com', 'noreply@github.com', trailers].join('\t');
+  const allowed = ['Co-Authored-By: Synthetic Model <noreply@anthropic.com>',
+    'Co-authored-by: Example <2+example@users.noreply.github.com>', 'Signed-off-by: GitHub <noreply@github.com>'];
+  assert.deepEqual(privateCommitEmails([row(''), row(allowed.join('\x1f')), ''].join('\0')), []);
+  for (const trailer of ['Co-authored-by: Person <person@example.test>', 'Signed-off-by: person@example.test',
+    'Reviewed-by: Person <person@example.test>, Model <noreply@anthropic.com>',
+    // The Anthropic identity is allowed only in trailers, never as author or committer.
+    'Co-authored-by: Person <noreply@anthropic.com.example.test>']) {
+    const failures = privateCommitEmails([row(allowed[0]), row(`${allowed[1]}\x1f${trailer}`)].join('\0'));
+    assert.deepEqual(failures, [`${'c'.repeat(12)}: commit trailer email must use a noreply address`], trailer);
+  }
+  assert.equal(privateCommitEmails(['d'.repeat(40), 'noreply@anthropic.com', 'noreply@anthropic.com', ''].join('\t')).length, 1);
+  // Author and trailer failures are reported separately.
+  assert.equal(privateCommitEmails(['e'.repeat(40), 'person@example.test', 'noreply@github.com',
+    'Co-authored-by: Person <person@example.test>'].join('\t')).length, 2);
 });
 
 test('checks both raw commit emails and redacts rejected identities', () => {
@@ -214,6 +272,42 @@ test('validates guided setup and rejects changed prompts, values and deployment 
   assert.throws(() => validateSetup(config, { ...pkg, scripts: { ...pkg.scripts, deploy: 'wrangler deploy' } }, example));
 });
 
+test('optional setting examples are empty and name exactly the optional secrets (T1-5)', () => {
+  const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  const example = read('../config/optional-secrets.example');
+  const envTypes = read('../src/env.d.ts');
+  assert.ok(optionalSecretNames(envTypes).includes('POLL_SECRET'));
+  validateOptionalSecrets(example, envTypes);
+  for (const changed of [
+    example.replace('HISTORY_SECRET=""', 'HISTORY_SECRET="synthetic-value"'),
+    example.replace('GCA_REGIONS=""', "GCA_REGIONS='{}'"),
+    example.replace('GCA_DM_ENABLED="false"', 'GCA_DM_ENABLED="true"'),
+    example.replace('COORDINATOR_NAME=""', 'COORDINATOR_NAME=synthetic'),
+    example.replace('MENTION_ROLE_ID=""\n', ''),
+    `${example}\nEXTRA_SETTING=""\n`,
+    `${example}\nPOLL_SECRET=""\n`,
+    `${example}\nFIR_LABELS=""\n`,
+  ]) assert.throws(() => validateOptionalSecrets(changed, envTypes));
+  assert.throws(() => validateOptionalSecrets(example, envTypes.replace('  COORDINATOR_NAME?: string;\n', '')));
+  assert.throws(() => optionalSecretNames(envTypes.replace('  GCA_REGIONS?: string;', '  GCA_REGIONS: string;')));
+  assert.throws(() => optionalSecretNames('type Env = {};'));
+});
+
+test('vitest bindings cover every optional and first-run setting (T2-4)', () => {
+  const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  const vitest = read('../vitest.config.ts');
+  const envTypes = read('../src/env.d.ts');
+  validateTestBindings(vitest, envTypes);
+  for (const name of ['GCA_VERIFIED_ROLE_ID', 'MENTION_COOLDOWN_MINUTES', 'IVAO_WEBHOOK_SECRET', 'FIR_PREFIXES']) {
+    const removed = vitest.replace(new RegExp(`^ {8}${name}: .*\n`, 'm'), '');
+    assert.notEqual(removed, vitest, name);
+    assert.throws(() => validateTestBindings(removed, envTypes), new RegExp(`Missing test binding: ${name}`));
+  }
+  assert.throws(() => validateTestBindings(vitest, envTypes.replace('  COORDINATOR_NAME?: string;',
+    '  COORDINATOR_NAME?: string;\n  SYNTHETIC_SETTING?: string;')), /SYNTHETIC_SETTING/);
+  assert.throws(() => validateTestBindings('export default {};', envTypes), /Missing vitest miniflare bindings/);
+});
+
 test('public deploy permits a fresh template and blocks private configuration, even with ignore-scripts', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   testDeployGuard(readFileSync(new URL('./check-deploy.mjs', import.meta.url)), pkg.scripts.deploy);
@@ -259,6 +353,32 @@ test('public deploy guard also sees private config in the main checkout of a Git
   }
   // Removing the private config allows the public deployment again.
   assert.equal(guard(linked).status, 0);
+  // T2-4: any wrangler.local.* entry in this checkout or the main worktree is private config.
+  for (const name of ['wrangler.local.yaml', 'wrangler.local.jsonc.bak', 'wrangler.local.d']) {
+    for (const dir of [main, linked]) {
+      if (name.endsWith('.d')) mkdirSync(join(dir, name)); else writeFileSync(join(dir, name), '{}');
+      for (const cwd of dir === main ? [main, linked] : [linked]) {
+        const result = guard(cwd);
+        assert.equal(result.status, 1, `${name} in ${dir === main ? 'main' : 'linked'} from ${cwd === main ? 'main' : 'linked'}`);
+        assert.match(result.stderr, /Private deployment config detected/);
+      }
+      rmSync(join(dir, name), { recursive: true });
+    }
+  }
+  // T2-4: a linked worktree whose main worktree Git cannot report fails closed.
+  const withoutGit = (cwd) => spawnSync(process.execPath, ['scripts/check-deploy.mjs'],
+    { cwd, env: { ...env, PATH: join(base, 'no-tools') }, encoding: 'utf8' });
+  const blind = withoutGit(linked);
+  assert.equal(blind.status, 1);
+  assert.match(blind.stderr, /Could not find the main Git worktree/);
+  assert.equal(withoutGit(main).status, 0, 'a main checkout is checked directly');
+  const detached = join(base, 'detached');
+  mkdirSync(join(detached, 'scripts'), { recursive: true });
+  copyFileSync(new URL('./check-deploy.mjs', import.meta.url), join(detached, 'scripts/check-deploy.mjs'));
+  writeFileSync(join(detached, '.git'), `gitdir: ${join(base, 'missing-git-dir')}\n`);
+  const missing = guard(detached);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /Could not find the main Git worktree/);
 
   // Inherited GIT_* variables must not redirect the lookup to another repository.
   writeFileSync(join(main, 'wrangler.local.jsonc'), '{}');
@@ -375,6 +495,40 @@ test('docs lint expands only supported globs, applies the config and refuses uns
   await assert.rejects(lintWith(['escaped/escape.md']), /resolves outside the repository/);
   await assert.rejects(lintWith(['--config', join(outside, 'escape.md')]), /outside the repository/);
   await assert.rejects(lintWith(['--unknown']), /Unknown option/);
+});
+
+test('docs lint refuses __proto__ keys that would hide globs or rules from its checks (T2-5)', async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-lint-proto-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, 'README.md'), '# Title\n');
+  for (const text of ['{ "__proto__": { "globs": ["README.md"] } }',
+    '{ "globs": ["README.md"], "config": { "__proto__": { "MD013": true } } }',
+    '{ "globs": ["README.md"], "\\u005f_proto__": {} }']) {
+    writeFileSync(join(root, CONFIG), text);
+    await assert.rejects(lintDocs([], { root, cwd: root }), /__proto__ keys are not allowed/, text);
+  }
+  writeFileSync(join(root, CONFIG), '{ "globs": ["README.md"], "config": { "MD041": false } }');
+  assert.deepEqual(await lintDocs([], { root, cwd: root }), { files: ['README.md'], violations: [] });
+});
+
+test('scripts run as the main module through a symlinked path (T2-5)', (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-main-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const link = join(dir, 'lint-docs.mjs');
+  symlinkSync(fileURLToPath(new URL('./lint-docs.mjs', import.meta.url)), link);
+  const run = spawnSync(process.execPath, [link, 'missing-lint-docs-fixture.md'],
+    { cwd: new URL('..', import.meta.url), encoding: 'utf8' });
+  assert.equal(run.status, 1);
+  assert.match(run.stderr, /^Markdown lint: missing-lint-docs-fixture\.md: missing file$/m);
+  const argv = process.argv[1];
+  t.after(() => { process.argv[1] = argv; });
+  process.argv[1] = link;
+  assert.equal(isMain(new URL('./lint-docs.mjs', import.meta.url).href), true);
+  assert.equal(isMain(new URL('./check-links.mjs', import.meta.url).href), false);
+  for (const missing of [join(dir, 'missing.mjs'), '', undefined]) {
+    process.argv[1] = missing;
+    assert.equal(isMain(new URL('./lint-docs.mjs', import.meta.url).href), false, String(missing));
+  }
 });
 
 test('docs lint CLI exits 1 with a message on refusals', () => {
