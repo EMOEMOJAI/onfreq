@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -9,6 +9,7 @@ import { diffTreeRows, fileErrors, imagePrivacy, privateCommitEmails, privatePat
 import { checkExternalLinks, checkLocalLinks, documentLinks } from './check-links.mjs';
 import { isolatedEnv, testDeployGuard, validateHooks, validateSetup } from './check-setup.mjs';
 import { jsonc } from './repo-files.mjs';
+import { CONFIG, lintDocs } from './lint-docs.mjs';
 
 test('rejects private paths independently of gitignore, allowing public templates', () => {
   for (const file of ['.dev.vars', '.env.production', 'nested/.dev.vars.preview', 'wrangler.local.jsonc',
@@ -331,4 +332,54 @@ test('external checks retry transient errors, fall back to GET and distinguish u
   assert.equal(calls[3].options.method, 'GET');
   assert.ok(calls.every(({ options }) => !options.headers));
   assert.equal(replies.length, 0);
+});
+
+test('docs lint expands only supported globs, applies the config and refuses unsafe paths', async (t) => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-lint-')));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-lint-outside-')));
+  t.after(() => [base, outside].forEach((dir) => rmSync(dir, { recursive: true, force: true })));
+  const root = join(base, 'repo');
+  mkdirSync(join(root, 'docs/nested'), { recursive: true });
+  const config = (value) => writeFileSync(join(root, 'config.jsonc'), JSON.stringify(value));
+  const lintWith = (argv) => lintDocs(argv, { root, cwd: root });
+  writeFileSync(join(root, CONFIG), JSON.stringify({ globs: ['*.md', 'docs/*.md', 'llms.txt'], config: { MD013: false } }));
+  for (const file of ['README.md', '.hidden.md', 'docs/setup.md', 'docs/nested/deep.md', 'llms.txt', 'notes.txt']) {
+    writeFileSync(join(root, file), `# Title\n\n${'long '.repeat(30).trim()}\n`);
+  }
+  assert.deepEqual(await lintWith([]), { files: ['.hidden.md', 'README.md', 'docs/setup.md', 'llms.txt'], violations: [] });
+  writeFileSync(join(root, 'bad.md'), '# Title\n\n### Jump\n');
+  assert.deepEqual((await lintWith(['bad.md'])).violations,
+    ['bad.md:3 error MD001/heading-increment Heading levels should only increment by one level at a time [Expected: h2; Actual: h3]']);
+  writeFileSync(join(root, 'config.jsonc'), '{ "globs": ["*.md", }');
+  await assert.rejects(lintWith(['--config', 'config.jsonc']), /config\.jsonc: Invalid JSON configuration/);
+  config({ globs: ['*.md'], ignores: [] });
+  await assert.rejects(lintWith(['--config', 'config.jsonc']), /unsupported top-level keys: ignores/);
+  config({ globs: ['*.md', 'missing/*.md'] });
+  await assert.rejects(lintWith(['--config', 'config.jsonc']), /Glob matched no files: missing\/\*\.md/);
+  config({ globs: ['absent.md'] });
+  await assert.rejects(lintWith(['--config', 'config.jsonc']), /Glob matched no files: absent\.md/);
+  for (const glob of ['**/*.md', '{a,b}.md', '?.md', '[ab].md', '!README.md', 'docs/*', '../*.md', 'docs/../x.md', '/etc/x.md']) {
+    config({ globs: [glob] });
+    await assert.rejects(lintWith(['--config', 'config.jsonc']), /Unsupported glob/, glob);
+  }
+  writeFileSync(join(outside, 'escape.md'), '# Outside\n');
+  symlinkSync('README.md', join(root, 'link.md'));
+  await assert.rejects(lintWith([]), /link\.md: symlink; refusing/);
+  await assert.rejects(lintWith(['link.md']), /symlink; refusing/);
+  rmSync(join(root, 'link.md'));
+  await assert.rejects(lintWith(['missing.md']), /missing\.md: missing file/);
+  await assert.rejects(lintWith(['docs']), /not a regular file/);
+  await assert.rejects(lintWith([join(outside, 'escape.md')]), /outside the repository/);
+  await assert.rejects(lintWith(['../../outside.md']), /outside the repository/);
+  symlinkSync(outside, join(root, 'escaped'));
+  await assert.rejects(lintWith(['escaped/escape.md']), /resolves outside the repository/);
+  await assert.rejects(lintWith(['--config', join(outside, 'escape.md')]), /outside the repository/);
+  await assert.rejects(lintWith(['--unknown']), /Unknown option/);
+});
+
+test('docs lint CLI exits 1 with a message on refusals', () => {
+  const run = spawnSync(process.execPath, ['scripts/lint-docs.mjs', 'missing-lint-docs-fixture.md'],
+    { cwd: new URL('..', import.meta.url), encoding: 'utf8' });
+  assert.equal(run.status, 1);
+  assert.match(run.stderr, /^Markdown lint: missing-lint-docs-fixture\.md: missing file$/m);
 });
