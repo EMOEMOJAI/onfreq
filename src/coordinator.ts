@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import {
-  CRON_PERIOD_MS, EARLY_POLL_DELAY_MS, EARLY_POLL_KEY, EARLY_POLL_MIN_GAIN_MS, EARLY_POLLS_PER_HOUR,
-  MIN_POLL_INTERVAL_MS, MIN_POLL_SPACING_MS, POLL_SNAPSHOT_KEY, SCHEDULER_SEEN_KEY, SCHEDULER_SEEN_MIN_WRITE_MS,
+  CRON_JITTER_MS, CRON_PERIOD_MS, EARLY_POLL_DELAY_MS, EARLY_POLL_KEY, EARLY_POLL_MIN_GAIN_MS, EARLY_POLLS_PER_HOUR,
+  MIN_POLL_INTERVAL_MS, MIN_POLL_SPACING_MS, MIN_SCHEDULED_POLL_SPACING_MS, POLL_SNAPSHOT_KEY, SCHEDULER_SEEN_KEY, SCHEDULER_SEEN_MIN_WRITE_MS,
   STATE_KEY,
 } from './config';
 import { runPoll } from './poll';
@@ -45,6 +45,12 @@ interface EarlyPollBudget {
 }
 
 const HOUR_MS = 60 * 60_000;
+
+/** The stored budget, or undefined when absent or corrupt (a bad count must not lock out or mis-count polls). */
+function readBudget(raw: EarlyPollBudget | undefined): EarlyPollBudget | undefined {
+  return typeof raw?.count === 'number' && Number.isFinite(raw.count) &&
+    typeof raw.hourStart === 'number' && Number.isFinite(raw.hourStart) ? raw : undefined;
+}
 
 /** The clock hour whose spent budget was last logged: webhook traffic must not multiply this line. */
 let loggedEarlyPollCappedHour: number | undefined;
@@ -96,7 +102,8 @@ export class PollCoordinator extends DurableObject<Env> {
   /**
    * A verified webhook hint: schedule one earlier poll through the alarm, at
    * least EARLY_POLL_DELAY_MS from now and MIN_POLL_SPACING_MS after the last
-   * poll. No-op while a poll runs, when a live cron's next poll that will
+   * poll. A pending alarm that a later poll has made a guaranteed skip is
+   * recomputed, and cleared when nothing should be scheduled. No-op while a poll runs, when a live cron's next poll that will
    * actually run is about as soon, or once this hour's early-poll budget is
    * spent. Without a recent heartbeat (a stopped cron) the early poll always
    * helps. Resolves to the pending alarm's time (epoch ms), whether just set
@@ -104,35 +111,41 @@ export class PollCoordinator extends DurableObject<Env> {
    */
   async requestEarlyPoll(): Promise<number | null> {
     const pending = await this.ctx.storage.getAlarm();
-    if (pending !== null) return pending;
-    if (this.inFlight) return null;
+    if (this.inFlight) return pending;
     const snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
-    const seen = await this.ctx.storage.get<unknown>(SCHEDULER_SEEN_KEY);
     const now = Date.now();
     // Future start times are not trusted, as in runOnce's throttle.
     const trusted = (at: number | undefined) => (at !== undefined && at <= now ? at : undefined);
     const last = trusted(snapshot?.lastPollStartedAt);
+    if (pending !== null && (last === undefined || pending - last >= MIN_POLL_SPACING_MS)) return pending;
+    const seen = await this.ctx.storage.get<unknown>(SCHEDULER_SEEN_KEY);
+    // Nothing to schedule: a stale pending alarm would only run a skipped poll.
+    const none = async () => {
+      if (pending !== null) await this.ctx.storage.deleteAlarm();
+      return null;
+    };
     const target = Math.max(now + EARLY_POLL_DELAY_MS, (last ?? 0) + MIN_POLL_SPACING_MS);
-    if (typeof seen === 'number' && within(seen, now, CRON_PERIOD_MS)) {
+    if (typeof seen === 'number' && within(seen, now, CRON_PERIOD_MS + CRON_JITTER_MS)) {
       // The next cron poll that will actually run: a tick within the spacing of
       // the last poll, or within the interval of the last scheduled one, is
-      // skipped. One tick later always clears both, so the loop is bounded.
+      // skipped, by the scheduled spacing. One tick later always clears both,
+      // so the loop is bounded.
       const lastScheduled = trusted(snapshot?.lastScheduledPollStartedAt ?? snapshot?.lastPollStartedAt);
       let next = seen + CRON_PERIOD_MS;
-      for (let i = 0; i < 2 && ((last !== undefined && next - last < MIN_POLL_SPACING_MS) ||
+      for (let i = 0; i < 2 && ((last !== undefined && next - last < MIN_SCHEDULED_POLL_SPACING_MS) ||
           (lastScheduled !== undefined && next - lastScheduled < MIN_POLL_INTERVAL_MS)); i++) {
         next += CRON_PERIOD_MS;
       }
-      if (target >= next - EARLY_POLL_MIN_GAIN_MS) return null;
+      if (target >= next - EARLY_POLL_MIN_GAIN_MS) return none();
     }
-    const budget = await this.ctx.storage.get<EarlyPollBudget>(EARLY_POLL_KEY);
+    const budget = readBudget(await this.ctx.storage.get<EarlyPollBudget>(EARLY_POLL_KEY));
     const hour = hourStart(now);
     if (budget?.hourStart === hour && budget.count >= EARLY_POLLS_PER_HOUR) {
       if (loggedEarlyPollCappedHour !== hour) {
         loggedEarlyPollCappedHour = hour;
         console.error(JSON.stringify({ event: 'early_poll_capped' }));
       }
-      return null;
+      return none();
     }
     // No re-check of inFlight: input gates deliver no other event while this awaits storage only.
     await this.ctx.storage.setAlarm(target);
@@ -157,7 +170,7 @@ export class PollCoordinator extends DurableObject<Env> {
     if (!attempt.ran) return;
     try {
       const now = Date.now();
-      const budget = await this.ctx.storage.get<EarlyPollBudget>(EARLY_POLL_KEY);
+      const budget = readBudget(await this.ctx.storage.get<EarlyPollBudget>(EARLY_POLL_KEY));
       const count = budget?.hourStart === hourStart(now) ? budget.count + 1 : 1;
       await this.ctx.storage.put(EARLY_POLL_KEY, { hourStart: hourStart(now), count } satisfies EarlyPollBudget);
     } catch (err) {
@@ -196,7 +209,11 @@ export class PollCoordinator extends DurableObject<Env> {
     const fresh = (at: unknown) => typeof at === 'number' && now - at >= 0 && now - at < HEALTH_MAX_AGE_MS;
     // Early polls alone must not hide a stopped scheduler. A deployment that
     // has not yet recorded a heartbeat keeps the success-age rule alone.
-    const ok = fresh(lastSuccessfulPollAt) && (schedulerSeenAt === undefined || fresh(schedulerSeenAt));
+    // Without a heartbeat, a snapshot that records poll starts must also have a
+    // fresh start: a new install driven only by early polls records 0.
+    const started = snapshot?.lastScheduledPollStartedAt ?? snapshot?.lastPollStartedAt;
+    const ok = fresh(lastSuccessfulPollAt) &&
+      (schedulerSeenAt === undefined ? started === undefined || fresh(started) : fresh(schedulerSeenAt));
     return { ok, lastSuccessfulPollAt, maxAgeSeconds: HEALTH_MAX_AGE_MS / 1000 };
   }
 
@@ -244,11 +261,13 @@ export class PollCoordinator extends DurableObject<Env> {
     const startedAt = Date.now();
     // A future start time (clock skew or corrupted storage) is not trusted as a
     // throttle: otherwise it would block every poll until that time arrives.
-    // Every poll keeps MIN_POLL_SPACING_MS from the last one; scheduled polls
-    // also keep MIN_POLL_INTERVAL_MS from the last scheduled one, so early
-    // polls do not push the cron back. Older snapshots fall back to any poll.
+    // Early polls keep MIN_POLL_SPACING_MS from the last poll, scheduled polls
+    // MIN_SCHEDULED_POLL_SPACING_MS; scheduled polls also keep
+    // MIN_POLL_INTERVAL_MS from the last scheduled one, so early polls do not
+    // push the cron back. Older snapshots fall back to any poll.
     const lastScheduled = snapshot.lastScheduledPollStartedAt ?? snapshot.lastPollStartedAt;
-    if (within(snapshot.lastPollStartedAt, startedAt, MIN_POLL_SPACING_MS) ||
+    const spacing = kind === 'scheduled' ? MIN_SCHEDULED_POLL_SPACING_MS : MIN_POLL_SPACING_MS;
+    if (within(snapshot.lastPollStartedAt, startedAt, spacing) ||
         (kind === 'scheduled' && within(lastScheduled, startedAt, MIN_POLL_INTERVAL_MS))) {
       if (snapshot.error) throw new Error(snapshot.error);
       return { skipped: true };

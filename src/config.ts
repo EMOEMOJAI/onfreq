@@ -77,8 +77,12 @@ export const SCHEDULER_SEEN_KEY = 'scheduler-seen-v1';
 export const SCHEDULER_SEEN_MIN_WRITE_MS = 5_000;
 /** The Wrangler cron runs every minute. */
 export const CRON_PERIOD_MS = 60_000;
-/** No two polls of any kind start closer together than this. */
+/** An early poll starts at least this long after any other poll. */
 export const MIN_POLL_SPACING_MS = 30_000;
+/** A scheduled poll keeps 5 s less from the last poll, like MIN_POLL_INTERVAL_MS, so a cron tick just under 30 s after an early poll is not lost to jitter. */
+export const MIN_SCHEDULED_POLL_SPACING_MS = MIN_POLL_SPACING_MS - 5_000;
+/** Allowance for a late cron tick when predicting the next one from its heartbeat. */
+export const CRON_JITTER_MS = 5_000;
 /** Durable early-poll budget for the current clock hour. */
 export const EARLY_POLL_KEY = 'early-poll-v1';
 // A verified IVAO webhook only brings the next poll forward. Early polls wait

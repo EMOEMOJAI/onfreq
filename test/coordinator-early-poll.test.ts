@@ -180,6 +180,53 @@ describe('requestEarlyPoll', () => {
     expect(await alarmAt()).toBe(T0 + 20_000);
   });
 
+  it('recomputes a pending alarm that a cron poll has made a guaranteed skip', async () => {
+    expect(await request()).toBe(T0 + 20_000);
+    now = T0 + 10_000;
+    await cron();
+    expect(feedFetches()).toBe(1);
+    now = T0 + 12_000;
+    // The alarm at 20 s would run 10 s after the cron poll: replaced by cron start + 30 s.
+    expect(await request()).toBe(T0 + 40_000);
+    expect(await alarmAt()).toBe(T0 + 40_000);
+    now = T0 + 40_000;
+    expect(await fireDueAlarm()).toBe(true);
+    expect(feedFetches()).toBe(2);
+  });
+
+  it('clears a stale pending alarm when the normal path schedules nothing', async () => {
+    // An early poll 5 s ago made the alarm at +10 s a skip; the cron tick at +20 s is as soon as any new alarm.
+    await seed({ state: {}, lastPollStartedAt: T0 - 5_000, lastScheduledPollStartedAt: T0 - 40_000 });
+    await seedSeen(T0 - 40_000);
+    await storage((ctx) => ctx.storage.setAlarm(T0 + 10_000));
+    expect(await request()).toBeNull();
+    expect(await alarmAt()).toBeNull();
+    // Likewise when the hour's budget is spent.
+    await seedSeen(T0 - 60_000);
+    await storage((ctx) => ctx.storage.setAlarm(T0 + 10_000));
+    await storage((ctx) => ctx.storage.put(EARLY_POLL_KEY, { hourStart: T0, count: 20 }));
+    expect(await request()).toBeNull();
+    expect(await alarmAt()).toBeNull();
+  });
+
+  it('treats a cron up to 5 s late as about to fire', async () => {
+    await seedSeen(T0 - 60_200);
+    expect(await request()).toBeNull();
+    expect(await alarmAt()).toBeNull();
+    await seedSeen(T0 - 65_000);
+    expect(await request()).toBe(T0 + 20_000);
+  });
+
+  it('ignores a corrupt stored budget', async () => {
+    await storage((ctx) => ctx.storage.put(EARLY_POLL_KEY, { hourStart: T0, count: '99' }));
+    expect(await request()).toBe(T0 + 20_000);
+    now = T0 + 20_000;
+    expect(await fireDueAlarm()).toBe(true);
+    expect(await budget()).toEqual({ hourStart: T0, count: 1 });
+    await storage((ctx) => ctx.storage.put(EARLY_POLL_KEY, { hourStart: T0, count: Number.NaN }));
+    expect(await request()).toBe(T0 + 50_000);
+  });
+
   it('resolves to the pending alarm time, or null when nothing is scheduled', async () => {
     expect(await request()).toBe(T0 + 20_000);
     // Already pending: kept, and its time still reported.
@@ -356,6 +403,19 @@ describe('cadence', () => {
     expect(await alarmAt()).toBe(T0 + 90_000);
   });
 
+  it('lets a cron poll follow an early poll after 25 s (early 30.001, cron 60)', async () => {
+    await cron();
+    now = T0 + 10_001;
+    await webhook();
+    expect(await alarmAt()).toBe(T0 + 30_001);
+    now = T0 + 30_001;
+    expect(await fireDueAlarm()).toBe(true);
+    expect(feedFetches()).toBe(2);
+    now = T0 + 60_000;
+    await cron();
+    expect(feedFetches()).toBe(3);
+  });
+
   it('lets an early poll 40 s past the cron delay the next cron poll by one minute at most', async () => {
     await cron();
     now = T0 + 20_000;
@@ -363,7 +423,7 @@ describe('cadence', () => {
     expect(await alarmAt()).toBe(T0 + 40_000);
     now = T0 + 40_000;
     expect(await fireDueAlarm()).toBe(true);
-    // Less than 30 s after the early poll: skipped, but the heartbeat is recorded.
+    // Less than 25 s after the early poll: skipped, but the heartbeat is recorded.
     now = T0 + 60_000;
     await cron();
     expect(feedFetches()).toBe(2);
@@ -482,6 +542,15 @@ describe('health with webhook-driven polls', () => {
     expect((await health()).status).toBe(200);
     await stub().getHealth();
     expect(await storage((ctx) => ctx.storage.get(SCHEDULER_SEEN_KEY))).toBeUndefined();
+  });
+
+  it('is unhealthy for a new install driven only by early polls', async () => {
+    await request();
+    now = T0 + 20_000;
+    expect(await fireDueAlarm()).toBe(true);
+    expect(await snapshot()).toMatchObject({ lastScheduledPollStartedAt: 0 });
+    expect(await seen()).toBeUndefined();
+    expect((await health()).status).toBe(503);
   });
 
   it.each([
