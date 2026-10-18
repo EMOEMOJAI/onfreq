@@ -1,5 +1,7 @@
 import { configuredSecret, extractBearer, logConfigInvalidOnce, secretsMatch } from './auth';
 import { getCoordinator } from './config';
+import { errorResponse } from './http';
+import { handleWebhook, WEBHOOK_PATH } from './webhook';
 
 export { PollCoordinator } from './coordinator';
 
@@ -13,9 +15,24 @@ interface Route {
   handle(request: Request, url: URL, env: Env): Promise<Response>;
 }
 
-/** Error bodies are `{ error }` with a fixed message: never stored errors, identifiers or variable names. */
-const errorResponse = (error: string, status: number, headers?: Record<string, string>) =>
-  Response.json({ error }, { status, headers });
+/** Every response of a protected route, including errors, is marked no-store. */
+function noStore(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set('cache-control', 'no-store');
+  return new Response(response.body, { status: response.status, headers });
+}
+
+/**
+ * A generic 503 for a handler that threw. Neither the response nor the log may
+ * expose stored errors, identifiers or request content, so only the error type
+ * is recorded, never its message.
+ */
+function routeFailed(url: URL, err: unknown): Response {
+  console.error(JSON.stringify({
+    event: 'route_failed', route: url.pathname, error: err instanceof Error ? err.name : typeof err,
+  }));
+  return errorResponse('coordinator unavailable', 503);
+}
 
 /**
  * Returns a disabled/unauthorized Response to short-circuit the caller, or
@@ -54,18 +71,11 @@ async function serve(route: Route, request: Request, url: URL, env: Env): Promis
       try {
         response = await route.handle(request, url, env);
       } catch (err) {
-        // Neither the response nor the log may expose stored errors or
-        // identifiers, so only the error type is recorded, never its message.
-        console.error(JSON.stringify({
-          event: 'route_failed', route: url.pathname, error: err instanceof Error ? err.name : typeof err,
-        }));
-        response = errorResponse('coordinator unavailable', 503);
+        response = routeFailed(url, err);
       }
     }
   }
-  const headers = new Headers(response.headers);
-  headers.set('cache-control', 'no-store');
-  return new Response(response.body, { status: response.status, headers });
+  return noStore(response);
 }
 
 /**
@@ -78,7 +88,7 @@ async function serve(route: Route, request: Request, url: URL, env: Env): Promis
 async function handlePoll(_request: Request, _url: URL, env: Env): Promise<Response> {
   const startedAt = Date.now();
   try {
-    const result = await getCoordinator(env).poll();
+    const result = await getCoordinator(env).poll({ scheduled: true });
     return Response.json({ ok: true, source: 'http', ...result, durationMs: Date.now() - startedAt });
   } catch (err) {
     console.error(JSON.stringify({ event: 'poll_failed', source: 'http', error: String(err) }));
@@ -127,6 +137,16 @@ export default {
     const route = ROUTES.get(url.pathname);
     if (route) return serve(route, request, url, env);
 
+    // Authenticated by its Hook0 signature rather than a bearer token.
+    if (url.pathname === WEBHOOK_PATH) {
+      if (request.method !== 'POST') return noStore(errorResponse('method not allowed', 405, { allow: 'POST' }));
+      try {
+        return noStore(await handleWebhook(request, env));
+      } catch (err) {
+        return noStore(routeFailed(url, err));
+      }
+    }
+
     if (request.method === 'GET' && url.pathname === '/') {
       return new Response('onfreq HTTP endpoint is reachable. Poll freshness requires authenticated GET /health.\n', {
         headers: { 'content-type': 'text/plain; charset=utf-8' },
@@ -138,7 +158,7 @@ export default {
 
   async scheduled(controller, env, _ctx): Promise<void> {
     try {
-      await getCoordinator(env).poll();
+      await getCoordinator(env).poll({ scheduled: true });
     } catch (err) {
       console.error(JSON.stringify({ event: 'poll_failed', error: String(err) }));
       // Re-throw so the invocation is recorded as failed in observability.

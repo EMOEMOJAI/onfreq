@@ -38,7 +38,11 @@ it('S1-3: a config throw preserves pending closeouts, roster pages, post budgets
     const coordinator = new PollCoordinator(ctx, misconfigured);
     await expect(coordinator.poll()).rejects.toThrow(CONFIG_ERROR);
     const stored = await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
-    expect(stored).toEqual({ ...seeded, lastPollStartedAt: expect.any(Number), error: CONFIG_ERROR });
+    // A failed scheduled poll still restarts the scheduled interval.
+    expect(stored).toEqual({
+      ...seeded, lastPollStartedAt: expect.any(Number), lastScheduledPollStartedAt: stored?.lastPollStartedAt,
+      error: CONFIG_ERROR,
+    });
     expect(stored?.lastPollStartedAt).toBeGreaterThanOrEqual(now);
     // The recorded cadence still throttles the next trigger, which reports the stored error.
     await expect(new PollCoordinator(ctx, env).poll()).rejects.toThrow(CONFIG_ERROR);
@@ -102,7 +106,9 @@ it.each([
     await ctx.storage.put(POLL_SNAPSHOT_KEY, seeded);
     await expect(new PollCoordinator(ctx, throwing).poll()).rejects.toSatisfy((err) => err === '' || err instanceof Error);
     const stored = await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
-    expect(stored).toEqual({ ...seeded, lastPollStartedAt: expect.any(Number), error: marker });
+    expect(stored).toEqual({
+      ...seeded, lastPollStartedAt: expect.any(Number), lastScheduledPollStartedAt: stored?.lastPollStartedAt, error: marker,
+    });
     // The throttled next trigger reports the failure instead of a silent skip.
     await expect(new PollCoordinator(ctx, env).poll()).rejects.toThrow(marker);
   });

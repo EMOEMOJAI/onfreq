@@ -24,9 +24,18 @@ export class ResponseTooLargeError extends Error {
   }
 }
 
-async function readCapped(response: Response, maxBytes: number): Promise<Uint8Array> {
-  if (!response.body) return new Uint8Array(0);
-  const reader = response.body.getReader();
+/** A body stream exceeded the cap passed to readCapped; the stream is cancelled. */
+export class BodyTooLargeError extends Error {
+  constructor() {
+    super('body exceeded size limit');
+    this.name = 'BodyTooLargeError';
+  }
+}
+
+/** Buffer a request or response body, throwing BodyTooLargeError past `maxBytes`. */
+export async function readCapped(body: ReadableStream | null, maxBytes: number): Promise<Uint8Array> {
+  if (!body) return new Uint8Array(0);
+  const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
@@ -36,7 +45,7 @@ async function readCapped(response: Response, maxBytes: number): Promise<Uint8Ar
     total += chunk.byteLength;
     if (total > maxBytes) {
       await reader.cancel().catch(() => {});
-      throw new ResponseTooLargeError(response.status);
+      throw new BodyTooLargeError();
     }
     chunks.push(chunk);
   }
@@ -72,7 +81,12 @@ export async function fetchBuffered(
       await response.body?.cancel().catch(() => {});
       throw new ResponseTooLargeError(response.status);
     }
-    const body = await readCapped(response, maxBytes);
+    let body: Uint8Array;
+    try {
+      body = await readCapped(response.body, maxBytes);
+    } catch (err) {
+      throw err instanceof BodyTooLargeError ? new ResponseTooLargeError(response.status) : err;
+    }
     return new Response([204, 205, 304].includes(response.status) ? null : body, {
       status: response.status,
       statusText: response.statusText,
@@ -82,3 +96,7 @@ export async function fetchBuffered(
     clearTimeout(timer);
   }
 }
+
+/** Error bodies are `{ error }` with a fixed message: never stored errors, identifiers or variable names. */
+export const errorResponse = (error: string, status: number, headers?: Record<string, string>) =>
+  Response.json({ error }, { status, headers });

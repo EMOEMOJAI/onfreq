@@ -1,5 +1,9 @@
 import { DurableObject } from 'cloudflare:workers';
-import { MIN_POLL_INTERVAL_MS, POLL_SNAPSHOT_KEY, STATE_KEY } from './config';
+import {
+  CRON_PERIOD_MS, EARLY_POLL_DELAY_MS, EARLY_POLL_KEY, EARLY_POLL_MIN_GAIN_MS, EARLY_POLLS_PER_HOUR,
+  MIN_POLL_INTERVAL_MS, MIN_POLL_SPACING_MS, POLL_SNAPSHOT_KEY, SCHEDULER_SEEN_KEY, SCHEDULER_SEEN_MIN_WRITE_MS,
+  STATE_KEY,
+} from './config';
 import { runPoll } from './poll';
 import type { PendingOffline, RosterMessage, RosterPostAttempt, StateMap } from './types';
 import { cleanupGcaCopies } from './retention';
@@ -14,7 +18,10 @@ export interface PollSnapshot {
   pendingOffline?: PendingOffline[];
   /** Last role ping per channel (epoch ms), kept while its mention cooldown runs. */
   rolePings?: Record<string, number>;
+  /** Start of the last poll of either kind. */
   lastPollStartedAt?: number;
+  /** Start of the last scheduled (cron or POST /poll) poll; absent in snapshots older than early polls. */
+  lastScheduledPollStartedAt?: number;
   lastSuccessfulPollAt?: number;
   error?: string;
 }
@@ -23,18 +30,130 @@ export interface PollResult {
   skipped: boolean;
 }
 
+export interface PollOptions {
+  /** Cron or POST /poll: records the scheduler heartbeat that health requires. */
+  scheduled?: boolean;
+}
+
+/** Scheduled polls (cron, POST /poll) or early polls (webhook alarm), throttled differently. */
+type PollKind = 'scheduled' | 'early';
+
+/** Early polls that actually ran in the clock hour starting at `hourStart`. */
+interface EarlyPollBudget {
+  hourStart: number;
+  count: number;
+}
+
+const HOUR_MS = 60 * 60_000;
+
+/** The clock hour whose spent budget was last logged: webhook traffic must not multiply this line. */
+let loggedEarlyPollCappedHour: number | undefined;
+/** Logged once per isolate, like other storage-failure lines. */
+let loggedHeartbeatFailed = false;
+
+/** Test-only: forget which early-poll cap and heartbeat failure were logged. */
+export function resetEarlyPollLogForTests(): void {
+  loggedEarlyPollCappedHour = undefined;
+  loggedHeartbeatFailed = false;
+}
+
+/** True when `at` is a trusted time less than `windowMs` before `now`; a future time is not trusted. */
+function within(at: unknown, now: number, windowMs: number): boolean {
+  return typeof at === 'number' && now - at >= 0 && now - at < windowMs;
+}
+
 /** One object owns this bot's session state and serializes both trigger sources. */
 export class PollCoordinator extends DurableObject<Env> {
   private inFlight?: Promise<PollResult>;
 
-  async poll(): Promise<PollResult> {
+  async poll({ scheduled = false }: PollOptions = {}): Promise<PollResult> {
+    if (scheduled) await this.recordSchedulerSeen();
+    return this.serialized('scheduled');
+  }
+
+  /**
+   * Separate key: health can tell a live scheduler from webhook-driven polls.
+   * The heartbeat is advisory, so a storage failure never stops the poll.
+   */
+  private async recordSchedulerSeen(): Promise<void> {
+    try {
+      const now = Date.now();
+      if (within(await this.ctx.storage.get<unknown>(SCHEDULER_SEEN_KEY), now, SCHEDULER_SEEN_MIN_WRITE_MS)) return;
+      await this.ctx.storage.put(SCHEDULER_SEEN_KEY, now);
+    } catch (err) {
+      if (loggedHeartbeatFailed) return;
+      loggedHeartbeatFailed = true;
+      console.error(JSON.stringify({
+        event: 'scheduler_heartbeat_failed', error: err instanceof Error ? err.name : typeof err,
+      }));
+    }
+  }
+
+  /**
+   * A verified webhook hint: schedule one earlier poll through the alarm, at
+   * least EARLY_POLL_DELAY_MS from now and MIN_POLL_SPACING_MS after the last
+   * poll. No-op while an alarm is pending or a poll runs, when a live cron's
+   * next poll is about as soon, or once this hour's early-poll budget is spent.
+   * Without a recent heartbeat (a stopped cron) the early poll always helps.
+   */
+  async requestEarlyPoll(): Promise<void> {
+    if (this.inFlight || (await this.ctx.storage.getAlarm()) !== null) return;
+    const snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
+    const seen = await this.ctx.storage.get<unknown>(SCHEDULER_SEEN_KEY);
+    const now = Date.now();
+    // A future start time is not trusted, as in runOnce's throttle.
+    const started = snapshot?.lastPollStartedAt;
+    const last = started !== undefined && started <= now ? started : 0;
+    const target = Math.max(now + EARLY_POLL_DELAY_MS, last + MIN_POLL_SPACING_MS);
+    if (typeof seen === 'number' && within(seen, now, CRON_PERIOD_MS) &&
+        target >= seen + CRON_PERIOD_MS - EARLY_POLL_MIN_GAIN_MS) return;
+    const budget = await this.ctx.storage.get<EarlyPollBudget>(EARLY_POLL_KEY);
+    const hour = hourStart(now);
+    if (budget?.hourStart === hour && budget.count >= EARLY_POLLS_PER_HOUR) {
+      if (loggedEarlyPollCappedHour !== hour) {
+        loggedEarlyPollCappedHour = hour;
+        console.error(JSON.stringify({ event: 'early_poll_capped' }));
+      }
+      return;
+    }
+    // No re-check of inFlight: input gates deliver no other event while this awaits storage only.
+    await this.ctx.storage.setAlarm(target);
+  }
+
+  /**
+   * Runs the early poll through the same serialized path, with only the
+   * throttle shortened. Errors are swallowed so the platform does not retry:
+   * the next cron poll reports them as usual. Only a poll that ran is logged,
+   * not a skip that rethrows an earlier poll's stored error.
+   */
+  async alarm(): Promise<void> {
+    const attempt = { ran: false };
+    try {
+      await this.serialized('early', attempt);
+    } catch (err) {
+      if (attempt.ran) {
+        console.error(JSON.stringify({ event: 'early_poll_failed', error: err instanceof Error ? err.name : typeof err }));
+      }
+    }
+    if (!attempt.ran) return;
+    try {
+      const now = Date.now();
+      const budget = await this.ctx.storage.get<EarlyPollBudget>(EARLY_POLL_KEY);
+      const count = budget?.hourStart === hourStart(now) ? budget.count + 1 : 1;
+      await this.ctx.storage.put(EARLY_POLL_KEY, { hourStart: hourStart(now), count } satisfies EarlyPollBudget);
+    } catch (err) {
+      console.error(JSON.stringify({ event: 'early_poll_failed', error: err instanceof Error ? err.name : typeof err }));
+    }
+  }
+
+  private async serialized(kind: PollKind, attempt?: { ran: boolean }): Promise<PollResult> {
     // Set synchronously before yielding: external fetches permit other RPCs
     // to enter this object, so storage consistency alone is not a mutex.
     if (this.inFlight) {
       await this.inFlight;
       return { skipped: true };
     }
-    this.inFlight = this.runOnce();
+    this.inFlight = this.runOnce(kind, attempt);
     try {
       return await this.inFlight;
     } finally {
@@ -50,11 +169,15 @@ export class PollCoordinator extends DurableObject<Env> {
 
   async getHealth() {
     const snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
+    const schedulerSeenAt = await this.ctx.storage.get<unknown>(SCHEDULER_SEEN_KEY);
+    const now = Date.now();
     const lastSuccessfulPollAt = snapshot?.lastSuccessfulPollAt ?? null;
-    const ageMs = lastSuccessfulPollAt === null ? null : Date.now() - lastSuccessfulPollAt;
     // A negative age (clock skew or a corrupted future timestamp) is treated
     // as unhealthy rather than trusted, same as a stale one.
-    const ok = ageMs !== null && ageMs >= 0 && ageMs < HEALTH_MAX_AGE_MS;
+    const fresh = (at: unknown) => typeof at === 'number' && now - at >= 0 && now - at < HEALTH_MAX_AGE_MS;
+    // Early polls alone must not hide a stopped scheduler. A deployment that
+    // has not yet recorded a heartbeat keeps the success-age rule alone.
+    const ok = fresh(lastSuccessfulPollAt) && (schedulerSeenAt === undefined || fresh(schedulerSeenAt));
     return { ok, lastSuccessfulPollAt, maxAgeSeconds: HEALTH_MAX_AGE_MS / 1000 };
   }
 
@@ -90,7 +213,7 @@ export class PollCoordinator extends DurableObject<Env> {
     return { records, nextCursor: rows.length > 100 ? String(rows[99]!.cursor) : null };
   }
 
-  private async runOnce(): Promise<PollResult> {
+  private async runOnce(kind: PollKind, attempt?: { ran: boolean }): Promise<PollResult> {
     let snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
     if (!snapshot) {
       snapshot = { state: await this.env.ATC_STATE.get<StateMap>(STATE_KEY, 'json') };
@@ -102,11 +225,19 @@ export class PollCoordinator extends DurableObject<Env> {
     const startedAt = Date.now();
     // A future start time (clock skew or corrupted storage) is not trusted as a
     // throttle: otherwise it would block every poll until that time arrives.
-    const elapsed = snapshot.lastPollStartedAt === undefined ? undefined : startedAt - snapshot.lastPollStartedAt;
-    if (elapsed !== undefined && elapsed >= 0 && elapsed < MIN_POLL_INTERVAL_MS) {
+    // Every poll keeps MIN_POLL_SPACING_MS from the last one; scheduled polls
+    // also keep MIN_POLL_INTERVAL_MS from the last scheduled one, so early
+    // polls do not push the cron back. Older snapshots fall back to any poll.
+    const lastScheduled = snapshot.lastScheduledPollStartedAt ?? snapshot.lastPollStartedAt;
+    if (within(snapshot.lastPollStartedAt, startedAt, MIN_POLL_SPACING_MS) ||
+        (kind === 'scheduled' && within(lastScheduled, startedAt, MIN_POLL_INTERVAL_MS))) {
       if (snapshot.error) throw new Error(snapshot.error);
       return { skipped: true };
     }
+    if (attempt) attempt.ran = true;
+    // A scheduled poll that runs, even one that fails, restarts the scheduled
+    // interval; an early poll carries it forward.
+    const scheduledAt = kind === 'scheduled' ? startedAt : lastScheduled;
 
     let outcome: Awaited<ReturnType<typeof runPoll>>;
     try {
@@ -126,7 +257,7 @@ export class PollCoordinator extends DurableObject<Env> {
       // error — log it (without bodies) and rethrow `err` regardless.
       try {
         // An empty message still records a failure, so the throttle keeps reporting it.
-        await this.persist(snapshot, startedAt, snapshot.lastSuccessfulPollAt,
+        await this.persist(snapshot, startedAt, scheduledAt, snapshot.lastSuccessfulPollAt,
           (err instanceof Error ? err.message || err.name : String(err)) || 'poll failed');
       } catch (putErr) {
         console.error(JSON.stringify({ event: 'poll_snapshot_put_failed', error: String(putErr) }));
@@ -134,7 +265,7 @@ export class PollCoordinator extends DurableObject<Env> {
       throw err;
     }
     // No successful response or in-memory checkpoint precedes persistence.
-    await this.persist(outcome, startedAt,
+    await this.persist(outcome, startedAt, scheduledAt,
       outcome.error ? snapshot.lastSuccessfulPollAt : Date.now(), outcome.error);
     if (outcome.error) throw new Error(outcome.error);
     return { skipped: false };
@@ -146,8 +277,11 @@ export class PollCoordinator extends DurableObject<Env> {
    * listed below (the mapped type fails to compile otherwise), so no path can
    * silently erase a field. Empty lists/maps and unset values are omitted.
    */
-  private persist(carried: Omit<PollSnapshot, 'lastPollStartedAt' | 'lastSuccessfulPollAt' | 'error'>,
-    lastPollStartedAt: number, lastSuccessfulPollAt: number | undefined, error: string | undefined): Promise<void> {
+  private persist(
+    carried: Omit<PollSnapshot, 'lastPollStartedAt' | 'lastScheduledPollStartedAt' | 'lastSuccessfulPollAt' | 'error'>,
+    lastPollStartedAt: number, lastScheduledPollStartedAt: number | undefined,
+    lastSuccessfulPollAt: number | undefined, error: string | undefined,
+  ): Promise<void> {
     const nonEmpty = <T>(list: T[] | undefined) => (list?.length ? list : undefined);
     const next: { [K in keyof Required<PollSnapshot>]: PollSnapshot[K] } = {
       state: carried.state,
@@ -156,6 +290,7 @@ export class PollCoordinator extends DurableObject<Env> {
       rosterPostAttempts: nonEmpty(carried.rosterPostAttempts),
       rolePings: carried.rolePings && Object.keys(carried.rolePings).length ? carried.rolePings : undefined,
       lastPollStartedAt,
+      lastScheduledPollStartedAt,
       lastSuccessfulPollAt,
       error: error || undefined,
     };
@@ -163,4 +298,8 @@ export class PollCoordinator extends DurableObject<Env> {
     return this.ctx.storage.put(POLL_SNAPSHOT_KEY,
       Object.fromEntries(Object.entries(next).filter(([, value]) => value !== undefined)) as unknown as PollSnapshot);
   }
+}
+
+function hourStart(ms: number): number {
+  return ms - (ms % HOUR_MS);
 }

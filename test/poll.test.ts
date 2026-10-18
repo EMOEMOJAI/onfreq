@@ -2540,11 +2540,22 @@ describe('polling through the Durable Object', () => {
     expect((await stub().getState())?.[a]?.frequency).toBe(118.1);
   });
 
+  /** Fail only the next poll snapshot write; POST /poll also records a scheduler heartbeat first. */
+  const failNextSnapshotPut = () => runInDurableObject(stub(), async (_instance, ctx) => {
+    const put = ctx.storage.put.bind(ctx.storage) as (key: string, value: unknown) => Promise<void>;
+    let failed = false;
+    vi.spyOn(ctx.storage, 'put').mockImplementation((async (key: string, value: unknown) => {
+      if (!failed && key === POLL_SNAPSHOT_KEY) {
+        failed = true;
+        throw new Error('storage unavailable');
+      }
+      return put(key, value);
+    }) as never);
+  });
+
   it('fails before notification if the legacy import cannot be persisted', async () => {
     feed = [entry(a)];
-    await runInDurableObject(stub(), async (_instance, ctx) => {
-      vi.spyOn(ctx.storage, 'put').mockRejectedValueOnce(new Error('storage unavailable'));
-    });
+    await failNextSnapshotPut();
     expect((await poll()).status).toBe(500);
     expect(network).not.toHaveBeenCalled();
     expect((await poll()).status).toBe(200);
@@ -2553,9 +2564,7 @@ describe('polling through the Durable Object', () => {
   it('reports a failed final save without acknowledging unpersisted state', async () => {
     await seed({});
     feed = [entry(a)];
-    await runInDurableObject(stub(), async (_instance, ctx) => {
-      vi.spyOn(ctx.storage, 'put').mockRejectedValueOnce(new Error('storage unavailable'));
-    });
+    await failNextSnapshotPut();
     expect((await poll()).status).toBe(500);
     expect(await stub().getState()).toEqual({});
     expect((await snapshot())?.lastPollStartedAt).toBeUndefined();

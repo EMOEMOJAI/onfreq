@@ -18,6 +18,7 @@ type OptionalSecrets = {
   COORDINATOR_NAME?: string;
   POLL_SECRET?: string;
   HISTORY_SECRET?: string;
+  IVAO_WEBHOOK_SECRET?: string;
 };
 
 // Extra local secret names must not turn optional features into required bindings.

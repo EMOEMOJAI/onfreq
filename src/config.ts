@@ -66,6 +66,24 @@ export function getCoordinator(env: Pick<Env, 'POLL_COORDINATOR' | 'COORDINATOR_
   return env.POLL_COORDINATOR.getByName(env.COORDINATOR_NAME?.trim() || COORDINATOR_NAME);
 }
 export const POLL_SNAPSHOT_KEY = 'poll-snapshot-v1';
-// Five seconds of tolerance avoids skipping minute cron runs due to jitter,
-// while still suppressing a second scheduler running at a different offset.
+// Between scheduled polls (cron or POST /poll). Five seconds of tolerance
+// avoids skipping minute cron runs due to jitter, while still suppressing a
+// second scheduler running at a different offset.
 export const MIN_POLL_INTERVAL_MS = 55_000;
+
+/** Last cron or POST /poll call, kept apart from the poll snapshot. */
+export const SCHEDULER_SEEN_KEY = 'scheduler-seen-v1';
+/** A heartbeat this recent is not rewritten: concurrent triggers need one write. */
+export const SCHEDULER_SEEN_MIN_WRITE_MS = 5_000;
+/** The Wrangler cron runs every minute. */
+export const CRON_PERIOD_MS = 60_000;
+/** No two polls of any kind start closer together than this. */
+export const MIN_POLL_SPACING_MS = 30_000;
+/** Durable early-poll budget for the current clock hour. */
+export const EARLY_POLL_KEY = 'early-poll-v1';
+// A verified IVAO webhook only brings the next poll forward. Early polls wait
+// for the new connection to reach the feed, and are skipped unless they run at
+// least EARLY_POLL_MIN_GAIN_MS before the next expected cron poll.
+export const EARLY_POLL_DELAY_MS = 20_000;
+export const EARLY_POLL_MIN_GAIN_MS = 10_000;
+export const EARLY_POLLS_PER_HOUR = 20;

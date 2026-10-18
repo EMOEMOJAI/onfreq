@@ -26,6 +26,7 @@ export default defineConfig({
         // Distinct synthetic values: a HISTORY_SECRET equal to POLL_SECRET disables history routes.
         POLL_SECRET: 'synthetic-poll-secret-for-vitest-only',
         HISTORY_SECRET: 'synthetic-history-secret-for-vitest-only',
+        IVAO_WEBHOOK_SECRET: 'synthetic-ivao-webhook-signing-secret-vitest',
         FIR_PREFIXES: 'XA,QC,QE,QF,QG,QH',
         FIR_LABELS: '',
         OFFLINE_GRACE_POLLS: '2',
