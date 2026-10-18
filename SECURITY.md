@@ -4,6 +4,8 @@ Report vulnerabilities through [GitHub private reporting](https://github.com/EMO
 
 Keep deployment values in Wrangler secrets and ignored `.dev.vars`, `wrangler.local.jsonc` or `*.local.sh` files. Do not publish working-directory ZIPs; use a reviewed Git archive. Rotate any exposed credential at its provider.
 
+The optional `POST /ivao/webhook` is authenticated by the IVAO (Hook0) HMAC signature keyed by `IVAO_WEBHOOK_SECRET`, is disabled while that secret is unset, and never stores or logs payloads.
+
 ## Data retention
 
 The bot processes IVAO and Discord IDs. Optional GCA delivery and occurrence ledgers retain member/connection identifiers indefinitely for deduplication. Other inactive reminder records expire after seven days; staff-copy payloads clear after delivery or handled terminal failure, but pending/reserved copies may retain them, including copies for a previous `GCA_COPY_USER_ID`, which are never sent. Only the manual [cleanup](docs/setup.md#private-history-maintenance) removes them: copies older than 30 days, and unsent copies for any account but the current one.

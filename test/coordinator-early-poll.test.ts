@@ -7,7 +7,7 @@ import {
 } from '../src/config';
 import { PollCoordinator, resetEarlyPollLogForTests, type PollSnapshot } from '../src/coordinator';
 import { resetTokenCache } from '../src/ivao';
-import { resetWebhookDebounceForTests, resetWebhookLogForTests } from '../src/webhook';
+import { resetWebhookDebounceForTests, resetWebhookLogForTests, resetWebhookSeenEventsForTests } from '../src/webhook';
 import { AUTH_HEADERS } from './helpers';
 
 // Simulated time stays well ahead of the real clock and starts on an hour, so
@@ -28,6 +28,7 @@ beforeEach(() => {
   resetEarlyPollLogForTests();
   resetWebhookLogForTests();
   resetWebhookDebounceForTests();
+  resetWebhookSeenEventsForTests();
   now = T0;
   release = undefined;
   entered = undefined;
@@ -76,10 +77,13 @@ const cron = () => worker.scheduled(createScheduledController({ cron: '* * * * *
 const health = () => worker.fetch(new Request('https://example.test/health', { headers: AUTH_HEADERS }), env,
   createExecutionContext());
 
-async function webhook(): Promise<Response> {
+let eventCount = 0;
+
+/** A signed ATC start with a new event id each time, as distinct connections would send. */
+async function webhook(target: Env = env): Promise<Response> {
   const t = Math.floor(now / 1000);
   const headers: Record<string, string> = {
-    'content-type': 'application/json', 'x-event-id': '00000000-0000-4000-8000-000000000002',
+    'content-type': 'application/json', 'x-event-id': `00000000-0000-4000-8000-${String(++eventCount).padStart(12, '0')}`,
     'x-event-type': 'tracker.session.started',
   };
   const body = '{"sessionId":2,"callsign":"XA_SYN_CTR","userId":100,"connectionType":"ATC","resume":false}';
@@ -89,7 +93,7 @@ async function webhook(): Promise<Response> {
   const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key,
     encoder.encode(`${t}.${h}.${h.split(' ').map((name) => headers[name]).join('.')}.${body}`)));
   headers['x-hook0-signature'] = `t=${t},h=${h},v1=${[...mac].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
-  return worker.fetch(new Request('https://example.test/ivao/webhook', { method: 'POST', headers, body }), env,
+  return worker.fetch(new Request('https://example.test/ivao/webhook', { method: 'POST', headers, body }), target,
     createExecutionContext());
 }
 
@@ -176,13 +180,46 @@ describe('requestEarlyPoll', () => {
     expect(await alarmAt()).toBe(T0 + 20_000);
   });
 
+  it('resolves true only while an alarm is pending', async () => {
+    expect(await request()).toBe(true);
+    // Already pending: kept, and still reported.
+    expect(await request()).toBe(true);
+    await storage((ctx) => ctx.storage.deleteAlarm());
+    await seed({ state: {}, lastPollStartedAt: T0 - 40_000 });
+    await seedSeen(T0 - 40_000);
+    expect(await request()).toBe(false);
+    await seedSeen(T0 - 60_000);
+    await storage((ctx) => ctx.storage.put(EARLY_POLL_KEY, { hourStart: T0, count: 20 }));
+    expect(await request()).toBe(false);
+    expect(await alarmAt()).toBeNull();
+  });
+
+  it('starts no webhook debounce while a poll is in flight', async () => {
+    // One request context: the gated poll and the webhook share this coordinator instance.
+    await storage(async (ctx) => {
+      const instance = coordinator()(ctx);
+      const target = { ...env, POLL_COORDINATOR: { getByName: () => instance } as unknown as Env['POLL_COORDINATOR'] };
+      const ready = new Promise<void>((resolve) => { entered = resolve; });
+      const running = instance.poll({ recordHeartbeat: true });
+      await ready;
+      expect((await webhook(target)).status).toBe(204);
+      expect(await ctx.storage.getAlarm()).toBeNull();
+      release!();
+      await running;
+      // Within what would have been the debounce, the next event still schedules.
+      now = T0 + 1_000;
+      expect((await webhook(target)).status).toBe(204);
+      expect(await ctx.storage.getAlarm()).toBe(T0 + 30_000);
+    });
+  });
+
   it('is a no-op while a poll is in flight', async () => {
     await storage(async (ctx) => {
       const instance = coordinator()(ctx);
       const ready = new Promise<void>((resolve) => { entered = resolve; });
       const running = instance.poll();
       await ready;
-      await instance.requestEarlyPoll();
+      await expect(instance.requestEarlyPoll()).resolves.toBe(false);
       release!();
       await running;
     });
@@ -277,7 +314,7 @@ describe('early poll alarm', () => {
       const ready = new Promise<void>((resolve) => { entered = resolve; });
       const running = instance.alarm();
       await ready;
-      const scheduled = instance.poll({ scheduled: true });
+      const scheduled = instance.poll({ recordHeartbeat: true });
       await vi.waitFor(async () => expect(await ctx.storage.get(SCHEDULER_SEEN_KEY)).toBe(T0));
       release!();
       await expect(scheduled).resolves.toEqual({ skipped: true });
@@ -334,9 +371,41 @@ describe('cadence', () => {
     expect(feedFetches()).toBe(3);
   });
 
+  it('schedules when the next cron tick will be throttled (cron 0, early 40, webhook 55)', async () => {
+    await cron();
+    now = T0 + 20_000;
+    await webhook();
+    now = T0 + 40_000;
+    expect(await fireDueAlarm()).toBe(true);
+    expect(feedFetches()).toBe(2);
+    // The cron at 60 is within 30 s of the early poll, so the next regular poll is at 120.
+    now = T0 + 55_000;
+    expect((await webhook()).status).toBe(204);
+    expect(await alarmAt()).toBe(T0 + 75_000);
+    now = T0 + 60_000;
+    await cron();
+    expect(feedFetches()).toBe(2);
+    now = T0 + 75_000;
+    expect(await fireDueAlarm()).toBe(true);
+    expect(feedFetches()).toBe(3);
+  });
+
+  it('does not throttle the first cron against an early poll that was a new install\'s first poll', async () => {
+    await request();
+    now = T0 + 20_000;
+    expect(await fireDueAlarm()).toBe(true);
+    expect(feedFetches()).toBe(1);
+    // 0 records that no scheduled poll has run yet.
+    expect(await snapshot()).toMatchObject({ lastPollStartedAt: now, lastScheduledPollStartedAt: 0 });
+    now = T0 + 50_000;
+    await cron();
+    expect(feedFetches()).toBe(2);
+    expect(await snapshot()).toMatchObject({ lastPollStartedAt: now, lastScheduledPollStartedAt: now });
+  });
+
   it('falls back to the last poll start for a snapshot without a scheduled start', async () => {
     await seed({ state: {}, lastPollStartedAt: T0 - 40_000 });
-    await expect(stub().poll({ scheduled: true })).resolves.toEqual({ skipped: true });
+    await expect(stub().poll({ recordHeartbeat: true })).resolves.toEqual({ skipped: true });
     await storage((ctx) => ctx.storage.setAlarm(now));
     expect(await runDurableObjectAlarm(stub())).toBe(true);
     expect(feedFetches()).toBe(1);
@@ -359,9 +428,9 @@ describe('cadence', () => {
       vi.spyOn(ctx.storage, 'put').mockImplementation(((key: string, value: unknown) => key === SCHEDULER_SEEN_KEY
         ? Promise.reject(new TypeError('synthetic private storage detail')) : put(key, value)) as typeof ctx.storage.put);
       const instance = coordinator()(ctx);
-      await expect(instance.poll({ scheduled: true })).resolves.toEqual({ skipped: false });
+      await expect(instance.poll({ recordHeartbeat: true })).resolves.toEqual({ skipped: false });
       now += 60_000;
-      await expect(instance.poll({ scheduled: true })).resolves.toEqual({ skipped: false });
+      await expect(instance.poll({ recordHeartbeat: true })).resolves.toEqual({ skipped: false });
     });
     expect(feedFetches()).toBe(2);
     expect(lines()).toEqual([{ event: 'scheduler_heartbeat_failed', error: 'TypeError' }]);

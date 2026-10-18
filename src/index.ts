@@ -88,10 +88,12 @@ async function serve(route: Route, request: Request, url: URL, env: Env): Promis
 async function handlePoll(_request: Request, _url: URL, env: Env): Promise<Response> {
   const startedAt = Date.now();
   try {
-    const result = await getCoordinator(env).poll({ scheduled: true });
+    const result = await getCoordinator(env).poll({ recordHeartbeat: true });
     return Response.json({ ok: true, source: 'http', ...result, durationMs: Date.now() - startedAt });
   } catch (err) {
-    console.error(JSON.stringify({ event: 'poll_failed', source: 'http', error: String(err) }));
+    console.error(JSON.stringify({
+      event: 'poll_failed', source: 'http', error: err instanceof Error ? err.name : typeof err,
+    }));
     return Response.json(
       { ok: false, source: 'http', error: 'poll failed', durationMs: Date.now() - startedAt },
       { status: 500 },
@@ -158,9 +160,9 @@ export default {
 
   async scheduled(controller, env, _ctx): Promise<void> {
     try {
-      await getCoordinator(env).poll({ scheduled: true });
+      await getCoordinator(env).poll({ recordHeartbeat: true });
     } catch (err) {
-      console.error(JSON.stringify({ event: 'poll_failed', error: String(err) }));
+      console.error(JSON.stringify({ event: 'poll_failed', error: err instanceof Error ? err.name : typeof err }));
       // Re-throw so the invocation is recorded as failed in observability.
       throw err;
     }

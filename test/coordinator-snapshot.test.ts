@@ -65,9 +65,11 @@ it('S1-3: a failed snapshot write rethrows the original error and logs no stored
     expect(await ctx.storage.get(POLL_SNAPSHOT_KEY)).toEqual(seeded);
   });
   const lines = log.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>);
-  expect(lines).toEqual([{ event: 'poll_snapshot_put_failed', error: 'Error: synthetic storage put failure' }]);
+  expect(lines).toEqual([{ event: 'poll_snapshot_put_failed', error: 'Error' }]);
   const logged = JSON.stringify(log.mock.calls);
-  for (const secretish of ['XA_SYNTHETIC', '900000000000000', CONFIG_ERROR]) expect(logged).not.toContain(secretish);
+  for (const secretish of ['XA_SYNTHETIC', '900000000000000', CONFIG_ERROR, 'synthetic storage']) {
+    expect(logged).not.toContain(secretish);
+  }
 });
 
 it('S11-13: a future lastPollStartedAt does not throttle polling indefinitely', async () => {

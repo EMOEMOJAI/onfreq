@@ -4,7 +4,7 @@ TypeScript Discord bot on Cloudflare Workers. Read [README.md](README.md) and [s
 
 ## Source map
 
-[src/index.ts](src/index.ts) routes HTTP and cron events; [src/coordinator.ts](src/coordinator.ts) serializes polling. [src/poll.ts](src/poll.ts), [src/state.ts](src/state.ts) and [src/roster.ts](src/roster.ts) handle notification delivery. [src/gca.ts](src/gca.ts) handles optional reminders. Tests live in [test/](test/); deployment and Git hook scripts live in [scripts/](scripts/).
+[src/index.ts](src/index.ts) routes HTTP and cron events; [src/webhook.ts](src/webhook.ts) handles the optional IVAO webhook that requests early polls; [src/coordinator.ts](src/coordinator.ts) serializes polling. [src/poll.ts](src/poll.ts), [src/state.ts](src/state.ts) and [src/roster.ts](src/roster.ts) handle notification delivery. [src/gca.ts](src/gca.ts) handles optional reminders. Tests live in [test/](test/); deployment and Git hook scripts live in [scripts/](scripts/).
 
 ## Checks
 

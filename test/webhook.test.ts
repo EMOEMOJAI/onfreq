@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import worker from '../src/index';
 import { resetConfigInvalidLogForTests } from '../src/auth';
 import {
-  parseHook0Signature, resetWebhookDebounceForTests, resetWebhookLogForTests, verifyHook0Signature,
+  parseHook0Signature, resetWebhookDebounceForTests, resetWebhookLogForTests, resetWebhookSeenEventsForTests,
+  SIGNATURE_TOLERANCE_SECONDS, verifyHook0Signature, WEBHOOK_DEBOUNCE_MS, WEBHOOK_MAX_BODY_BYTES,
+  WEBHOOK_SEEN_EVENT_TTL_MS, WEBHOOK_SEEN_EVENTS_MAX,
 } from '../src/webhook';
 import { POLL_ONLY, HISTORY_ONLY } from './helpers';
 
@@ -22,7 +24,7 @@ const STARTED = '{"sessionId":1,"callsign":"XA_SYN_CTR","userId":100,"connection
 const FIXED_V1 = '6fae3d7c2af8f5a5aab8bc77621cb3fd222bc91a38dfcbcb1d0c6ee847a3cafc';
 const WEBHOOK_URL = 'https://example.test/ivao/webhook';
 
-let requestEarlyPoll: ReturnType<typeof vi.fn<() => Promise<void>>>;
+let requestEarlyPoll: ReturnType<typeof vi.fn<() => Promise<boolean>>>;
 let getByName: ReturnType<typeof vi.fn>;
 let log: MockInstance<typeof console.error>;
 
@@ -30,9 +32,11 @@ beforeEach(() => {
   resetConfigInvalidLogForTests();
   resetWebhookLogForTests();
   resetWebhookDebounceForTests();
+  resetWebhookSeenEventsForTests();
   vi.spyOn(Date, 'now').mockReturnValue(NOW_S * 1000);
   log = vi.spyOn(console, 'error').mockImplementation(() => {});
-  requestEarlyPoll = vi.fn(async () => {});
+  // A real coordinator resolves true while an early-poll alarm is pending.
+  requestEarlyPoll = vi.fn(async () => true);
   getByName = vi.fn(() => ({ requestEarlyPoll }));
 });
 afterEach(() => { vi.restoreAllMocks(); });
@@ -58,12 +62,14 @@ interface Signing {
   omit?: string[];
   /** Body actually sent, when it differs from the signed one. */
   sentBody?: BodyInit;
+  eventId?: string;
 }
 
 async function signed(options: Signing = {}): Promise<Request> {
   const { body = STARTED, eventType = 'tracker.session.started', t = NOW_S, h = SIGNED, secret = SECRET } = options;
   const headers: Record<string, string> = {
-    'content-type': 'application/json', 'x-event-id': EVENT_ID, 'x-event-type': eventType, ...options.extraHeaders,
+    'content-type': 'application/json', 'x-event-id': options.eventId ?? EVENT_ID, 'x-event-type': eventType,
+    ...options.extraHeaders,
   };
   for (const name of options.omit ?? []) delete headers[name];
   const values = h.split(' ').map((name) => headers[name] ?? '').join('.');
@@ -119,11 +125,11 @@ describe('Hook0 signature', () => {
     expect(log).not.toHaveBeenCalled();
   });
 
-  it.each([300, -300])('accepts a timestamp %i seconds away', async (offset) => {
+  it.each([SIGNATURE_TOLERANCE_SECONDS, -SIGNATURE_TOLERANCE_SECONDS])('accepts a timestamp %i seconds away', async (offset) => {
     await expectAccepted(await send(await signed({ t: NOW_S + offset })), 1);
   });
 
-  it.each([301, -301])('rejects a timestamp %i seconds away', async (offset) => {
+  it.each([SIGNATURE_TOLERANCE_SECONDS + 1, -SIGNATURE_TOLERANCE_SECONDS - 1])('rejects a timestamp %i seconds away', async (offset) => {
     await expectError(await send(await signed({ t: NOW_S + offset })), 401, 'unauthorized');
     expect(rejectionLines()).toEqual([{ event: 'webhook_rejected', reason: 'signature_expired' }]);
   });
@@ -213,7 +219,7 @@ describe('Hook0 signature', () => {
   it('logs each rejection reason once and never logs request content', async () => {
     for (let i = 0; i < 5; i++) {
       await send(await signed({ sentBody: STARTED.replace('XA_SYN_CTR', 'XA_SYN_TWR') }));
-      await send(await signed({ t: NOW_S - 400 }));
+      await send(await signed({ t: NOW_S - SIGNATURE_TOLERANCE_SECONDS - 100 }));
     }
     expect(rejectionLines()).toEqual([
       { event: 'webhook_rejected', reason: 'signature_mismatch' },
@@ -231,22 +237,22 @@ describe('body limit', () => {
   };
 
   it('accepts a signed body of exactly 8 KiB', async () => {
-    const body = padded(8 * 1024);
-    expect(encoder.encode(body).byteLength).toBe(8192);
+    const body = padded(WEBHOOK_MAX_BODY_BYTES);
+    expect(encoder.encode(body).byteLength).toBe(WEBHOOK_MAX_BODY_BYTES);
     await expectAccepted(await send(await signed({ body })), 1);
   });
 
   it('rejects a 9 KiB body declared by content-length with 413 before reading it', async () => {
-    const body = padded(9 * 1024);
-    const request = await signed({ body, extraHeaders: { 'content-length': String(9 * 1024) } });
-    expect(request.headers.get('content-length')).toBe('9216');
+    const body = padded(WEBHOOK_MAX_BODY_BYTES + 1024);
+    const request = await signed({ body, extraHeaders: { 'content-length': String(WEBHOOK_MAX_BODY_BYTES + 1024) } });
+    expect(request.headers.get('content-length')).toBe(String(WEBHOOK_MAX_BODY_BYTES + 1024));
     await expectError(await send(request), 413, 'payload too large');
     expect(request.bodyUsed).toBe(false);
     expect(rejectionLines()).toEqual([{ event: 'webhook_rejected', reason: 'payload_too_large' }]);
   });
 
   it('rejects a 9 KiB streamed body without content-length with 413', async () => {
-    const body = padded(9 * 1024);
+    const body = padded(WEBHOOK_MAX_BODY_BYTES + 1024);
     const bytes = encoder.encode(body);
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -321,30 +327,86 @@ describe('configuration and method', () => {
 describe('debounce', () => {
   const at = (ms: number) => vi.spyOn(Date, 'now').mockReturnValue(NOW_S * 1000 + ms);
 
+  const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+
   it('skips the coordinator for 15 s after a successful call, still acknowledging with 204', async () => {
-    await expectAccepted(await send(await signed()), 1);
-    at(14_999);
-    await expectAccepted(await send(await signed()), 1);
-    at(15_000);
-    await expectAccepted(await send(await signed()), 2);
+    await expectAccepted(await send(await signed({ eventId: id(1) })), 1);
+    at(WEBHOOK_DEBOUNCE_MS - 1);
+    await expectAccepted(await send(await signed({ eventId: id(2) })), 1);
+    at(WEBHOOK_DEBOUNCE_MS);
+    await expectAccepted(await send(await signed({ eventId: id(3) })), 2);
   });
 
   it('does not debounce after a failed coordinator call', async () => {
     requestEarlyPoll.mockRejectedValueOnce(new Error('synthetic failure'));
-    expect((await send(await signed())).status).toBe(503);
+    expect((await send(await signed({ eventId: id(1) }))).status).toBe(503);
     at(1_000);
-    await expectAccepted(await send(await signed()), 2);
+    await expectAccepted(await send(await signed({ eventId: id(2) })), 2);
+  });
+
+  it('does not debounce when the coordinator scheduled nothing', async () => {
+    requestEarlyPoll.mockResolvedValueOnce(false);
+    await expectAccepted(await send(await signed({ eventId: id(1) })), 1);
+    at(1_000);
+    await expectAccepted(await send(await signed({ eventId: id(2) })), 2);
   });
 
   it('does not debounce events that need no early poll', async () => {
-    await expectAccepted(await send(await signed({ eventType: 'tracker.session.ended' })), 0);
+    await expectAccepted(await send(await signed({ eventId: id(1), eventType: 'tracker.session.ended' })), 0);
+    await expectAccepted(await send(await signed({ eventId: id(2) })), 1);
+  });
+});
+
+describe('replayed event ids', () => {
+  const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  /** Moves the clock and signs at the new time, as a fresh delivery would. */
+  const signedAt = (ms: number, options: Signing = {}) => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW_S * 1000 + ms);
+    return signed({ t: NOW_S + Math.floor(ms / 1000), ...options });
+  };
+
+  it('acknowledges a duplicate X-Event-Id with 204 and no second coordinator call, logging nothing', async () => {
     await expectAccepted(await send(await signed()), 1);
+    // Past the debounce, with a fresh signature: only the replay cache stops it.
+    await expectAccepted(await send(await signedAt(WEBHOOK_DEBOUNCE_MS)), 1);
+    await expectAccepted(await send(await signedAt(WEBHOOK_SEEN_EVENT_TTL_MS - 1)), 1);
+    // A different id is still handled.
+    await expectAccepted(await send(await signedAt(WEBHOOK_SEEN_EVENT_TTL_MS - 1, { eventId: id(2) })), 2);
+    expect(log).not.toHaveBeenCalled();
   });
 
-  it('is cleared by the test-only reset hook', async () => {
+  it('forgets an id once the replay window has passed', async () => {
     await expectAccepted(await send(await signed()), 1);
-    resetWebhookDebounceForTests();
-    await expectAccepted(await send(await signed()), 2);
+    await expectAccepted(await send(await signedAt(WEBHOOK_SEEN_EVENT_TTL_MS)), 2);
+  });
+
+  it('also remembers ids of events that needed no early poll', async () => {
+    const ended = { eventType: 'tracker.session.ended' };
+    await expectAccepted(await send(await signed(ended)), 0);
+    // Same id, now signed as a start: still a replay.
+    await expectAccepted(await send(await signedAt(1_000)), 0);
+  });
+
+  it('processes a retry with the same id after a 503, then remembers it', async () => {
+    requestEarlyPoll.mockRejectedValueOnce(new Error('synthetic failure'));
+    expect((await send(await signed())).status).toBe(503);
+    await expectAccepted(await send(await signedAt(1_000)), 2);
+    await expectAccepted(await send(await signedAt(WEBHOOK_DEBOUNCE_MS + 1_000)), 2);
+  });
+
+  it(`keeps at most ${WEBHOOK_SEEN_EVENTS_MAX} ids, evicting the oldest first`, async () => {
+    await expectAccepted(await send(await signed({ eventId: id(0) })), 1);
+    const ended = { eventType: 'tracker.session.ended' };
+    for (let n = 1; n <= WEBHOOK_SEEN_EVENTS_MAX; n++) {
+      expect((await send(await signed({ ...ended, eventId: id(n) }))).status).toBe(204);
+    }
+    // id(0) was evicted, so it is handled again; recording it evicts id(1).
+    await expectAccepted(await send(await signedAt(WEBHOOK_DEBOUNCE_MS, { eventId: id(0) })), 2);
+    // Past the debounce again: the newest ids are still remembered.
+    for (const n of [2, WEBHOOK_SEEN_EVENTS_MAX]) {
+      await expectAccepted(await send(await signedAt(2 * WEBHOOK_DEBOUNCE_MS, { eventId: id(n) })), 2);
+    }
+    await expectAccepted(await send(await signedAt(2 * WEBHOOK_DEBOUNCE_MS, { eventId: id(1) })), 3);
   });
 });
 

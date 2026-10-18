@@ -21,17 +21,28 @@ export const WEBHOOK_MAX_BODY_BYTES = 8 * 1024;
 export const SIGNATURE_TOLERANCE_SECONDS = 300;
 
 /**
- * After a successful coordinator call, this isolate skips further calls for
- * this long. A skipped hint is covered: any alarm it could have set fires at
- * least EARLY_POLL_DELAY_MS after scheduling, which is later than this.
+ * After a coordinator call that leaves an early-poll alarm pending, this
+ * isolate skips further calls for this long. A skipped hint is covered: that
+ * alarm fires at least EARLY_POLL_DELAY_MS after it was set, which is later
+ * than this. A call that scheduled nothing starts no debounce.
  */
 export const WEBHOOK_DEBOUNCE_MS = 15_000;
+
+/**
+ * Handled event ids are remembered this long: a signature stays acceptable for
+ * SIGNATURE_TOLERANCE_SECONDS on either side of its timestamp, so a request
+ * accepted now can be replayed for up to twice that.
+ */
+export const WEBHOOK_SEEN_EVENT_TTL_MS = 2 * SIGNATURE_TOLERANCE_SECONDS * 1000;
+
+/** At most this many remembered event ids per isolate; the oldest is evicted first. */
+export const WEBHOOK_SEEN_EVENTS_MAX = 1_000;
 
 /** The headers every accepted signature must cover. */
 const REQUIRED_SIGNED_HEADERS = ['x-event-type', 'x-event-id'];
 
 /** Fixed rejection reasons, logged without any request content. */
-export type RejectReason =
+type RejectReason =
   | 'signature_header_invalid'
   | 'signature_expired'
   | 'signed_headers_invalid'
@@ -41,7 +52,7 @@ export type RejectReason =
   | 'signature_mismatch';
 
 /** The parts of a Hook0 signature header needed to verify a request. */
-export interface SignedRequest {
+interface SignedRequest {
   /** `{t}.{h}.{values of the listed headers, joined by "."}.`, signed before the raw body. */
   prefix: string;
   /** One or two decoded `v1` HMAC-SHA256 values. */
@@ -68,6 +79,38 @@ let earlyPollRequestedAt: number | undefined;
 /** Test-only: forget the last early-poll request, ending the debounce. */
 export function resetWebhookDebounceForTests(): void {
   earlyPollRequestedAt = undefined;
+}
+
+/**
+ * Handled event ids and their expiry (epoch ms), in insertion order. A replay
+ * within the signature window is acknowledged without another coordinator
+ * call. Per isolate only, so another isolate may still handle a replay once.
+ * Event ids are never logged.
+ */
+const seenEvents = new Map<string, number>();
+
+/** Test-only: forget every handled event id. */
+export function resetWebhookSeenEventsForTests(): void {
+  seenEvents.clear();
+}
+
+function seenRecently(id: string, now: number): boolean {
+  const expiry = seenEvents.get(id);
+  return expiry !== undefined && expiry > now;
+}
+
+function recordSeen(id: string, now: number): void {
+  for (const [seenId, expiry] of seenEvents) {
+    if (expiry <= now) seenEvents.delete(seenId);
+  }
+  // Re-inserting moves an id to the newest position.
+  seenEvents.delete(id);
+  while (seenEvents.size >= WEBHOOK_SEEN_EVENTS_MAX) {
+    const oldest = seenEvents.keys().next().value;
+    if (oldest === undefined) break;
+    seenEvents.delete(oldest);
+  }
+  seenEvents.set(id, now + WEBHOOK_SEEN_EVENT_TTL_MS);
 }
 
 /**
@@ -209,7 +252,8 @@ function wantsEarlyPoll(eventType: string | null, body: Uint8Array, env: Env): b
  * configured secret, signature header, timestamp, signed headers, body size,
  * then the HMAC. Every verified event is acknowledged with 204, so IVAO does
  * not retry events this bot ignores. A coordinator failure is thrown, for the
- * caller's generic 503.
+ * caller's generic 503. Only an acknowledged event id is remembered: IVAO
+ * retries a failed delivery with the same id.
  */
 export async function handleWebhook(request: Request, env: Env): Promise<Response> {
   const secret = webhookSecret(env);
@@ -234,15 +278,17 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     logRejectionOnce('signature_mismatch');
     return errorResponse('unauthorized', 401);
   }
-  if (!wantsEarlyPoll(request.headers.get('x-event-type'), body, env)) return new Response(null, { status: 204 });
+  // A signed required header, so always present.
+  const eventId = request.headers.get('x-event-id') ?? '';
   const now = Date.now();
-  if (earlyPollRequestedAt !== undefined && now - earlyPollRequestedAt >= 0 &&
-      now - earlyPollRequestedAt < WEBHOOK_DEBOUNCE_MS) {
-    return new Response(null, { status: 204 });
+  if (seenRecently(eventId, now)) return new Response(null, { status: 204 });
+  if (wantsEarlyPoll(request.headers.get('x-event-type'), body, env) &&
+      (earlyPollRequestedAt === undefined || now - earlyPollRequestedAt < 0 ||
+       now - earlyPollRequestedAt >= WEBHOOK_DEBOUNCE_MS)) {
+    // Cleared first, so a failed call never debounces the next event.
+    earlyPollRequestedAt = undefined;
+    if (await getCoordinator(env).requestEarlyPoll()) earlyPollRequestedAt = now;
   }
-  // Cleared first, so a failed call never debounces the next event.
-  earlyPollRequestedAt = undefined;
-  await getCoordinator(env).requestEarlyPoll();
-  earlyPollRequestedAt = now;
+  recordSeen(eventId, now);
   return new Response(null, { status: 204 });
 }

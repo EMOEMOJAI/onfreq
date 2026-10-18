@@ -137,6 +137,18 @@ it('C1: a thrown /poll keeps its 500 result body, now with no-store, and exposes
   expect(body).not.toContain('600001');
 });
 
+it('C56: a failed poll logs only the error type, for POST /poll and cron', async () => {
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const { env: target } = withCoordinator({ poll: vi.fn(async () => { throw new TypeError(PRIVATE_DETAIL); }) });
+  expect((await send('/poll', 'POST', target)).status).toBe(500);
+  await expect(worker.scheduled(createScheduledController(), target, createExecutionContext())).rejects.toThrow(TypeError);
+  expect(log.mock.calls.map(([line]) => JSON.parse(String(line)) as unknown)).toEqual([
+    { event: 'poll_failed', source: 'http', error: 'TypeError' },
+    { event: 'poll_failed', error: 'TypeError' },
+  ]);
+  expect(JSON.stringify(log.mock.calls)).not.toContain('600001');
+});
+
 it.each(['', '   ', 'preserved-state'])('uses the same identity for cron with override %j', async (name) => {
   const poll = vi.fn(async () => ({ skipped: true }));
   const getByName = vi.fn(() => ({ poll }));
