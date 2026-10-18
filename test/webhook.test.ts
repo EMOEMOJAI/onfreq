@@ -471,7 +471,9 @@ describe('verified events', () => {
   ])('acknowledges %s with 204 and no coordinator call', async (label, options, overrides) => {
     let request = await signed(options as Signing);
     if (label === 'invalid UTF-8') {
-      const bytes = new Uint8Array([0x7b, 0xff, 0x7d]);
+      // A monitored ATC start except for one 0xff byte inside the callsign: a lenient decoder would still notify.
+      const bytes = encoder.encode(event({ callsign: 'XA_SYN_CTR' }));
+      bytes[bytes.indexOf(0x53)] = 0xff; // the S of SYN
       const v1 = await hmacHex(SECRET, new Uint8Array([
         ...encoder.encode(`${NOW_S}.${SIGNED}.application/json.${EVENT_ID}.tracker.session.started.`), ...bytes]));
       const headers = new Headers(request.headers);

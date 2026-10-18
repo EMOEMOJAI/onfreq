@@ -223,8 +223,16 @@ describe('requestEarlyPoll', () => {
     now = T0 + 20_000;
     expect(await fireDueAlarm()).toBe(true);
     expect(await budget()).toEqual({ hourStart: T0, count: 1 });
-    await storage((ctx) => ctx.storage.put(EARLY_POLL_KEY, { hourStart: T0, count: Number.NaN }));
-    expect(await request()).toBe(T0 + 50_000);
+    // Non-finite counts are discarded too: an unguarded Infinity would read as a spent budget, NaN would stay NaN.
+    for (const count of [Number.POSITIVE_INFINITY, Number.NaN]) {
+      await seedSeen(now - 65_000);
+      await storage((ctx) => ctx.storage.put(EARLY_POLL_KEY, { hourStart: T0, count }));
+      const due = await request();
+      expect(due).toBe(now + 30_000);
+      now = due!;
+      expect(await fireDueAlarm()).toBe(true);
+      expect(await budget()).toEqual({ hourStart: T0, count: 1 });
+    }
   });
 
   it('resolves to the pending alarm time, or null when nothing is scheduled', async () => {
@@ -250,11 +258,14 @@ describe('requestEarlyPoll', () => {
       const target = { ...env, POLL_COORDINATOR: { getByName: () => instance } as unknown as Env['POLL_COORDINATOR'] };
       const ready = new Promise<void>((resolve) => { entered = resolve; });
       const running = instance.poll({ recordHeartbeat: true });
-      await ready;
-      expect((await webhook(target)).status).toBe(204);
-      expect(await ctx.storage.getAlarm()).toBeNull();
-      release!();
-      await running;
+      try {
+        await ready;
+        expect((await webhook(target)).status).toBe(204);
+        expect(await ctx.storage.getAlarm()).toBeNull();
+      } finally {
+        release!();
+        await running;
+      }
       // Within what would have been the debounce, the next event still schedules.
       now = T0 + 1_000;
       expect((await webhook(target)).status).toBe(204);
@@ -267,10 +278,13 @@ describe('requestEarlyPoll', () => {
       const instance = coordinator()(ctx);
       const ready = new Promise<void>((resolve) => { entered = resolve; });
       const running = instance.poll();
-      await ready;
-      await expect(instance.requestEarlyPoll()).resolves.toBeNull();
-      release!();
-      await running;
+      try {
+        await ready;
+        await expect(instance.requestEarlyPoll()).resolves.toBeNull();
+      } finally {
+        release!();
+        await running;
+      }
     });
     expect(await alarmAt()).toBeNull();
   });
@@ -327,6 +341,9 @@ describe('early poll alarm', () => {
     network.mockResolvedValueOnce(new Response('synthetic outage', { status: 500 }));
     await storage((ctx) => ctx.storage.setAlarm(now));
     expect(await runDurableObjectAlarm(stub())).toBe(true);
+    expect(feedFetches()).toBe(1);
+    expect(lines()).toEqual([{ event: 'early_poll_failed', error: 'Error' }, { event: 'early_poll_failed', error: 'Error' }]);
+    expect(await budget()).toEqual({ hourStart: T0, count: 2 });
     expect(await alarmAt()).toBeNull();
     expect(JSON.stringify(log.mock.calls)).not.toContain('synthetic outage');
   });
@@ -362,12 +379,16 @@ describe('early poll alarm', () => {
       const instance = coordinator()(ctx);
       const ready = new Promise<void>((resolve) => { entered = resolve; });
       const running = instance.alarm();
-      await ready;
-      const scheduled = instance.poll({ recordHeartbeat: true });
-      await vi.waitFor(async () => expect(await ctx.storage.get(SCHEDULER_SEEN_KEY)).toBe(T0));
-      release!();
-      await expect(scheduled).resolves.toEqual({ skipped: true });
-      await running;
+      try {
+        await ready;
+        const scheduled = instance.poll({ recordHeartbeat: true });
+        await vi.waitFor(async () => expect(await ctx.storage.get(SCHEDULER_SEEN_KEY)).toBe(T0));
+        release!();
+        await expect(scheduled).resolves.toEqual({ skipped: true });
+      } finally {
+        release!();
+        await running;
+      }
     });
     expect(feedFetches()).toBe(1);
     expect(await budget()).toEqual({ hourStart: T0, count: 1 });

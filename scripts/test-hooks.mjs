@@ -978,9 +978,11 @@ function scanAssignment(f, text) {
   writeFileSync(join(f.repo, 'settings.env'), text);
   f.git('add', 'settings.env');
   const hook = [f.commitHook(), f.commitHook({ commit: true })];
+  // A passing hook already committed the file, so this commit may be empty: scan the commit that added it.
   f.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m', 'synthetic settings');
+  const added = f.git('log', '-1', '--format=%H', '--', 'settings.env');
   const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
-  const scan = spawnSync('/bin/sh', ['scripts/secret-scan.sh', 'HEAD^!'], { cwd: f.repo, env, encoding: 'utf8' });
+  const scan = spawnSync('/bin/sh', ['scripts/secret-scan.sh', `${added}^!`], { cwd: f.repo, env, encoding: 'utf8' });
   f.git('rm', '--quiet', 'settings.env');
   f.git('commit', '--quiet', '--no-verify', '-m', 'remove synthetic settings');
   return { hook, scan };
