@@ -38,14 +38,14 @@ Each of these changes makes the named chunk due at once, whatever its date:
 
 ## Next up
 
-**T1-2**: IVAO webhook (new since baseline; public and unauthenticated by design)
+**T1-1**: HTTP surface and bearer auth (changed since baseline: webhook routing, shared error helpers)
 
 ## Tier 1 (quarterly; due 2026-12-27)
 
 | ID | Chunk | Paths | Focus | Baseline | Last pass | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | T1-1 | HTTP surface and bearer auth | `src/index.ts`, `src/auth.ts`, `src/http.ts` | Route auth and secret separation, fixed error bodies, no-store, bounded upstream reads, no redirects | 932364b | 2026-09-27 | clean |
-| T1-2 | IVAO webhook | `src/webhook.ts` | HMAC verification order, replay cache, body cap, no Durable Object call before verification, log privacy | 932364b | — | due (new since baseline) |
+| T1-2 | IVAO webhook | `src/webhook.ts` | HMAC verification order, replay cache, body cap, no Durable Object call before verification, log privacy | a07f281 | 2026-10-18 | open-findings (1 P3, 5 P4) |
 | T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | 932364b | 2026-09-27 | clean |
 | T1-4 | GCA reminders and member data | `src/gca.ts`, `src/retention.ts` | Policy parsing fails closed, DM reservations and dedup ledgers, history privacy, cleanup vs polling | 932364b | 2026-09-27 | clean |
 | T1-5 | Secrets hygiene and privacy gates | `scripts/check-privacy.mjs`, `scripts/secret-scan.sh`, `scripts/hooks/**`, `.github/actions/**`, `.gitignore`, `.dev.vars.example`, `config/**`, `src/env.d.ts` | No real IDs or secrets in history, hook coverage, optional-secret boundaries | 932364b | 2026-09-27 | clean |
@@ -75,3 +75,5 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | --- | --- | --- | --- | --- |
 | 2026-10-18 | T1-2, T2-1 | P2 | Per-change audit of the webhook: early polls suppressed cron; fixed with separate throttles | cc05123 |
 | 2026-10-18 | T2-5 | P2 | CI audit red on braces (GHSA-vfj7-8cjw-p6xm, no patch); replaced markdownlint-cli2 | 2c7fc1b |
+| 2026-10-18 | T1-2 | P3 | Debounce can outlast an already-pending early-poll alarm (latency only) | — |
+| 2026-10-18 | T1-2 | P4 | Empty event-id shares a replay key; replay TTL 1 s short; three untested guard paths | — |
