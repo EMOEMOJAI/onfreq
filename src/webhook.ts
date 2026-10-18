@@ -22,18 +22,19 @@ export const SIGNATURE_TOLERANCE_SECONDS = 300;
 
 /**
  * After a coordinator call that leaves an early-poll alarm pending, this
- * isolate skips further calls for this long. A skipped hint is covered: that
- * alarm fires at least EARLY_POLL_DELAY_MS after it was set, which is later
- * than this. A call that scheduled nothing starts no debounce.
+ * isolate skips further calls for this long, or until that alarm's time if
+ * sooner. A skipped hint is covered: the pending alarm has not fired yet. A
+ * call that scheduled nothing starts no debounce.
  */
 export const WEBHOOK_DEBOUNCE_MS = 15_000;
 
 /**
  * Handled event ids are remembered this long: a signature stays acceptable for
  * SIGNATURE_TOLERANCE_SECONDS on either side of its timestamp, so a request
- * accepted now can be replayed for up to twice that.
+ * accepted now can be replayed for up to twice that. Hook0 timestamps are
+ * whole seconds, so add one second.
  */
-export const WEBHOOK_SEEN_EVENT_TTL_MS = 2 * SIGNATURE_TOLERANCE_SECONDS * 1000;
+export const WEBHOOK_SEEN_EVENT_TTL_MS = (2 * SIGNATURE_TOLERANCE_SECONDS + 1) * 1000;
 
 /** At most this many remembered event ids per isolate; the oldest is evicted first. */
 export const WEBHOOK_SEEN_EVENTS_MAX = 1_000;
@@ -73,12 +74,20 @@ export function resetWebhookLogForTests(): void {
   loggedRejections.clear();
 }
 
-/** When this isolate last asked the coordinator for an early poll and the call succeeded. */
-let earlyPollRequestedAt: number | undefined;
+/**
+ * The current debounce: started when a coordinator call left an alarm
+ * pending, ending at the earlier of WEBHOOK_DEBOUNCE_MS later and that alarm.
+ */
+let earlyPollDebounce: { from: number; until: number } | undefined;
 
 /** Test-only: forget the last early-poll request, ending the debounce. */
 export function resetWebhookDebounceForTests(): void {
-  earlyPollRequestedAt = undefined;
+  earlyPollDebounce = undefined;
+}
+
+/** True while the debounce runs; a start later than now (clock moved back) is ignored. */
+function debounced(now: number): boolean {
+  return earlyPollDebounce !== undefined && earlyPollDebounce.from <= now && now < earlyPollDebounce.until;
 }
 
 /**
@@ -282,12 +291,13 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   const eventId = request.headers.get('x-event-id') ?? '';
   const now = Date.now();
   if (seenRecently(eventId, now)) return new Response(null, { status: 204 });
-  if (wantsEarlyPoll(request.headers.get('x-event-type'), body, env) &&
-      (earlyPollRequestedAt === undefined || now - earlyPollRequestedAt < 0 ||
-       now - earlyPollRequestedAt >= WEBHOOK_DEBOUNCE_MS)) {
+  if (wantsEarlyPoll(request.headers.get('x-event-type'), body, env) && !debounced(now)) {
     // Cleared first, so a failed call never debounces the next event.
-    earlyPollRequestedAt = undefined;
-    if (await getCoordinator(env).requestEarlyPoll()) earlyPollRequestedAt = now;
+    earlyPollDebounce = undefined;
+    const alarmAt = await getCoordinator(env).requestEarlyPoll();
+    if (typeof alarmAt === 'number') {
+      earlyPollDebounce = { from: now, until: Math.min(now + WEBHOOK_DEBOUNCE_MS, alarmAt) };
+    }
   }
   recordSeen(eventId, now);
   return new Response(null, { status: 204 });

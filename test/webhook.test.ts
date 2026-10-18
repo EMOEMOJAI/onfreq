@@ -3,6 +3,7 @@ import { createExecutionContext } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import worker from '../src/index';
 import { resetConfigInvalidLogForTests } from '../src/auth';
+import { EARLY_POLL_DELAY_MS } from '../src/config';
 import {
   parseHook0Signature, resetWebhookDebounceForTests, resetWebhookLogForTests, resetWebhookSeenEventsForTests,
   SIGNATURE_TOLERANCE_SECONDS, verifyHook0Signature, WEBHOOK_DEBOUNCE_MS, WEBHOOK_MAX_BODY_BYTES,
@@ -24,7 +25,7 @@ const STARTED = '{"sessionId":1,"callsign":"XA_SYN_CTR","userId":100,"connection
 const FIXED_V1 = '6fae3d7c2af8f5a5aab8bc77621cb3fd222bc91a38dfcbcb1d0c6ee847a3cafc';
 const WEBHOOK_URL = 'https://example.test/ivao/webhook';
 
-let requestEarlyPoll: ReturnType<typeof vi.fn<() => Promise<boolean>>>;
+let requestEarlyPoll: ReturnType<typeof vi.fn<() => Promise<number | null>>>;
 let getByName: ReturnType<typeof vi.fn>;
 let log: MockInstance<typeof console.error>;
 
@@ -35,8 +36,8 @@ beforeEach(() => {
   resetWebhookSeenEventsForTests();
   vi.spyOn(Date, 'now').mockReturnValue(NOW_S * 1000);
   log = vi.spyOn(console, 'error').mockImplementation(() => {});
-  // A real coordinator resolves true while an early-poll alarm is pending.
-  requestEarlyPoll = vi.fn(async () => true);
+  // A real coordinator resolves to the pending early-poll alarm's time, at least this far ahead when just set.
+  requestEarlyPoll = vi.fn(async () => Date.now() + EARLY_POLL_DELAY_MS);
   getByName = vi.fn(() => ({ requestEarlyPoll }));
 });
 afterEach(() => { vi.restoreAllMocks(); });
@@ -216,6 +217,11 @@ describe('Hook0 signature', () => {
     await expectError(await send(await signed({ secret: POLL_ONLY })), 401, 'unauthorized');
   });
 
+  it('does not let a forged request claim an event id before the genuine one', async () => {
+    await expectError(await send(await signed({ secret: POLL_ONLY })), 401, 'unauthorized');
+    await expectAccepted(await send(await signed()), 1);
+  });
+
   it('logs each rejection reason once and never logs request content', async () => {
     for (let i = 0; i < 5; i++) {
       await send(await signed({ sentBody: STARTED.replace('XA_SYN_CTR', 'XA_SYN_TWR') }));
@@ -263,6 +269,15 @@ describe('body limit', () => {
     const request = await signed({ body, sentBody: stream });
     expect(request.headers.get('content-length')).toBeNull();
     await expectError(await send(request), 413, 'payload too large');
+  });
+
+  it('rejects an unreadable body with 400', async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) { controller.error(new Error('synthetic stream failure')); },
+    });
+    const request = await signed({ sentBody: stream });
+    await expectError(await send(request), 400, 'bad request');
+    expect(rejectionLines()).toEqual([{ event: 'webhook_rejected', reason: 'body_unreadable' }]);
   });
 
   it('accepts a small streamed body without content-length', async () => {
@@ -345,9 +360,25 @@ describe('debounce', () => {
   });
 
   it('does not debounce when the coordinator scheduled nothing', async () => {
-    requestEarlyPoll.mockResolvedValueOnce(false);
+    requestEarlyPoll.mockResolvedValueOnce(null);
     await expectAccepted(await send(await signed({ eventId: id(1) })), 1);
     at(1_000);
+    await expectAccepted(await send(await signed({ eventId: id(2) })), 2);
+  });
+
+  it('ends the debounce at a pending alarm due sooner than 15 s', async () => {
+    requestEarlyPoll.mockResolvedValueOnce(NOW_S * 1000 + 3_000);
+    await expectAccepted(await send(await signed({ eventId: id(1) })), 1);
+    at(2_999);
+    await expectAccepted(await send(await signed({ eventId: id(2) })), 1);
+    // That alarm is due, so its poll may already have run: this hint needs a new one.
+    at(3_000);
+    await expectAccepted(await send(await signed({ eventId: id(3) })), 2);
+  });
+
+  it('ignores a debounce that started later than now, as after the clock moved back', async () => {
+    await expectAccepted(await send(await signed({ eventId: id(1) })), 1);
+    at(-1_000);
     await expectAccepted(await send(await signed({ eventId: id(2) })), 2);
   });
 
@@ -373,6 +404,13 @@ describe('replayed event ids', () => {
     // A different id is still handled.
     await expectAccepted(await send(await signedAt(WEBHOOK_SEEN_EVENT_TTL_MS - 1, { eventId: id(2) })), 2);
     expect(log).not.toHaveBeenCalled();
+  });
+
+  it('treats an empty X-Event-Id as an id, so its identical replay is not handled again', async () => {
+    await expectAccepted(await send(await signed({ eventId: '' })), 1);
+    // Past the debounce and still within the signature window: only the replay cache stops it.
+    vi.spyOn(Date, 'now').mockReturnValue(NOW_S * 1000 + WEBHOOK_DEBOUNCE_MS);
+    await expectAccepted(await send(await signed({ eventId: '' })), 1);
   });
 
   it('forgets an id once the replay window has passed', async () => {

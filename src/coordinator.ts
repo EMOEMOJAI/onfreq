@@ -99,12 +99,13 @@ export class PollCoordinator extends DurableObject<Env> {
    * poll. No-op while a poll runs, when a live cron's next poll that will
    * actually run is about as soon, or once this hour's early-poll budget is
    * spent. Without a recent heartbeat (a stopped cron) the early poll always
-   * helps. Resolves true when an alarm is pending (just set or already set),
-   * false for every no-op.
+   * helps. Resolves to the pending alarm's time (epoch ms), whether just set
+   * or already set, or null for every no-op.
    */
-  async requestEarlyPoll(): Promise<boolean> {
-    if ((await this.ctx.storage.getAlarm()) !== null) return true;
-    if (this.inFlight) return false;
+  async requestEarlyPoll(): Promise<number | null> {
+    const pending = await this.ctx.storage.getAlarm();
+    if (pending !== null) return pending;
+    if (this.inFlight) return null;
     const snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
     const seen = await this.ctx.storage.get<unknown>(SCHEDULER_SEEN_KEY);
     const now = Date.now();
@@ -122,7 +123,7 @@ export class PollCoordinator extends DurableObject<Env> {
           (lastScheduled !== undefined && next - lastScheduled < MIN_POLL_INTERVAL_MS)); i++) {
         next += CRON_PERIOD_MS;
       }
-      if (target >= next - EARLY_POLL_MIN_GAIN_MS) return false;
+      if (target >= next - EARLY_POLL_MIN_GAIN_MS) return null;
     }
     const budget = await this.ctx.storage.get<EarlyPollBudget>(EARLY_POLL_KEY);
     const hour = hourStart(now);
@@ -131,11 +132,11 @@ export class PollCoordinator extends DurableObject<Env> {
         loggedEarlyPollCappedHour = hour;
         console.error(JSON.stringify({ event: 'early_poll_capped' }));
       }
-      return false;
+      return null;
     }
     // No re-check of inFlight: input gates deliver no other event while this awaits storage only.
     await this.ctx.storage.setAlarm(target);
-    return true;
+    return target;
   }
 
   /**

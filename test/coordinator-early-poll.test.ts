@@ -114,7 +114,7 @@ describe('requestEarlyPoll', () => {
 
   it('waits at least 30 s after the last poll start', async () => {
     await seed({ state: {}, lastPollStartedAt: T0 - 2_000 });
-    await storage((ctx) => coordinator()(ctx).requestEarlyPoll());
+    expect(await request()).toBe(T0 + 28_000);
     expect(await alarmAt()).toBe(T0 + 28_000);
   });
 
@@ -180,17 +180,19 @@ describe('requestEarlyPoll', () => {
     expect(await alarmAt()).toBe(T0 + 20_000);
   });
 
-  it('resolves true only while an alarm is pending', async () => {
-    expect(await request()).toBe(true);
-    // Already pending: kept, and still reported.
-    expect(await request()).toBe(true);
+  it('resolves to the pending alarm time, or null when nothing is scheduled', async () => {
+    expect(await request()).toBe(T0 + 20_000);
+    // Already pending: kept, and its time still reported.
+    now += 5_000;
+    expect(await request()).toBe(T0 + 20_000);
+    now = T0;
     await storage((ctx) => ctx.storage.deleteAlarm());
     await seed({ state: {}, lastPollStartedAt: T0 - 40_000 });
     await seedSeen(T0 - 40_000);
-    expect(await request()).toBe(false);
+    expect(await request()).toBeNull();
     await seedSeen(T0 - 60_000);
     await storage((ctx) => ctx.storage.put(EARLY_POLL_KEY, { hourStart: T0, count: 20 }));
-    expect(await request()).toBe(false);
+    expect(await request()).toBeNull();
     expect(await alarmAt()).toBeNull();
   });
 
@@ -219,7 +221,7 @@ describe('requestEarlyPoll', () => {
       const ready = new Promise<void>((resolve) => { entered = resolve; });
       const running = instance.poll();
       await ready;
-      await expect(instance.requestEarlyPoll()).resolves.toBe(false);
+      await expect(instance.requestEarlyPoll()).resolves.toBeNull();
       release!();
       await running;
     });
