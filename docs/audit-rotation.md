@@ -47,19 +47,19 @@ Each of these changes makes the named chunk due at once, whatever its date:
 | --- | --- | --- | --- | --- | --- | --- |
 | T1-1 | HTTP surface and bearer auth | `src/index.ts`, `src/auth.ts`, `src/http.ts` | Route auth and secret separation, fixed error bodies, no-store, bounded upstream reads, no redirects | 04af6c6 | 2026-10-18 | clean |
 | T1-2 | IVAO webhook | `src/webhook.ts` | HMAC verification order, replay cache, body cap, no Durable Object call before verification, log privacy | 08d76ed | 2026-10-18 | clean |
-| T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | 4b2c8a9 | 2026-10-18 | clean (unchanged) |
-| T1-4 | GCA reminders and member data | `src/gca.ts`, `src/retention.ts` | Policy parsing fails closed, DM reservations and dedup ledgers, history privacy, cleanup vs polling | 4b2c8a9 | 2026-10-18 | clean (unchanged) |
-| T1-5 | Secrets hygiene and privacy gates | `scripts/check-privacy.mjs`, `scripts/secret-scan.sh`, `scripts/hooks/**`, `.github/actions/**`, `.gitignore`, `.gitleaks.toml`, `.dev.vars.example`, `config/**`, `src/env.d.ts` | No real IDs or secrets in history, hook coverage, optional-secret boundaries | 04af6c6 | 2026-10-18 | clean |
-| T1-6 | Short-session reminders | `src/short-session.ts` | Presence invariants, continuity/baseline, at-most-once and daily cap, GCA interaction, retention/purge, log privacy | pending | 2026-10-19 | fixes pending |
+| T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | b0bcc2a | 2026-10-19 | clean |
+| T1-4 | GCA reminders and member data | `src/gca.ts`, `src/retention.ts` | Policy parsing fails closed, DM reservations and dedup ledgers, history privacy, cleanup vs polling | b0bcc2a | 2026-10-19 | clean |
+| T1-5 | Secrets hygiene and privacy gates | `scripts/check-privacy.mjs`, `scripts/secret-scan.sh`, `scripts/hooks/**`, `.github/actions/**`, `.gitignore`, `.gitleaks.toml`, `.dev.vars.example`, `config/**`, `src/env.d.ts` | No real IDs or secrets in history, hook coverage, optional-secret boundaries | b0bcc2a | 2026-10-19 | clean |
+| T1-6 | Short-session reminders | `src/short-session.ts` | Presence invariants, continuity/baseline, at-most-once and daily cap, GCA interaction, retention/purge, log privacy | b0bcc2a | 2026-10-19 | clean |
 
 ## Tier 2 (semi-annually; due 2027-04-18)
 
 | ID | Chunk | Paths | Focus | Baseline | Last pass | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| T2-1 | Coordinator and scheduling | `src/coordinator.ts`, `src/config.ts` | Single coordinator, inFlight serialization, throttles and alarms, heartbeat and health, persist() field coverage | 4b2c8a9 | 2026-10-18 | clean |
-| T2-2 | Delivery pipeline | `src/poll.ts`, `src/state.ts`, `src/roster.ts`, `src/types.ts` | Untrusted feed data, at-least-once delivery, grace windows, nonce keys, retry budgets | 4b2c8a9 | 2026-10-18 | clean (unchanged) |
+| T2-1 | Coordinator and scheduling | `src/coordinator.ts`, `src/config.ts` | Single coordinator, inFlight serialization, throttles and alarms, heartbeat and health, persist() field coverage | b0bcc2a | 2026-10-19 | clean |
+| T2-2 | Delivery pipeline | `src/poll.ts`, `src/state.ts`, `src/roster.ts`, `src/types.ts` | Untrusted feed data, at-least-once delivery, grace windows, nonce keys, retry budgets | b0bcc2a | 2026-10-19 | clean |
 | T2-3 | Discord client and rendering | `src/discord.ts`, `src/discord-rate-limit.ts` | Markdown and mention escaping, rate-limit waits, error handling without leaking IDs | 4b2c8a9 | 2026-10-18 | clean (unchanged) |
-| T2-4 | Build and deploy config | `wrangler.jsonc`, `tsconfig.json`, `vitest.config.ts`, `.node-version`, `scripts/check-deploy.mjs`, `scripts/check-setup.mjs` | Public KV ID stays all-zero, Durable Object identity and migrations, deploy refusal with private config | 04af6c6 | 2026-10-18 | clean |
+| T2-4 | Build and deploy config | `wrangler.jsonc`, `tsconfig.json`, `vitest.config.ts`, `.node-version`, `scripts/check-deploy.mjs`, `scripts/check-setup.mjs` | Public KV ID stays all-zero, Durable Object identity and migrations, deploy refusal with private config | b0bcc2a | 2026-10-19 | clean |
 | T2-5 | CI and supply chain | `.github/workflows/**`, `package.json`, `package-lock.json`, `.markdownlint-cli2.jsonc`, `scripts/lint-docs.mjs`, `scripts/check-links.mjs`, `scripts/repo-files.mjs` | Pinned actions and minimal permissions, audit gate intact, overrides justified, lint script path safety | 04af6c6 | 2026-10-18 | clean |
 
 ## Tier 3 (on trigger)
@@ -91,20 +91,20 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-19 | T1-5 | P3 | `.gitignore` re-included `config/.example` and files under `config/*.example/`, unlike `privatePath`; now aligned | fd1b363 |
 | 2026-10-19 | T1-5 | P4 | Trailer-email check ignored `/@` anywhere, so `person/@domain` passed; now ignored only inside a scheme:// URL | d912d3a |
 | 2026-10-19 | T1-5 | P4 | Pre-push note missed `gitleaks:allow` lines that only a merge resolution adds; merge diffs now included, as in the scan | d912d3a |
-| 2026-10-19 | T2-1 | P2 | A trigger or webhook hint arriving during a saved poll's DM step was dropped; it now runs once, or schedules an early poll, as the throttle allows | pending |
-| 2026-10-19 | T1-6 | P3 | Short-session DM requests could start with too little budget left; each now needs 10 s (the request timeout) | pending |
-| 2026-10-19 | T1-3 | P2 | A tracker that rejected fresh tokens was retried with a new token every poll; it now falls back to anonymous reads for 30 minutes | pending |
-| 2026-10-19 | T1-5 | P3 | Pre-push did not name commits whose message carries gitleaks:allow; now named, whatever the message encoding | pending |
-| 2026-10-19 | T1-5 | P2 | No Gitleaks rule for operator Discord IDs or private JSON settings; added, with synthetic-fixture allowlists (constants and other names remain uncovered) | pending |
-| 2026-10-19 | T1-5 | P3 | Any `config/*.example` was public; now only `config/optional-secrets.example` | pending |
-| 2026-10-19 | T1-5 | P3 | The Gitleaks configuration could drop default rules (extend, path, disabledRules, top-level allowlists, CRLF); check:setup now rejects them | pending |
-| 2026-10-19 | T1-5 | P3 | `.envrc` files were neither private nor ignored | pending |
-| 2026-10-19 | T2-4 | P4 | The wrangler.jsonc secret-name comment was unchecked; check:setup now compares it with the settings | pending |
-| 2026-10-19 | T2-2 | P4 | GCA send detection assumed every request had options | pending |
-| 2026-10-19 | T1-4, T1-6 | P3 | A definitely undelivered GCA reminder suppressed short-session DMs; GCA budget comment outdated; member-list failure log now says whether a short-session failure counted | pending |
-| 2026-10-19 | T1-6 | P3 | Due and expiry used the clock rather than the recorded poll; disabling kept the member-list pause key; coverage added for limits and retries | pending |
-| 2026-10-19 | T1-6 | P4 | Deferred: the DM channel id is kept in the shared rate-limit map | pending |
-| 2026-10-19 | T1-5 | P4 | Deferred: whole-message email check; gitleaks:allow in author names or paths; a COORDINATOR_NAME or FIR_PREFIXES rule | pending |
+| 2026-10-19 | T2-1 | P2 | A trigger or webhook hint arriving during a saved poll's DM step was dropped; it now runs once, or schedules an early poll, as the throttle allows | b0bcc2a |
+| 2026-10-19 | T1-6 | P3 | Short-session DM requests could start with too little budget left; each now needs 10 s (the request timeout) | b0bcc2a |
+| 2026-10-19 | T1-3 | P2 | A tracker that rejected fresh tokens was retried with a new token every poll; it now falls back to anonymous reads for 30 minutes | b0bcc2a |
+| 2026-10-19 | T1-5 | P3 | Pre-push did not name commits whose message carries gitleaks:allow; now named, whatever the message encoding | b0bcc2a |
+| 2026-10-19 | T1-5 | P2 | No Gitleaks rule for operator Discord IDs or private JSON settings; added, with synthetic-fixture allowlists (constants and other names remain uncovered) | b0bcc2a |
+| 2026-10-19 | T1-5 | P3 | Any `config/*.example` was public; now only `config/optional-secrets.example` | b0bcc2a |
+| 2026-10-19 | T1-5 | P3 | The Gitleaks configuration could drop default rules (extend, path, disabledRules, top-level allowlists, CRLF); check:setup now rejects them | b0bcc2a |
+| 2026-10-19 | T1-5 | P3 | `.envrc` files were neither private nor ignored | b0bcc2a |
+| 2026-10-19 | T2-4 | P4 | The wrangler.jsonc secret-name comment was unchecked; check:setup now compares it with the settings | b0bcc2a |
+| 2026-10-19 | T2-2 | P4 | GCA send detection assumed every request had options | b0bcc2a |
+| 2026-10-19 | T1-4, T1-6 | P3 | A definitely undelivered GCA reminder suppressed short-session DMs; GCA budget comment outdated; member-list failure log now says whether a short-session failure counted | b0bcc2a |
+| 2026-10-19 | T1-6 | P3 | Due and expiry used the clock rather than the recorded poll; disabling kept the member-list pause key; coverage added for limits and retries | b0bcc2a |
+| 2026-10-19 | T1-6 | P4 | Deferred: the DM channel id is kept in the shared rate-limit map | b0bcc2a |
+| 2026-10-19 | T1-5 | P4 | Deferred: whole-message email check; gitleaks:allow in author names or paths; a COORDINATOR_NAME or FIR_PREFIXES rule | b0bcc2a |
 
 Deferred: test pool runtime older than deploy runtime (vitest-pool-workers 0.23.0 still bundles miniflare 5.20260815.0-alpha vs compatibility date 2026-08-16; bump when a matching release exists). Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
