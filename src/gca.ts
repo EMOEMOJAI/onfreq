@@ -44,6 +44,8 @@ const REBASELINE_GAP_MS = 15 * 60_000;
  * stored backoff further out can only be corrupt or pre-cap, and is ignored.
  */
 const GCA_MAX_BACKOFF_MS = 60 * 60_000;
+/** One poll's budget for GCA member reminders and staff copies together. */
+export const DM_BUDGET_MS = 25_000;
 
 export interface GcaApproval {
   region: Region;
@@ -378,7 +380,7 @@ class GcaDiscordError extends Error {
 }
 
 /** Running out of the poll deadline, not a Discord failure: backs off only when repeated. */
-class GcaDeadlineError extends Error {}
+export class GcaDeadlineError extends Error {}
 
 /** A member list Discord returned successfully but that cannot be used. */
 class GcaMemberListError extends Error {
@@ -602,6 +604,7 @@ export function gcaRemindersEnabled(env: Env): boolean {
  */
 export async function fetchMembersWithBackoff(
   env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits, now: number, deadline: number,
+  { countDeadline = true }: { countDeadline?: boolean } = {},
 ): Promise<GuildMember[] | null> {
   const globalBackoff = await readBackoff(storage, BACKOFF_KEY, now);
   const memberListBackoff = await readBackoff(storage, MEMBER_LIST_BACKOFF_KEY, now);
@@ -619,6 +622,9 @@ export async function fetchMembersWithBackoff(
     console.warn(JSON.stringify({
       event: 'gca_member_list_failed', reason, status: httpError ? err.status : 'unavailable', ...rateLimitDetail(err),
     }));
+    // A caller with a budget of its own (short-session reminders) handles its
+    // own deadline failures: they never count towards GCA's lookup backoff.
+    if (err instanceof GcaDeadlineError && !countDeadline) throw err;
     if (err instanceof GcaDeadlineError) {
       // Running out of the poll deadline is not a Discord failure: a one-off
       // slow lookup is simply retried next poll. Only a lookup that keeps
@@ -661,12 +667,12 @@ export interface MemberListCache {
 /** `fetchMembersWithBackoff`, reusing (or recording) this poll's single attempt; a failed one reads as null. */
 export async function sharedMembers(
   env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits, now: number, deadline: number,
-  cache?: MemberListCache,
+  cache?: MemberListCache, options?: { countDeadline?: boolean },
 ): Promise<GuildMember[] | null> {
-  if (!cache) return fetchMembersWithBackoff(env, storage, limits, now, deadline);
+  if (!cache) return fetchMembersWithBackoff(env, storage, limits, now, deadline, options);
   if (cache.fetched) return cache.members;
   cache.fetched = true;
-  cache.members = await fetchMembersWithBackoff(env, storage, limits, now, deadline);
+  cache.members = await fetchMembersWithBackoff(env, storage, limits, now, deadline, options);
   return cache.members;
 }
 
@@ -868,7 +874,7 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits
 export async function sendGcaReminders(
   env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number,
   policy: GcaPolicy | null, labels: FirLabel[] = [], rateLimits?: DiscordRateLimits,
-  deadline = Date.now() + 25_000, memberCache?: MemberListCache,
+  deadline = Date.now() + DM_BUDGET_MS, memberCache?: MemberListCache,
 ): Promise<void> {
   if (env.GCA_DM_ENABLED !== 'true') return;
   const limits = rateLimits ?? await DiscordRateLimits.load(storage);

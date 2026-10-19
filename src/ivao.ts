@@ -469,6 +469,8 @@ async function authHeaders(
 export async function fetchDivisionAtc(
   prefixes: string[],
   auth?: IvaoAuth,
+  /** Filled with the VIDs of every division entry, before duplicate callsigns are merged. */
+  presentVids?: number[],
 ): Promise<OnlineAtc[]> {
   const headers = await authHeaders(auth);
   let res = await fetchBuffered(IVAO_ATC_SUMMARY_URL, { headers }, { maxBytes: IVAO_ATC_SUMMARY_MAX_BYTES });
@@ -540,9 +542,9 @@ export async function fetchDivisionAtc(
     );
   }
 
-  return dedupeByCallsign(
-    sanitized
-      .filter((e) => isDivisionCallsign(e.callsign, prefixes))
-      .map(normalizeAtc),
-  );
+  const division = sanitized
+    .filter((e) => isDivisionCallsign(e.callsign, prefixes))
+    .map(normalizeAtc);
+  presentVids?.push(...division.map((atc) => atc.userId));
+  return dedupeByCallsign(division);
 }

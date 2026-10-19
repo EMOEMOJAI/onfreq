@@ -178,13 +178,6 @@ export interface TrackedAtc extends OnlineAtc {
    * before it was recorded.
    */
   firstSessionId?: number;
-  /**
-   * ISO time of the last saved poll before this controller's presence was
-   * first seen (inherited across a switch between callsigns), so the time
-   * from it to the session end bounds the real duration from above. Absent
-   * for sessions first seen without such a poll, or before it was recorded.
-   */
-  seenAfter?: string;
 }
 
 /** Persisted session state, keyed by callsign. */

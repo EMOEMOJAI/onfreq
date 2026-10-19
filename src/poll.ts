@@ -29,9 +29,13 @@ import {
 } from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
 import {
-  gcaMismatch, gcaRemindersEnabled, parseGcaPolicy, sendGcaReminders, type GcaPolicy, type MemberListCache,
+  DM_BUDGET_MS, gcaMismatch, gcaRemindersEnabled, parseGcaPolicy, sendGcaReminders, type GcaPolicy,
+  type MemberListCache,
 } from './gca';
-import { recordShortSessions, sendShortSessionReminders, shortSessionConfig, trustedStateAt } from './short-session';
+import {
+  maintainShortSessions, purgeShortSessions, recordShortSessions, shortSessionMode, trustedStateAt,
+  type ShortSessionHandoff,
+} from './short-session';
 import { channelIndex, mayHavePosted, nextBudget, syncRosterMessages, type RosterTarget } from './roster';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import type {
@@ -672,6 +676,8 @@ export interface PollOutcome {
   /** Last role ping per channel (epoch ms), kept while its cooldown runs. */
   rolePings: Record<string, number>;
   error?: string;
+  /** Short-session delivery input for the coordinator; never persisted. */
+  shortSession?: ShortSessionHandoff;
 }
 
 export interface RunPollOptions {
@@ -682,10 +688,9 @@ export interface RunPollOptions {
   previousRolePings?: Record<string, number>;
   /** ISO time of the poll that saved `stored`; absent in older snapshots. */
   previousStateAt?: string;
+  /** Start of the coordinator's last poll (epoch ms), bounding `previousStateAt`. */
+  previousPollStartedAt?: number;
 }
-
-/** Every DM feature in a poll shares this budget, so together they cannot hold the poll longer. */
-const DM_BUDGET_MS = 25_000;
 
 /** Called only by the coordinator; all network and notification work is one poll. */
 export async function runPoll(
@@ -702,7 +707,9 @@ export async function runPoll(
   const limits = await DiscordRateLimits.load(storage);
 
   const auth = ivaoAuthFromEnv(env);
-  const currentAll = await fetchDivisionAtc(prefixes, auth);
+  // Every division VID, before duplicate callsigns are merged (short-session presence).
+  const presentVids: number[] = [];
+  const currentAll = await fetchDivisionAtc(prefixes, auth, presentVids);
 
   // Excluded callsigns (the EXCLUDED_CALLSIGNS list plus `xxxx_X_yyy`
   // special positions) never enter the notification pipeline. Prune them
@@ -715,6 +722,7 @@ export async function runPoll(
     .sort((a, b) => a.callsign.localeCompare(b.callsign));
   // Normalized once here: invalid entries are dropped, legacy fields stripped.
   const prev = loadSessions(stored ?? {});
+  const previousStateAt = trustedStateAt(options.previousStateAt, Date.parse(nowIso), options.previousPollStartedAt, prev);
   const previousJobs = loadPendingOffline(options.previousPendingOffline ?? []);
   const previousRosterMessages = loadRosterMessages(options.previousRosterMessages ?? []);
   const previousRosterPostAttempts = loadRosterPostAttempts(options.previousRosterPostAttempts ?? []);
@@ -741,12 +749,27 @@ export async function runPoll(
 
   // Optional short-session reminders: the feature's config is checked once
   // per poll, and invalid IDs disable it (logged) without affecting cards.
-  const shortSession = storage ? shortSessionConfig(env) : null;
-  const dmDeadline = Date.now() + DM_BUDGET_MS;
+  const shortSession = storage ? shortSessionMode(env) : { kind: 'disabled' as const };
   const memberCache: MemberListCache = { fetched: false, members: null };
+  // GCA gets the same requests either way; a POST (a member DM or staff copy)
+  // is only noted, so short-session reminders skip this poll.
+  let gcaAttempted = false;
+  const gcaLimits = new Proxy(limits, {
+    get(target, property) {
+      if (property === 'fetch') {
+        return (path: string, init: RequestInit) => {
+          if (init.method === 'POST') gcaAttempted = true;
+          return target.fetch(path, init);
+        };
+      }
+      const value: unknown = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
   if (storage) {
     try {
-      await sendGcaReminders(env, current, storage, Date.parse(nowIso), gcaPolicy, labels, limits, dmDeadline, memberCache);
+      await sendGcaReminders(env, current, storage, Date.parse(nowIso), gcaPolicy, labels, gcaLimits,
+        Date.now() + DM_BUDGET_MS, memberCache);
     } catch (err) {
       // DM lookup/storage failures must not break the public ATC cards. Only
       // the error class is logged: a message could carry private details.
@@ -759,14 +782,18 @@ export async function runPoll(
     current,
     nowIso,
     gracePolls,
-    // Presence times are only recorded while the feature that reads them is on.
-    shortSession ? trustedStateAt(options.previousStateAt, Date.parse(nowIso)) : undefined,
   );
   const trackedBefore = Object.keys(prev).length;
-  if (shortSession && storage) {
+  if (storage) {
     try {
-      // Never excluded closures: only sessions the feed showed ending.
-      recordShortSessions(storage, prev, next, wentOffline, nowIso);
+      if (shortSession.kind === 'purge') {
+        await purgeShortSessions(storage);
+      } else if (shortSession.kind === 'enabled') {
+        // Never excluded closures: only sessions the feed showed ending.
+        await recordShortSessions(storage, { ended: wentOffline, nowIso, trackedBefore, presentVids, previousStateAt });
+      } else {
+        await maintainShortSessions(storage, nowIso);
+      }
     } catch (err) {
       console.error(JSON.stringify({ event: 'short_session_poll_failed', error: err instanceof Error ? err.name : typeof err }));
     }
@@ -891,19 +918,6 @@ export async function runPoll(
   ];
   const rosterFailed = cards.failed || roster.failed;
 
-  // After every public card, with whatever is left of the poll's DM budget.
-  if (shortSession && storage) {
-    try {
-      await sendShortSessionReminders({
-        env, config: shortSession, storage, limits, currentAll, current: current.length, trackedBefore,
-        deadline: dmDeadline, memberCache,
-      });
-    } catch (err) {
-      // Only the error class: a message could carry private details.
-      console.error(JSON.stringify({ event: 'short_session_poll_failed', error: err instanceof Error ? err.name : typeof err }));
-    }
-  }
-
   if (attempted > 0) {
     console.log(
       JSON.stringify({
@@ -925,6 +939,13 @@ export async function runPoll(
     rosterPostAttempts,
     pendingOffline,
     rolePings,
+    // Delivered by the coordinator once this poll's snapshot is saved.
+    ...(storage && shortSession.kind === 'enabled' ? {
+      shortSession: {
+        config: shortSession.config, limits, stateAtMs: Date.parse(nowIso), presentVids, trackedBefore,
+        current: current.length, memberCache, gcaAttempted,
+      },
+    } : {}),
     ...(deliveryFailed && delivered > 0 ? { error: 'some Discord notifications failed' } :
       attempted > 0 && delivered === 0 ? { error: 'all Discord notifications failed' } :
       rosterFailed ? { error: 'some Discord roster updates failed' } : {}),

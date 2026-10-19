@@ -5,6 +5,7 @@ import {
   STATE_KEY,
 } from './config';
 import { runPoll } from './poll';
+import { sendShortSessionReminders, SHORT_SESSION_DM_BUDGET_MS } from './short-session';
 import type { PendingOffline, RosterMessage, RosterPostAttempt, StateMap } from './types';
 import { cleanupGcaCopies } from './retention';
 
@@ -292,6 +293,7 @@ export class PollCoordinator extends DurableObject<Env> {
         previousPendingOffline: snapshot.pendingOffline,
         previousRolePings: snapshot.rolePings,
         previousStateAt: snapshot.stateAt,
+        previousPollStartedAt: snapshot.lastPollStartedAt,
       });
     } catch (err) {
       // runPoll threw (a config/precondition failure or any other error), so
@@ -314,6 +316,17 @@ export class PollCoordinator extends DurableObject<Env> {
     // No successful response or in-memory checkpoint precedes persistence.
     await this.persist({ ...outcome, stateAt: nowIso }, startedAt, scheduledAt,
       outcome.error ? snapshot.lastSuccessfulPollAt : Date.now(), outcome.error);
+    // Optional short-session DMs run only after the snapshot is saved, still
+    // inside the serialized poll, with a budget of their own.
+    if (outcome.shortSession) {
+      try {
+        await sendShortSessionReminders(this.env, this.ctx.storage, outcome.shortSession,
+          Date.now() + SHORT_SESSION_DM_BUDGET_MS);
+      } catch (err) {
+        // Only the error class: a message could carry private details.
+        console.error(JSON.stringify({ event: 'short_session_poll_failed', error: err instanceof Error ? err.name : typeof err }));
+      }
+    }
     if (outcome.error) throw new Error(outcome.error);
     return { skipped: false };
   }

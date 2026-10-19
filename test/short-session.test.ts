@@ -4,9 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { COORDINATOR_NAME, IVAO_ATC_SUMMARY_URL, POLL_SNAPSHOT_KEY } from '../src/config';
 import { PollCoordinator, type PollSnapshot } from '../src/coordinator';
 import type { DiscordEmbed } from '../src/discord';
-import { buildShortSessionEmbed, trustedStateAt } from '../src/short-session';
-import { diffState, loadPendingOffline, loadSessions } from '../src/state';
-import type { IvaoAtcSummaryEntry, OnlineAtc, PendingOffline, StateMap, TrackedAtc } from '../src/types';
+import { DiscordRateLimits } from '../src/discord-rate-limit';
+import {
+  buildShortSessionEmbed, reminderMinutes, sendShortSessionReminders, trustedStateAt, type ShortSessionHandoff,
+} from '../src/short-session';
+import { loadPendingOffline, loadSessions } from '../src/state';
+import type { IvaoAtcSummaryEntry, PendingOffline, StateMap, TrackedAtc } from '../src/types';
 import { seedGca } from './helpers';
 
 // Entirely synthetic members, connections and Discord IDs.
@@ -18,18 +21,35 @@ const COPY = '200000000000000099';
 const DM_CHANNEL = '300000000000000001';
 const PUBLIC = '900000000000000001';
 const ROLE = (env as Env).GCA_MEMBER_ROLE_ID!;
+const VERIFIED = '100000000000000003';
+const REMINDERS = 'short_session_reminders_v2';
+const ONLINE = 'short_session_online';
+const RECORDED_KEY = 'short-session-recorded-v1';
+const BACKOFF_KEY = 'gca-discord-backoff-v1';
+const EXCLUDED = { EXCLUDED_CALLSIGNS: 'QCXX_CTR' };
+const OFF = { SHORT_SESSION_DM_ENABLED: 'false' };
+const PURGE = { SHORT_SESSION_DM_ENABLED: 'purge' };
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
-const iso = (minutes: number) => new Date(START + minutes * 60_000).toISOString();
+const ms = (minutes: number) => START + minutes * 60_000;
+const iso = (minutes: number) => new Date(ms(minutes)).toISOString();
+const keyAt = (minutes: number) => `${VID}:${ms(minutes)}`;
+
+type Row = {
+  session_key: string; user_id: number; callsign: string; online_since: number; status: string; attempts: number;
+  ended_at: number; duration_minutes: number; due_at: number; expires_at: number;
+};
 
 let now: number;
 let feed: IvaoAtcSummaryEntry[];
+let feedStatus: number;
 let calls: string[];
 let dms: { embeds: DiscordEmbed[]; allowed_mentions?: unknown }[];
 let dmRecipients: string[];
 let members: unknown[];
 let memberListCalls: number;
-let dmFailure: 'none' | 'timeout' | 'global429';
+let dmFailure: 'none' | 'timeout' | 'global429' | 'forbidden' | 'wrong_recipient';
 let statusDuringPost: string[];
+let stateAtDuringPost: (string | undefined)[];
 let activeCtx: DurableObjectState | undefined;
 let onCardPost: (() => void) | undefined;
 let cardId: number;
@@ -43,24 +63,51 @@ function entry(callsign: string, userId = VID, frequency = 118.1, id = 1): IvaoA
   };
 }
 
+const twr = (id = 1) => entry('QCTT_TWR', VID, 118.1, id);
+const app = (id = 2) => entry('QCTT_APP', VID, 119.1, id);
+const excludedCtr = (id = 9) => entry('QCXX_CTR', VID, 125.1, id);
+
+function member(vid: number, id = MEMBER, roles = [ROLE, VERIFIED]) {
+  return { user: { id }, nick: `Member (${vid})`, roles };
+}
+
 function settings(overrides: Partial<Env> = {}): Env {
   return {
-    ...env, SHORT_SESSION_DM_ENABLED: 'true', GCA_DM_ENABLED: undefined, GCA_COPY_USER_ID: COPY, ...overrides,
+    ...env, SHORT_SESSION_DM_ENABLED: 'true', GCA_DM_ENABLED: undefined, GCA_COPY_USER_ID: COPY,
+    GCA_VERIFIED_ROLE_ID: VERIFIED, ...overrides,
   } as Env;
 }
 
-function poll(overrides: Partial<Env> = {}) {
+/** One poll `minutes` after START with the given monitored feed; a failing poll is tolerated. */
+function at(
+  minutes: number, current: IvaoAtcSummaryEntry[], overrides: Partial<Env> = {},
+  prepare?: (ctx: DurableObjectState) => void,
+) {
+  now = ms(minutes);
+  feed = current;
   return runInDurableObject(stub(), (_instance, ctx) => {
     activeCtx = ctx;
+    prepare?.(ctx);
     return new PollCoordinator(ctx, settings(overrides)).poll();
-  });
+  }).catch(() => undefined);
 }
 
-/** One poll `minutes` after START with the given monitored feed. */
-function at(minutes: number, current: IvaoAtcSummaryEntry[], overrides: Partial<Env> = {}) {
-  now = START + minutes * 60_000;
-  feed = current;
-  return poll(overrides);
+/** Polls at each minute in `[from, to]` with `step`, all with the same feed. */
+async function during(from: number, to: number, step: number, current: IvaoAtcSummaryEntry[], overrides: Partial<Env> = {}) {
+  for (let minute = from; minute <= to; minute += step) await at(minute, current, overrides);
+}
+
+/** The next recording transaction fails, as an injected SQL error would. */
+const failRecording = (ctx: DurableObjectState) => {
+  vi.spyOn(ctx.storage, 'transactionSync').mockImplementationOnce(() => { throw new Error('synthetic SQL failure'); });
+};
+
+function sql<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: unknown[]): Promise<T[]> {
+  return runInDurableObject(stub(), (_instance, ctx) => ctx.storage.sql.exec<T>(query, ...bindings).toArray());
+}
+
+function storageGet(key: string) {
+  return runInDurableObject(stub(), (_instance, ctx) => ctx.storage.get(key));
 }
 
 function seedSnapshot(snapshot: PollSnapshot) {
@@ -71,20 +118,18 @@ function snapshot() {
   return runInDurableObject(stub(), (_instance, ctx) => ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY));
 }
 
-function tables(): Promise<string[]> {
-  return runInDurableObject(stub(), (_instance, ctx) => ctx.storage.sql.exec<{ name: string }>(
-    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").toArray().map((row) => row.name));
+async function tables(): Promise<string[]> {
+  return (await sql<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"))
+    .map((row) => row.name);
 }
 
-function rows() {
-  return runInDurableObject(stub(), (_instance, ctx) => {
-    const exists = ctx.storage.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'short_sessions'").toArray().length;
-    return exists ? ctx.storage.sql.exec<{
-      session_key: string; user_id: number; callsign: string; session_ids: string; status: string; attempts: number;
-      ended_at: number; seen_after: number; duration_minutes: number; due_at: number; expires_at: number;
-    }>('SELECT * FROM short_sessions ORDER BY rowid').toArray() : [];
-  });
+const shortSessionTables = async () => (await tables()).filter((name) => name.startsWith('short_session'));
+
+async function rows(): Promise<Row[]> {
+  return (await tables()).includes(REMINDERS) ? sql<Row>(`SELECT * FROM ${REMINDERS} ORDER BY rowid`) : [];
 }
+
+const statuses = async () => (await rows()).map((row) => row.status);
 
 function logged(event: string): Record<string, unknown>[] {
   return logs.flatMap((spy) => spy.mock.calls)
@@ -97,24 +142,35 @@ function shortSessionLogs(): string {
     .filter((line) => line.includes('short_session')));
 }
 
-/** A carded TWR session from minute 1 that drops at `endMinute` and closes one poll later. */
+/**
+ * The first recorded poll at minute 0, then a carded TWR session from minute
+ * 1 that drops at `endMinute` and closes one poll later: a known start.
+ */
 async function shortSession(endMinute = 5, overrides: Partial<Env> = {}, others: IvaoAtcSummaryEntry[] = []) {
   await at(0, others, overrides);
-  await at(1, [...others, entry('QCTT_TWR')], overrides);
+  await at(1, [...others, twr()], overrides);
   await at(endMinute, others, overrides);
   await at(endMinute + 1, others, overrides);
+}
+
+/** No reminder recorded and no DM sent. */
+async function expectNothing() {
+  expect(await rows()).toEqual([]);
+  expect(dms).toEqual([]);
 }
 
 beforeEach(() => {
   now = START;
   feed = [];
+  feedStatus = 200;
   calls = [];
   dms = [];
   dmRecipients = [];
-  members = [{ user: { id: MEMBER }, nick: `Member (${VID})`, roles: [ROLE] }];
+  members = [member(VID)];
   memberListCalls = 0;
   dmFailure = 'none';
   statusDuringPost = [];
+  stateAtDuringPost = [];
   activeCtx = undefined;
   onCardPost = undefined;
   cardId = 0;
@@ -122,7 +178,7 @@ beforeEach(() => {
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
-    if (url === IVAO_ATC_SUMMARY_URL) return Response.json([entry('EGLL_TWR', 1), ...feed]);
+    if (url === IVAO_ATC_SUMMARY_URL) return Response.json([entry('EGLL_TWR', 1), ...feed], { status: feedStatus });
     if (url.includes('/guilds/') && url.includes('/members?')) {
       memberListCalls++;
       return Response.json(members);
@@ -131,20 +187,21 @@ beforeEach(() => {
       const recipient = (JSON.parse(String(init?.body)) as { recipient_id: string }).recipient_id;
       calls.push('dm_open');
       dmRecipients.push(recipient);
-      return Response.json({ id: DM_CHANNEL, type: 1, recipients: [{ id: recipient }] });
+      const shown = dmFailure === 'wrong_recipient' ? OTHER_MEMBER : recipient;
+      return Response.json({ id: DM_CHANNEL, type: 1, recipients: [{ id: shown }] });
     }
     if (url.endsWith(`/channels/${DM_CHANNEL}/messages`)) {
       calls.push('dm_post');
       dms.push(JSON.parse(String(init?.body)));
       const ctx = activeCtx!;
-      if (ctx.storage.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'short_sessions'").toArray().length) {
+      stateAtDuringPost.push((await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY))?.stateAt);
+      if (ctx.storage.sql.exec('SELECT 1 FROM sqlite_master WHERE name = ?', REMINDERS).toArray().length) {
         statusDuringPost.push(...ctx.storage.sql.exec<{ status: string }>(
-          "SELECT status FROM short_sessions WHERE status = 'reserved'").toArray().map((row) => row.status));
+          `SELECT status FROM ${REMINDERS} WHERE status = 'reserved'`).toArray().map((row) => row.status));
       }
       if (dmFailure === 'timeout') throw new Error('Synthetic timeout after Discord may have delivered');
-      if (dmFailure === 'global429') {
-        return Response.json({ retry_after: 120, global: true }, { status: 429 });
-      }
+      if (dmFailure === 'global429') return Response.json({ retry_after: 120, global: true }, { status: 429 });
+      if (dmFailure === 'forbidden') return Response.json({ message: 'Cannot send messages to this user' }, { status: 403 });
       return Response.json({ id: '300000000000000002' });
     }
     if (url.startsWith(`https://discord.com/api/v10/channels/${PUBLIC}/messages`)) {
@@ -163,12 +220,12 @@ afterEach(async () => {
   await reset();
 });
 
-describe('short-session reminders', () => {
-  it('sends exactly one DM without GCA enabled, creating no GCA table and no staff copy', async () => {
+describe('short-session reminders: sending', () => {
+  it('sends exactly one DM for a short session after the first recorded poll, without GCA and with no staff copy', async () => {
     await shortSession(16);
     expect(await rows()).toMatchObject([{
-      user_id: VID, callsign: 'QCTT_TWR', session_ids: '[1]', status: 'pending', duration_minutes: 15,
-      seen_after: START, ended_at: START + 16 * 60_000, due_at: START + 26 * 60_000, expires_at: START + 136 * 60_000,
+      session_key: keyAt(0), user_id: VID, callsign: 'QCTT_TWR', online_since: START, status: 'pending',
+      duration_minutes: 16, ended_at: ms(16), due_at: ms(26), expires_at: ms(136),
     }]);
     await at(25, []);
     expect(dms).toEqual([]);
@@ -176,13 +233,11 @@ describe('short-session reminders', () => {
     await at(27, []);
     await at(40, []);
     expect(dms).toHaveLength(1);
-    expect(dms[0]).toEqual({
-      embeds: [buildShortSessionEmbed('QCTT_TWR', 15)], allowed_mentions: { parse: [] },
-    });
-    expect(dms[0]!.embeds[0]!.description).toContain('for about 15 minutes');
+    expect(dms[0]).toEqual({ embeds: [buildShortSessionEmbed('QCTT_TWR', 16)], allowed_mentions: { parse: [] } });
+    expect(dms[0]!.embeds[0]!.description).toContain('for about 16 minutes');
     expect(dmRecipients).toEqual([MEMBER]);
     expect(memberListCalls).toBe(1);
-    // Finished rows keep no callsign column; the key is deleted with the row.
+    // Finished rows keep no callsign column.
     expect(await rows()).toMatchObject([{ status: 'sent', callsign: '', attempts: 1 }]);
     expect((await tables()).filter((name) => name.startsWith('gca_'))).toEqual([]);
     expect(logged('short_session_poll_failed')).toEqual([]);
@@ -192,185 +247,118 @@ describe('short-session reminders', () => {
     expect(JSON.stringify(dms)).not.toContain(String(VID));
   });
 
-  it('sends nothing when a gap before first sight puts the bound at 30 minutes, however short the observed session', async () => {
-    await at(0, []);
-    await at(25, [entry('QCTT_TWR')]);
-    await at(30, []);
-    await at(31, []);
-    await at(45, []);
-    expect(await rows()).toEqual([]);
-    expect(dms).toEqual([]);
-  });
-
-  it('sends nothing for a session tracked from a legacy snapshot without stateAt', async () => {
-    await seedSnapshot({ state: {} });
-    await at(0, [entry('QCTT_TWR')]);
-    expect((await snapshot())!.state!.QCTT_TWR!.seenAfter).toBeUndefined();
-    expect((await snapshot())!.stateAt).toBe(iso(0));
+  it('a member already online at the first recorded poll has an unknown start', async () => {
+    await at(0, [twr()]);
     await at(5, []);
     await at(6, []);
     await at(20, []);
-    expect(await rows()).toEqual([]);
-    expect(dms).toEqual([]);
+    await expectNothing();
+    expect(logged('short_session_baseline')).toEqual([{ event: 'short_session_baseline', online: 1 }]);
   });
 
-  it('sends nothing for a pre-upgrade session without seenAfter', async () => {
-    const legacy: TrackedAtc = {
-      sessionId: 1, userId: VID, callsign: 'QCTT_TWR', frequency: 118.1, position: 'TWR', station: null,
-      location: null, since: iso(-5), missed: 0, messages: [{ channelId: PUBLIC, messageId: '800000000000009999' }],
-    };
-    await seedSnapshot({ state: { QCTT_TWR: legacy }, stateAt: iso(-1) });
+  it('a 10 + 8 minute switch sends one reminder for the combined presence', async () => {
     await at(0, []);
-    await at(1, []);
-    await at(15, []);
-    expect(await rows()).toEqual([]);
-    expect(dms).toEqual([]);
+    await at(1, [twr()]);
+    await at(11, [app()]);
+    await at(12, [app()]);
+    await at(19, []);
+    await at(20, []);
+    await at(29, []);
+    expect(await statuses()).toEqual(['sent']);
+    expect(dms.map((dm) => dm.embeds[0]!.description)).toEqual([expect.stringContaining('**QCTT_APP** for about 19 minutes')]);
   });
 
-  it('a grace-window resume keeps seenAfter and records nothing', async () => {
+  it('a merged presence that ends short later sends one reminder for all of it', async () => {
     await at(0, []);
-    await at(1, [entry('QCTT_TWR')]);
-    await at(5, []);
-    await at(6, [entry('QCTT_TWR', VID, 118.1, 2)]);
-    expect((await snapshot())!.state!.QCTT_TWR).toMatchObject({ seenAfter: iso(0), since: iso(1), sessionId: 2 });
-    await at(20, [entry('QCTT_TWR', VID, 118.1, 2)]);
-    expect(await rows()).toEqual([]);
+    await at(1, [twr()]);
+    await at(9, []);
+    await at(10, []);
+    expect(await rows()).toMatchObject([{ ended_at: ms(9), due_at: ms(19) }]);
+    await at(12, [app()]);
+    await at(17, [app()]);
+    await at(18, []);
+    await at(19, []);
+    expect(await rows()).toMatchObject([{ status: 'pending', ended_at: ms(18), due_at: ms(28), callsign: 'QCTT_APP' }]);
+    await at(28, []);
+    expect(await statuses()).toEqual(['sent']);
+    expect(dms.map((dm) => dm.embeds[0]!.description)).toEqual([expect.stringContaining('for about 18 minutes')]);
   });
 
-  it('an APP to TWR switch inherits presence, so neither half is reported', async () => {
-    await at(0, []);
-    await at(1, [entry('QCAA_APP')]);
-    await at(20, [entry('QCAA_TWR', VID, 118.1, 2)]);
-    expect((await snapshot())!.state!.QCAA_TWR!.seenAfter).toBe(iso(0));
-    await at(21, [entry('QCAA_TWR', VID, 118.1, 2)]);
-    // The APP half alone is short, but its controller is still online when it falls due.
-    await at(30, [entry('QCAA_TWR', VID, 118.1, 2)]);
-    await at(36, []);
-    await at(37, []);
-    await at(50, []);
-    expect((await rows()).map((row) => [row.session_key, row.status])).toEqual([[`${VID}:QCAA_APP:${iso(1)}`, 'reconnected']]);
-    expect(dms).toEqual([]);
-  });
-
-  it.each([
-    ['an excluded callsign', entry('QCTT_GND'), { EXCLUDED_CALLSIGNS: 'QCTT_GND' }],
-    ['a special position', entry('QCTT_X_GND'), {}],
-    ['0.000 MHz', entry('QCTT_GND', VID, 0), {}],
-  ])('a reconnect at %s counts as back online', async (_label, reconnect, overrides: Partial<Env>) => {
-    await shortSession(5, overrides);
-    await at(15, [reconnect], overrides);
-    expect(await rows()).toMatchObject([{ status: 'reconnected' }]);
-    expect(dms).toEqual([]);
-  });
-
-  it.each([
-    ['more than ten sessions end', 11, 0],
-    ['most tracked sessions end', 3, 2],
-  ])('records nothing when %s in one poll', async (_label, ending: number, staying: number) => {
-    const session = (n: number): TrackedAtc => ({
-      sessionId: n, userId: VID + n, callsign: `QCT${String.fromCharCode(65 + n)}_TWR`, frequency: 118.1, position: 'TWR',
-      station: null, location: null, since: iso(-10), seenAfter: iso(-11), missed: 0,
-      messages: [{ channelId: PUBLIC, messageId: `80000000000001${String(n).padStart(4, '0')}` }],
-    });
-    const all = Array.from({ length: ending + staying }, (_, n) => session(n));
-    const state: StateMap = Object.fromEntries(all.map((s) => [s.callsign, s]));
-    const kept = all.slice(ending).map((s) => entry(s.callsign, s.userId, 118.1, s.sessionId));
-    await seedSnapshot({ state, stateAt: iso(-1) });
-    await at(0, kept);
-    await at(1, kept);
-    expect(await rows()).toEqual([]);
-    expect(logged('short_session_anomaly')).toEqual([{ event: 'short_session_anomaly', ended: ending, tracked: ending + staying }]);
-  });
-
-  it('a feed much smaller than the tracked state defers delivery', async () => {
-    const others = [1, 2, 3, 4].map((n) => entry(`QCO${n}_CTR`, 700000 + n, 125.1, 10 + n));
-    await shortSession(5, {}, others);
-    await at(15, others.slice(0, 1));
-    expect(await rows()).toMatchObject([{ status: 'pending' }]);
-    expect(dms).toEqual([]);
-    await at(16, others);
+  it('excluded presence that clearly ended more than 10 minutes earlier does not join a later short TWR session', async () => {
+    await at(-122, [], EXCLUDED);
+    await during(-120, 0, 2, [excludedCtr()], EXCLUDED);
+    await during(1, 14, 1, [], EXCLUDED);
+    await at(15, [twr(2)], EXCLUDED);
+    await at(20, [twr(2)], EXCLUDED);
+    await at(21, [], EXCLUDED);
+    await at(22, [], EXCLUDED);
+    await at(31, [], EXCLUDED);
+    expect(await rows()).toMatchObject([{ online_since: ms(14), status: 'sent' }]);
     expect(dms).toHaveLength(1);
   });
 
-  it.each([
-    ['sent', true], ['reserved', true], ['failed', true], ['baseline', false], ['unmapped', false],
-  ])('a GCA reminder %s for the same connection suppresses: %s', async (status, suppressed) => {
-    await seedGca((sql) => sql.exec('INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)',
-      `${VID}:1`, status, START));
-    await shortSession();
-    await at(15, []);
-    expect(await rows()).toMatchObject([{ status: suppressed ? 'skipped_gca' : 'sent' }]);
-    expect(dms).toHaveLength(suppressed ? 0 : 1);
+  it('P3-3: shows the whole minutes of the bound', async () => {
+    await at(0, []);
+    await at(5, [twr()]);
+    await at(15.8, []);
+    await at(16.8, []);
+    expect(await rows()).toMatchObject([{ duration_minutes: 15 }]);
   });
 
-  it('sends at most one reminder per member per 24 hours', async () => {
-    await shortSession();
-    await at(15, []);
-    await at(20, [entry('QCTT_GND', VID, 121.9, 2)]);
-    await at(25, []);
-    await at(26, []);
+  it.each([
+    [28.9, 1], [29.2, 0],
+  ])('F3: a bound of %s minutes is reported only with a one-minute margin (%s rows)', async (end, expected) => {
+    await at(0, []);
+    await at(1, [twr()]);
+    await at(end, []);
+    await at(end + 1, []);
+    expect(await rows()).toHaveLength(expected);
+  });
+});
+
+describe('short-session reminders: presence regressions send nothing', () => {
+  it('TWR for 25 minutes, then APP for 9, then leaving', async () => {
+    await at(0, []);
+    await at(1, [twr()]);
+    await at(25, [app()]);
+    await at(26, [app()]);
+    await at(30, [app()]);
+    await at(34, []);
     await at(35, []);
-    expect((await rows()).map((row) => row.status)).toEqual(['sent', 'skipped_daily']);
-    expect(dms).toHaveLength(1);
+    await at(45, []);
+    await expectNothing();
   });
 
-  it('F1: an ambiguous failure counts towards the daily cap', async () => {
-    dmFailure = 'timeout';
-    await shortSession();
-    await at(15, []);
-    expect(dms).toHaveLength(1);
-    expect(await rows()).toMatchObject([{ status: 'failed' }]);
-    dmFailure = 'none';
-    await at(70, []);
-    await at(71, [entry('QCTT_GND', VID, 121.9, 2)]);
-    await at(75, []);
-    await at(76, []);
-    await at(85, []);
-    expect((await rows()).map((row) => row.status)).toEqual(['failed', 'skipped_daily']);
-    expect(dms).toHaveLength(1);
-  });
-
-  it('F1: keeps 24 hours between actual sends when the first was delivered late', async () => {
-    await shortSession();
-    // Delivered just before expiry, almost two hours after the session ended.
-    await at(124, []);
-    expect(dms).toHaveLength(1);
-    // Ended more than 24 h after the first session, but due under 24 h after its DM.
-    await at(1485, []);
-    await at(1486, [entry('QCTT_GND', VID, 121.9, 2)]);
-    await at(1490, []);
-    await at(1491, []);
-    await at(1500, []);
-    expect(dms).toHaveLength(1);
-    // Past 24 h plus the expiry window after the first session ended.
-    await at(1585, []);
-    await at(1586, [entry('QCTT_DEL', VID, 121.7, 3)]);
-    await at(1590, []);
-    await at(1591, []);
-    await at(1600, []);
-    expect((await rows()).map((row) => row.status)).toEqual(['sent', 'skipped_daily', 'sent']);
-    expect(dms).toHaveLength(2);
-  });
-
-  it('A1: a feed gap within one IVAO connection does not shorten its presence', async () => {
+  it.each([2, 3])('a switch with a %s-poll gap is one presence', async (gap) => {
     await at(0, []);
-    await at(1, [entry('QCTT_TWR')]);
-    await at(119, [entry('QCTT_TWR')]);
+    await at(1, [twr()]);
+    await at(20, [twr()]);
+    await during(21, 20 + gap, 1, []);
+    const back = 21 + gap;
+    await at(back, [app()]);
+    await at(back + 6, []);
+    await at(back + 7, []);
+    await at(back + 20, []);
+    expect(await statuses()).toEqual(['reconnected']);
+    expect(dms).toEqual([]);
+  });
+
+  it('a feed gap within one IVAO connection', async () => {
+    await at(0, []);
+    await at(1, [twr()]);
+    await at(119, [twr()]);
     await at(120, []);
     await at(121, []);
-    await at(122, [entry('QCTT_TWR')]);
-    expect((await snapshot())!.state!.QCTT_TWR!.seenAfter).toBe(iso(121));
+    await at(122, [twr()]);
     await at(140, []);
     await at(141, []);
     await at(155, []);
-    expect(await rows()).toEqual([]);
-    expect(dms).toEqual([]);
+    await expectNothing();
   });
 
-  it('A1: a whole-division gap followed by staggered departures sends nothing', async () => {
+  it('a whole-division empty feed followed by staggered departures', async () => {
     const five = [1, 2, 3, 4, 5].map((n) => entry(`QCO${n}_CTR`, 700000 + n, 125.1, 10 + n));
-    members = five.map((item) => ({ user: { id: `2000000000000001${item.userId % 100}`.padEnd(18, '0') },
-      nick: `Member (${item.userId})`, roles: [ROLE] }));
+    members = five.map((item) => member(item.userId, `2000000000000001${item.userId % 100}`.padEnd(18, '0')));
     await at(0, []);
     await at(1, five);
     await at(60, five);
@@ -380,45 +368,412 @@ describe('short-session reminders', () => {
     for (let n = 1; n <= 6; n++) await at(69 + n, five.slice(n));
     await at(90, []);
     await at(91, []);
-    expect(await rows()).toEqual([]);
+    await expectNothing();
+  });
+
+  it('the member is missing from the feed on the due poll but was back online in between', async () => {
+    await at(0, []);
+    await at(1, [twr()]);
+    await at(25, []);
+    await at(26, []);
+    expect(await rows()).toMatchObject([{ status: 'pending', due_at: ms(35) }]);
+    await at(28, [app()]);
+    await at(30, [app()]);
+    await at(35, []);
+    await at(36, [app()]);
+    await at(40, [app()]);
+    await at(45, []);
+    await at(46, []);
+    await at(60, []);
+    expect(await statuses()).toEqual(['reconnected']);
     expect(dms).toEqual([]);
   });
 
-  it('A1: a genuinely new connection after a gap still gets its reminder', async () => {
+  it('K4: 100 minutes at an excluded position, then 9 at TWR', async () => {
+    await at(0, [], EXCLUDED);
+    await during(1, 96, 5, [excludedCtr(1)], EXCLUDED);
+    await at(100, [twr(2)], EXCLUDED);
+    await at(105, [twr(2)], EXCLUDED);
+    await at(109, [], EXCLUDED);
+    await at(110, [], EXCLUDED);
+    await at(125, [], EXCLUDED);
+    await expectNothing();
+  });
+
+  it.each([
+    ['V1: enabled after a TWR session closed while off', OFF],
+    ['V2: re-enabled after a TWR session closed under purge', PURGE],
+    ['PR2: valid again after a TWR session closed while misconfigured', { GCA_VERIFIED_ROLE_ID: '' }],
+  ])('%s', async (_label, gap: Partial<Env>) => {
     await at(0, []);
-    await at(1, [entry('QCTT_TWR')]);
-    await at(119, [entry('QCTT_TWR')]);
-    await at(120, []);
-    await at(121, []);
-    await at(122, [entry('QCTT_TWR', VID, 118.1, 2)]);
-    await at(140, []);
+    await at(1, [twr()]);
+    await at(60, [twr()]);
+    await at(61, [], gap);
+    await at(62, [], gap);
+    await at(63, [app()]);
+    await at(70, [app()]);
+    await at(71, []);
+    await at(72, []);
+    await at(85, []);
+    await expectNothing();
+  });
+
+  it('V3: a connection split by a feed gap while off, seen again on the first enabled poll', async () => {
+    await at(0, [], OFF);
+    await at(1, [twr()], OFF);
+    await at(120, [twr()], OFF);
+    await at(121, [], OFF);
+    await at(122, [], OFF);
+    await at(123, [twr()]);
     await at(141, []);
-    await at(150, []);
-    expect(await rows()).toMatchObject([{ status: 'sent', seen_after: START + 121 * 60_000 }]);
+    await at(142, []);
+    await at(155, []);
+    await expectNothing();
+  });
+
+  it.each([
+    ['PR1: off', OFF],
+    ['PR2: misconfigured', { GCA_VERIFIED_ROLE_ID: '' }],
+    ['control: on throughout', {}],
+  ])('%s while at an excluded position, then a short TWR session soon after', async (_label, gap: Partial<Env>) => {
+    const between = { ...EXCLUDED, ...gap };
+    await at(-400, [], EXCLUDED);
+    await at(-300, [], EXCLUDED);
+    await at(-299, [], between);
+    await at(0, [], between);
+    await during(1, 96, 5, [excludedCtr(1)], between);
+    await at(100, [], between);
+    await at(101, [twr(2)], EXCLUDED);
+    await at(106, [twr(2)], EXCLUDED);
+    await at(107, [], EXCLUDED);
+    await at(108, [], EXCLUDED);
+    await at(120, [], EXCLUDED);
+    await expectNothing();
+  });
+
+  it.each([
+    ['a feed outage after presence at an excluded position', excludedCtr(1), 'outage'],
+    ['a 12-minute gap without polls after presence at an excluded position', excludedCtr(1), 'gap'],
+    ['control: a feed outage after presence at a tracked position', app(1), 'outage'],
+  ])('%s', async (_label, earlier, kind) => {
+    await at(-122, [], EXCLUDED);
+    await during(-120, 0, 2, [earlier], EXCLUDED);
+    if (kind === 'outage') {
+      feedStatus = 503;
+      await during(1, 14, 1, [], EXCLUDED);
+      feedStatus = 200;
+    }
+    const from = kind === 'outage' ? 15 : 12;
+    await at(from, [twr(2)], EXCLUDED);
+    await at(from + 5, [twr(2)], EXCLUDED);
+    await at(from + 6, [], EXCLUDED);
+    await at(from + 7, [], EXCLUDED);
+    await at(45, [], EXCLUDED);
+    await expectNothing();
+  });
+
+  it('H1: TWR 1–60, excluded 61–72, TWR 73–78, then leaving', async () => {
+    await at(0, [], EXCLUDED);
+    await during(1, 60, 5, [twr(1)], EXCLUDED);
+    await during(61, 72, 1, [excludedCtr(2)], EXCLUDED);
+    await at(73, [twr(3)], EXCLUDED);
+    await at(78, [twr(3)], EXCLUDED);
+    await at(79, [], EXCLUDED);
+    await at(80, [], EXCLUDED);
+    await at(95, [], EXCLUDED);
+    await expectNothing();
+  });
+
+  it('H2: excluded −120..0, TWR 1–30, excluded 31–42, TWR 43–48, then leaving', async () => {
+    await at(-122, [], EXCLUDED);
+    await during(-120, 0, 4, [excludedCtr(1)], EXCLUDED);
+    await during(1, 30, 5, [twr(2)], EXCLUDED);
+    await during(31, 42, 1, [excludedCtr(3)], EXCLUDED);
+    await at(43, [twr(4)], EXCLUDED);
+    await at(48, [twr(4)], EXCLUDED);
+    await at(49, [], EXCLUDED);
+    await at(50, [], EXCLUDED);
+    await at(65, [], EXCLUDED);
+    await expectNothing();
+  });
+
+  it('F9: an untrusted stored stateAt starts a fresh baseline', async () => {
+    await at(-10, []);
+    // The stored poll time is later than the recorded last poll start.
+    await seedSnapshot({ state: {}, stateAt: iso(-10), lastPollStartedAt: ms(-11) });
+    await at(0, [twr()]);
+    await at(5, []);
+    await at(6, []);
+    await at(20, []);
+    await expectNothing();
+    expect(logged('short_session_baseline')).toHaveLength(2);
+  });
+
+  it('an unsaved poll (recorded, snapshot not saved) starts a fresh baseline', async () => {
+    await at(0, []);
+    await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.put(RECORDED_KEY, ms(0.5)));
+    await at(1, [twr()]);
+    await at(5, []);
+    await at(6, []);
+    await at(20, []);
+    await expectNothing();
+  });
+
+  it('plan review: TWR for an hour, an outage of over 10 minutes, one recorded poll elsewhere, then leaving', async () => {
+    await at(0, []);
+    await during(1, 60, 5, [twr()]);
+    feedStatus = 503;
+    await during(61, 72, 1, []);
+    feedStatus = 200;
+    await at(73, [app()]);
+    await at(74, []);
+    await at(75, []);
+    await at(90, []);
+    await expectNothing();
+  });
+
+  it('F1: a blip at the last recorded poll, then an outage of over 10 minutes, does not split the presence (grace 1)', async () => {
+    const grace = { OFFLINE_GRACE_POLLS: '1' };
+    await at(-60, [], grace);
+    await during(-59, -1, 2, [twr()], grace);
+    await at(0, [], grace);
+    feedStatus = 503;
+    await during(1, 11, 1, [], grace);
+    feedStatus = 200;
+    await at(12, [twr()], grace);
+    await at(19, [twr()], grace);
+    await at(20, [], grace);
+    await at(35, [], grace);
+    await expectNothing();
+  });
+
+  it('F2: members reappearing together after a 200 OK feed dropped most of them have unknown starts', async () => {
+    const five = [1, 2, 3, 4, 5].map((n) => entry(`QCO${n}_CTR`, 700000 + n, 125.1, 10 + n));
+    members = five.map((item) => member(item.userId, `2000000000000001${item.userId % 100}`.padEnd(18, '0')));
+    await at(-61, []);
+    await at(-60, five.slice(0, 1));
+    await at(-59, five.slice(0, 2));
+    await at(-58, five.slice(0, 3));
+    await at(-57, five.slice(0, 4));
+    await at(-56, five);
+    await at(0, five);
+    await during(1, 15, 2, five.slice(0, 1));
+    await at(16, five);
+    expect(logged('short_session_mass_reappearance')).toEqual([{ event: 'short_session_mass_reappearance', count: 4 }]);
+    await at(20, five.slice(0, 4));
+    await at(21, five.slice(0, 4));
+    await at(35, five.slice(0, 4));
+    await expectNothing();
+  });
+
+  it('F3: a member hidden by a duplicate callsign is still online', async () => {
+    await at(0, []);
+    await at(1, [twr(1)]);
+    await at(10, [twr(1), entry('QCTT_TWR', 600002, 118.1, 2)]);
+    await at(11, [twr(1), entry('QCTT_TWR', 600002, 118.1, 2)]);
+    await during(15, 30, 5, [twr(1), entry('QCTT_TWR', 600002, 118.1, 2)]);
+    await expectNothing();
+  });
+
+  it('F5: no delivery in a poll whose recording failed, though its snapshot was saved', async () => {
+    await shortSession();
+    await at(15, [], {}, failRecording);
+    expect((await snapshot())!.stateAt).toBe(iso(15));
+    expect(dms).toEqual([]);
+    expect(logged('short_session_skipped')).toContainEqual({ event: 'short_session_skipped', reason: 'unrecorded_poll' });
+    expect(await storageGet(RECORDED_KEY)).toBeUndefined();
+  });
+
+  it('a SQL failure in the record update makes the next poll start a fresh baseline', async () => {
+    await at(0, []);
+    await at(1, [twr()]);
+    await at(5, [twr()], {}, failRecording);
+    await at(6, [twr()]);
+    await at(10, []);
+    await at(11, []);
+    await at(25, []);
+    await expectNothing();
+    expect(logged('short_session_baseline')).toHaveLength(2);
+  });
+
+  it.each([
+    ['an excluded callsign', entry('QCTT_GND'), { EXCLUDED_CALLSIGNS: 'QCTT_GND' }],
+    ['a special position', entry('QCTT_X_GND'), {}],
+    ['0.000 MHz', entry('QCTT_GND', VID, 0), {}],
+  ])('a reconnect at %s counts as back online', async (_label, reconnect, overrides: Partial<Env>) => {
+    await shortSession(5, overrides);
+    await at(15, [reconnect], overrides);
+    expect(await statuses()).toEqual(['reconnected']);
+    expect(dms).toEqual([]);
+  });
+
+  it.each([
+    ['more than ten sessions end', 11, 0],
+    ['most tracked sessions end', 3, 2],
+  ])('records nothing when %s in one poll', async (_label, ending: number, staying: number) => {
+    const session = (n: number): TrackedAtc => ({
+      sessionId: n + 1, userId: VID + n, callsign: `QCT${String.fromCharCode(65 + n)}_TWR`, frequency: 118.1,
+      position: 'TWR', station: null, location: null, since: iso(-10), missed: 0,
+      messages: [{ channelId: PUBLIC, messageId: `80000000000001${String(n).padStart(4, '0')}` }],
+    });
+    const all = Array.from({ length: ending + staying }, (_, n) => session(n));
+    const state: StateMap = Object.fromEntries(all.map((s) => [s.callsign, s]));
+    const kept = all.slice(ending).map((s) => entry(s.callsign, s.userId, 118.1, s.sessionId));
+    await seedSnapshot({ state, stateAt: iso(-1), lastPollStartedAt: ms(-1) });
+    await at(0, kept);
+    await at(1, kept);
+    expect(await rows()).toEqual([]);
+    expect(logged('short_session_anomaly')).toEqual([{ event: 'short_session_anomaly', ended: ending, tracked: ending + staying }]);
+  });
+});
+
+describe('short-session reminders: delivery', () => {
+  it('a feed much smaller than the tracked state defers delivery', async () => {
+    const others = [1, 2, 3, 4].map((n) => entry(`QCO${n}_CTR`, 700000 + n, 125.1, 10 + n));
+    await shortSession(5, {}, others);
+    await at(15, others.slice(0, 1));
+    expect(await statuses()).toEqual(['pending']);
+    expect(dms).toEqual([]);
+    await at(16, others);
     expect(dms).toHaveLength(1);
+  });
+
+  it.each([
+    ['sent', true], ['reserved', true], ['failed', true], ['baseline', false], ['unmapped', false],
+  ])('a GCA reminder %s during this presence suppresses: %s', async (status, suppressed) => {
+    await seedGca((db) => db.exec('INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)',
+      `${VID}:1`, status, START));
+    await shortSession();
+    await at(15, []);
+    expect(await statuses()).toEqual([suppressed ? 'skipped_gca' : 'sent']);
+    expect(dms).toHaveLength(suppressed ? 0 : 1);
+  });
+
+  it('F4: a GCA reminder to the member during this presence suppresses, an earlier one does not', async () => {
+    await seedGca((db) => {
+      db.exec('INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)', `${VID}:999`, 'sent', ms(3));
+      db.exec('INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)', `${VID + 10}:1`, 'sent', ms(3));
+    });
+    await shortSession();
+    await at(15, []);
+    expect(await statuses()).toEqual(['skipped_gca']);
+    await reset();
+    dms = [];
+    await seedGca((db) => db.exec('INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)',
+      `${VID}:999`, 'sent', ms(-1)));
+    await shortSession();
+    await at(15, []);
+    expect(await statuses()).toEqual(['sent']);
+    expect(dms).toHaveLength(1);
+  });
+
+  it('sends at most one reminder per member per 24 hours', async () => {
+    await shortSession();
+    await at(15, []);
+    await at(20, [entry('QCTT_GND', VID, 121.9, 2)]);
+    await at(25, []);
+    await at(26, []);
+    await at(35, []);
+    expect(await statuses()).toEqual(['sent', 'skipped_daily']);
+    expect(dms).toHaveLength(1);
+  });
+
+  it('F1: an ambiguous failure counts towards the daily cap', async () => {
+    dmFailure = 'timeout';
+    await shortSession();
+    await at(15, []);
+    expect(dms).toHaveLength(1);
+    expect(await statuses()).toEqual(['failed']);
+    dmFailure = 'none';
+    await at(70, []);
+    await at(71, [entry('QCTT_GND', VID, 121.9, 2)]);
+    await at(75, []);
+    await at(76, []);
+    await at(85, []);
+    expect(await statuses()).toEqual(['failed', 'skipped_daily']);
+    expect(dms).toHaveLength(1);
+  });
+
+  it.each([
+    ['a 403 on the message POST', 'forbidden'],
+    ['an unexpected DM recipient before any POST', 'wrong_recipient'],
+  ] as const)('P4-1: %s is rejected and does not count towards the daily cap', async (_label, failure) => {
+    dmFailure = failure;
+    await shortSession();
+    await at(15, []);
+    expect(await rows()).toMatchObject([{ status: 'rejected', attempts: 1 }]);
+    dmFailure = 'none';
+    await at(70, []);
+    await at(71, [entry('QCTT_GND', VID, 121.9, 2)]);
+    await at(75, []);
+    await at(76, []);
+    await at(85, []);
+    expect(await statuses()).toEqual(['rejected', 'sent']);
+  });
+
+  it('F1: keeps 24 hours between actual sends when the first was delivered late', async () => {
+    await shortSession();
+    // Delivered late: the last poll before the online record is pruned an hour after the presence ended.
+    await at(65, []);
+    expect(dms).toHaveLength(1);
+    // Ended more than 24 h after the first session, but due under 24 h after its DM.
+    await at(1465, []);
+    await at(1466, [entry('QCTT_GND', VID, 121.9, 2)]);
+    await at(1470, []);
+    await at(1471, []);
+    await at(1480, []);
+    expect(dms).toHaveLength(1);
+    // Past 24 h plus the expiry window after the first session ended.
+    await at(1585, []);
+    await at(1586, [entry('QCTT_DEL', VID, 121.7, 3)]);
+    await at(1590, []);
+    await at(1591, []);
+    await at(1600, []);
+    expect(await statuses()).toEqual(['sent', 'skipped_daily', 'sent']);
+    expect(dms).toHaveLength(2);
+  });
+
+  it('a reminder whose online record was pruned an hour after the presence ended counts as reconnected', async () => {
+    await shortSession();
+    await at(66, []);
+    expect(await statuses()).toEqual(['reconnected']);
+    expect(dms).toEqual([]);
   });
 
   it('expires a reminder not deliverable within two hours', async () => {
     await shortSession();
     await at(126, []);
-    expect(await rows()).toMatchObject([{ status: 'expired' }]);
+    expect(await rows()).toMatchObject([{ status: 'expired', callsign: '' }]);
+    expect(dms).toEqual([]);
+  });
+
+  it('F6: an expired reserved row loses its callsign but still counts towards the daily cap', async () => {
+    await shortSession();
+    await sql(`UPDATE ${REMINDERS} SET status = 'reserved'`);
+    await at(130, []);
+    expect(await rows()).toMatchObject([{ session_key: keyAt(0), status: 'reserved', callsign: '' }]);
+    await at(131, [entry('QCTT_GND', VID, 121.9, 2)]);
+    await at(135, []);
+    await at(136, []);
+    await at(145, []);
+    expect(await statuses()).toEqual(['reserved', 'skipped_daily']);
     expect(dms).toEqual([]);
   });
 
   it('marks an unmapped member without sending', async () => {
-    members = [{ user: { id: MEMBER }, nick: 'Member (699999)', roles: [ROLE] }];
+    members = [member(699999)];
     await shortSession();
     await at(15, []);
-    expect(await rows()).toMatchObject([{ status: 'unmapped' }]);
+    expect(await statuses()).toEqual(['unmapped']);
     expect(dms).toEqual([]);
     expect(dmRecipients).toEqual([]);
   });
 
-  it('honours the verified role when it is set', async () => {
-    const verified = '100000000000000003';
-    await shortSession(5, { GCA_VERIFIED_ROLE_ID: verified });
-    await at(15, [], { GCA_VERIFIED_ROLE_ID: verified });
-    expect(await rows()).toMatchObject([{ status: 'unmapped' }]);
+  it('trusts a nickname VID only with the verified role', async () => {
+    members = [member(VID, MEMBER, [ROLE])];
+    await shortSession();
+    await at(15, []);
+    expect(await statuses()).toEqual(['unmapped']);
     expect(dms).toEqual([]);
   });
 
@@ -439,8 +794,7 @@ describe('short-session reminders', () => {
     await shortSession();
     await at(15, []);
     expect(await rows()).toMatchObject([{ status: 'pending', attempts: 1 }]);
-    const backoff = await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.get<number>('gca-discord-backoff-v1'));
-    expect(backoff).toBeGreaterThan(now);
+    expect(await storageGet(BACKOFF_KEY)).toBeGreaterThan(now);
     dmFailure = 'none';
     // Still within the two-minute global limit: nothing is attempted.
     await at(16, []);
@@ -451,16 +805,18 @@ describe('short-session reminders', () => {
   });
 
   it.each([
-    ['disabled', { SHORT_SESSION_DM_ENABLED: 'false' }, false],
+    ['disabled', OFF, false],
     ['an invalid guild', { GCA_DISCORD_GUILD_ID: 'not-a-guild' }, true],
     ['an invalid member role', { GCA_MEMBER_ROLE_ID: '' }, true],
     ['an invalid verified role', { GCA_VERIFIED_ROLE_ID: 'not-a-role' }, true],
+    ['F7: an unset verified role', { GCA_VERIFIED_ROLE_ID: '' }, true],
   ])('%s never breaks cards and does no work', async (_label, overrides: Partial<Env>, invalid) => {
     await shortSession(5, overrides);
     await at(15, [], overrides);
     expect(calls.filter((call) => call.startsWith('card_'))).toEqual(['card_POST', 'card_PATCH']);
     expect((await snapshot())?.error).toBeUndefined();
-    expect(await tables()).not.toContain('short_sessions');
+    expect(await shortSessionTables()).toEqual([]);
+    expect(await storageGet(RECORDED_KEY)).toBeUndefined();
     expect(dms).toEqual([]);
     expect(logged('short_session_config_invalid').length > 0).toBe(invalid);
   });
@@ -474,114 +830,229 @@ describe('short-session reminders', () => {
     expect((await snapshot())?.error).toBeUndefined();
   });
 
-  it('leaves due DMs for a later poll once card delivery used up the DM budget', async () => {
+  it('K5: saves the poll snapshot before any DM, and slow cards do not use up the DM budget', async () => {
     await shortSession();
     onCardPost = () => { now += 30_000; };
     await at(15, [entry('QCZZ_CTR', 700001, 125.1, 9)]);
-    expect(dms).toEqual([]);
-    expect(await rows()).toMatchObject([{ status: 'pending', attempts: 0 }]);
-    onCardPost = undefined;
-    await at(17, [entry('QCZZ_CTR', 700001, 125.1, 9)]);
     expect(dms).toHaveLength(1);
+    expect(stateAtDuringPost).toEqual([iso(15)]);
+    expect(Object.keys((await snapshot())!)).not.toContain('shortSession');
   });
 
-  it('shares one member-list lookup with GCA reminders in a poll', async () => {
-    const gca: Partial<Env> = {
-      GCA_DM_ENABLED: 'true', GCA_REGIONS: JSON.stringify({ AD: { name: 'Example East', prefixes: ['QC'] } }),
-      GCA_APPROVALS: '{}', GCA_HOME_OVERRIDES: JSON.stringify({ 600002: 'AC' }), GCA_COPY_USER_ID: '',
-    };
-    members = [...members, { user: { id: OTHER_MEMBER }, nick: 'Other (600002)', roles: [ROLE] }];
-    await shortSession(5, gca);
+  it('F2: never starts its own member-list lookup with under 10 seconds of budget', async () => {
+    await shortSession();
+    now = ms(15);
+    const page = Array.from({ length: 1000 }, (_, n) => member(VID + n, String(300000000000000000n + BigInt(n))));
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (!url.includes('/members?')) throw new Error(`Unexpected request ${url}`);
+      memberListCalls++;
+      // Each page is slow: the first one alone uses six seconds.
+      now += 6_000;
+      return Response.json(url.includes('after=0') ? page : []);
+    }));
+    const deliver = (budget: number) => runInDurableObject(stub(), async (_instance, ctx) => {
+      const handoff: ShortSessionHandoff = {
+        config: { memberRoleId: ROLE, verifiedRoleId: VERIFIED }, limits: await DiscordRateLimits.load(ctx.storage),
+        stateAtMs: ms(6), presentVids: [], trackedBefore: 0, current: 0,
+        memberCache: { fetched: false, members: null }, gcaAttempted: false,
+      };
+      await sendShortSessionReminders(settings(), ctx.storage, handoff, Date.now() + budget);
+    });
+    await deliver(5_000);
+    await deliver(5_000);
     expect(memberListCalls).toBe(0);
+    expect(await statuses()).toEqual(['pending']);
+    expect([await storageGet('gca-member-list-backoff-v1'), await storageGet('gca-member-list-deadline-failures-v1')])
+      .toEqual([undefined, undefined]);
+  });
+
+  it('V5: short-session lookups that run out of budget never trip the GCA member-list backoff', async () => {
+    await shortSession();
+    const page = Array.from({ length: 1000 }, (_, n) => member(VID + 1 + n));
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      if (url === IVAO_ATC_SUMMARY_URL) return Response.json([entry('EGLL_TWR', 1), ...feed]);
+      if (!url.includes('/members?')) throw new Error(`Unexpected request ${url} ${init?.method}`);
+      memberListCalls++;
+      now += 6_000;
+      // Over 2,000 members, six seconds a page: never complete within 15 seconds.
+      const after = BigInt(new URL(url).searchParams.get('after')!);
+      const first = after === 0n ? 300000000000000000n : after + 1n;
+      return Response.json(page.map((item, n) => ({ ...item, user: { id: String(first + BigInt(n)) } })));
+    }));
+    await at(15, []);
+    await at(16, []);
+    const lookups = memberListCalls;
+    await at(17, []);
+    expect(memberListCalls).toBe(lookups);
+    expect([await storageGet('gca-member-list-backoff-v1'), await storageGet('gca-member-list-deadline-failures-v1')])
+      .toEqual([undefined, undefined]);
+    expect(await statuses()).toEqual(['pending']);
+  });
+
+  const gca: Partial<Env> = {
+    GCA_DM_ENABLED: 'true', GCA_REGIONS: JSON.stringify({ AD: { name: 'Example East', prefixes: ['QC'] } }),
+    GCA_APPROVALS: '{}', GCA_HOME_OVERRIDES: JSON.stringify({ 600002: 'AC' }), GCA_COPY_USER_ID: '',
+  };
+
+  it('F5: skips sending in a poll where GCA sent a DM, then sends on the next poll', async () => {
+    members = [...members, member(600002, OTHER_MEMBER)];
+    await shortSession(5, gca);
     await at(15, [entry('QCGG_APP', 600002, 119.1, 7)], gca);
-    expect(memberListCalls).toBe(1);
+    expect(dms.map((dm) => dm.embeds[0]!.title)).toEqual([expect.stringContaining('GCA approval reminder')]);
+    expect(await statuses()).toEqual(['pending']);
+    await at(16, [entry('QCGG_APP', 600002, 119.1, 7)], gca);
     expect(dms.map((dm) => dm.embeds[0]!.title)).toEqual([
       expect.stringContaining('GCA approval reminder'), expect.stringContaining('short ATC session'),
     ]);
   });
+
+  it('shares one member-list lookup with GCA reminders in a poll', async () => {
+    // GCA looks the list up for an unmapped member, so it sends nothing itself.
+    await shortSession(5, gca);
+    expect(memberListCalls).toBe(0);
+    await at(15, [entry('QCGG_APP', 600002, 119.1, 7)], gca);
+    expect(memberListCalls).toBe(1);
+    expect(dms.map((dm) => dm.embeds[0]!.title)).toEqual([expect.stringContaining('short ATC session')]);
+  });
 });
 
-describe('short-session state', () => {
-  const atc = (callsign: string, userId = VID): OnlineAtc => ({
-    sessionId: 1, userId, callsign, frequency: 118.1, position: callsign.split('_').at(-1)!, station: null, location: null,
-  });
-  const tracked = (callsign: string, extra: Partial<TrackedAtc> = {}): TrackedAtc => ({
-    ...atc(callsign), since: iso(0), missed: 0, ...extra,
-  });
-
-  it('stamps new sessions only when the previous poll time is known', () => {
-    expect(diffState({}, [atc('QCTT_TWR')], iso(5), 2).next.QCTT_TWR!.seenAfter).toBeUndefined();
-    expect(diffState({}, [atc('QCTT_TWR')], iso(5), 2, iso(4)).next.QCTT_TWR!.seenAfter).toBe(iso(4));
-  });
-
-  it('inherits the earliest presence of the same VID, or none if any is unknown', () => {
-    const prev = {
-      QCAA_APP: tracked('QCAA_APP', { seenAfter: iso(-20), missed: 1, missingSince: iso(4) }),
-      QCAA_CTR: tracked('QCAA_CTR', { seenAfter: iso(-10) }),
-      QCBB_TWR: tracked('QCBB_TWR', { userId: VID + 1, seenAfter: iso(-90) }),
-    };
-    const current = [atc('QCAA_CTR'), atc('QCBB_TWR', VID + 1), atc('QCAA_TWR')];
-    expect(diffState(prev, current, iso(5), 2, iso(4)).next.QCAA_TWR!.seenAfter).toBe(iso(-20));
-    const { seenAfter: _unknown, ...legacy } = prev.QCAA_CTR;
-    expect(diffState({ ...prev, QCAA_CTR: legacy }, current, iso(5), 2, iso(4)).next.QCAA_TWR!.seenAfter).toBeUndefined();
+describe('short-session storage', () => {
+  it('enabling then disabling keeps no online records and no continuity key, but reminders still expire', async () => {
+    await shortSession();
+    await sql(`INSERT INTO ${REMINDERS} (session_key, user_id, callsign, online_since, ended_at, duration_minutes,
+      status, due_at, expires_at) VALUES ('old', 1, 'X', 0, ?, 1, 'sent', 0, 0)`, ms(-8 * 1440));
+    expect(await shortSessionTables()).toEqual([ONLINE, REMINDERS]);
+    expect(await storageGet(RECORDED_KEY)).toBe(ms(6));
+    await at(20, [twr(2)], OFF);
+    expect(await shortSessionTables()).toEqual([REMINDERS]);
+    expect(await storageGet(RECORDED_KEY)).toBeUndefined();
+    expect((await rows()).map((row) => row.session_key)).toEqual([keyAt(0)]);
+    expect(dms).toEqual([]);
   });
 
-  it('a callsign taken over by another VID starts a fresh presence', () => {
-    const prev = { QCTT_TWR: tracked('QCTT_TWR', { seenAfter: iso(-30) }) };
-    expect(diffState(prev, [atc('QCTT_TWR', VID + 1)], iso(5), 2, iso(4)).next.QCTT_TWR!.seenAfter).toBe(iso(4));
-  });
-
-  it('loadSessions drops an invalid seenAfter as a field, never the session', () => {
-    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const loaded = loadSessions({
-      A_TWR: tracked('A_TWR', { seenAfter: iso(-1) }),
-      B_TWR: tracked('B_TWR', { seenAfter: 12345 as unknown as string }),
-      C_TWR: tracked('C_TWR', { seenAfter: 'not a time' }),
-      D_TWR: tracked('D_TWR', { seenAfter: iso(1) }),
-      E_TWR: tracked('E_TWR'),
+  it('purge drops every short-session table and key, leaves the shared GCA backoff, and sends nothing', async () => {
+    await shortSession();
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      for (const table of ['short_session_reminders', 'short_session_segments', 'short_session_presence', 'short_sessions']) {
+        ctx.storage.sql.exec(`CREATE TABLE ${table} (id INTEGER)`);
+      }
+      await ctx.storage.put({
+        'short-session-presence-poll-v1': 1, 'short-session-recording-v1': 1, 'short-session-member-list-v1': {},
+        [BACKOFF_KEY]: ms(1),
+      });
     });
-    expect(Object.keys(loaded)).toEqual(['A_TWR', 'B_TWR', 'C_TWR', 'D_TWR', 'E_TWR']);
-    expect(Object.values(loaded).map((session) => session.seenAfter)).toEqual([iso(-1), undefined, undefined, undefined, undefined]);
-    for (const callsign of ['B_TWR', 'C_TWR', 'D_TWR']) expect(Object.hasOwn(loaded[callsign]!, 'seenAfter')).toBe(false);
-    expect(error).not.toHaveBeenCalled();
+    await at(15, [], PURGE);
+    await at(16, [], PURGE);
+    expect(await shortSessionTables()).toEqual([]);
+    const keys = await runInDurableObject(stub(), async (_instance, ctx) => Object.fromEntries(await ctx.storage.get([
+      RECORDED_KEY, 'short-session-presence-poll-v1', 'short-session-recording-v1', 'short-session-member-list-v1',
+      BACKOFF_KEY,
+    ])));
+    expect(keys).toEqual({ [BACKOFF_KEY]: ms(1) });
+    expect(logged('short_session_purged')).toEqual([
+      { event: 'short_session_purged', tables: 6 }, { event: 'short_session_purged', tables: 0 },
+    ]);
+    expect(dms).toEqual([]);
   });
 
-  it('new-format sessions and closeouts pass the unchanged load guards in both directions', () => {
-    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    // isTrackedAtc and isPendingOffline are untouched by this change: extra fields are ignored.
-    const session = tracked('QCTT_TWR', { seenAfter: iso(-1), firstSessionId: 1 });
-    const job: PendingOffline = {
-      event: { ...session, missed: 2, missingSince: iso(9), endedAt: iso(9), durationSeconds: 540 },
-      messages: [{ channelId: PUBLIC, messageId: '800000000000000001' }], channelIds: [],
+  it('drops tables of earlier designs on a recorded poll; older code still runs its own schema', async () => {
+    // The d2c84ca schema, verbatim.
+    const legacySchema = (db: SqlStorage) => {
+      db.exec(`CREATE TABLE IF NOT EXISTS short_sessions (
+        session_key TEXT PRIMARY KEY, user_id INTEGER NOT NULL, callsign TEXT NOT NULL, session_ids TEXT NOT NULL,
+        ended_at INTEGER NOT NULL, seen_after INTEGER NOT NULL, duration_minutes INTEGER NOT NULL,
+        status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0,
+        due_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+      )`);
+      db.exec('CREATE INDEX IF NOT EXISTS short_sessions_due_idx ON short_sessions (status, due_at)');
+      db.exec('CREATE INDEX IF NOT EXISTS short_sessions_user_idx ON short_sessions (user_id, ended_at)');
+      db.exec(`CREATE TABLE IF NOT EXISTS short_session_segments (
+        user_id INTEGER NOT NULL, session_id INTEGER NOT NULL, seen_after INTEGER, ended_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, session_id, ended_at)
+      )`);
+      db.exec('CREATE INDEX IF NOT EXISTS short_session_segments_ended_idx ON short_session_segments (ended_at)');
     };
-    expect(loadSessions({ QCTT_TWR: session })).toEqual({ QCTT_TWR: session });
-    expect(loadPendingOffline([job])).toEqual([job]);
-    const { seenAfter: _added, ...legacy } = session;
-    expect(loadSessions({ QCTT_TWR: legacy })).toEqual({ QCTT_TWR: legacy });
-    expect(error).not.toHaveBeenCalled();
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      legacySchema(ctx.storage.sql);
+      ctx.storage.sql.exec('CREATE TABLE short_session_reminders (session_key TEXT PRIMARY KEY)');
+      ctx.storage.sql.exec('CREATE TABLE short_session_presence (user_id INTEGER PRIMARY KEY)');
+      await ctx.storage.put({ 'short-session-presence-poll-v1': 1, 'short-session-recording-v1': { since: 1, last: 1 } });
+    });
+    await at(0, []);
+    expect(await shortSessionTables()).toEqual([ONLINE, REMINDERS]);
+    expect(await storageGet('short-session-recording-v1')).toBeUndefined();
+    expect(await storageGet('short-session-presence-poll-v1')).toBeUndefined();
+    // Rollback: d2c84ca's own schema still applies beside the new tables.
+    await runInDurableObject(stub(), (_instance, ctx) => legacySchema(ctx.storage.sql));
+    expect(await shortSessionTables()).toEqual([ONLINE, REMINDERS, 'short_session_segments', 'short_sessions']);
   });
 
-  it('trusts only a valid stored poll time that is not in the future', () => {
-    expect(trustedStateAt(iso(0), START)).toBe(iso(0));
-    expect(trustedStateAt(iso(1), START)).toBeUndefined();
-    expect(trustedStateAt('garbage', START)).toBeUndefined();
-    expect(trustedStateAt(START, START)).toBeUndefined();
-    expect(trustedStateAt(undefined, START)).toBeUndefined();
+  it('P4-4: indexes reminders by end time', async () => {
+    await at(0, []);
+    const indexes = (await sql<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'")).map((row) => row.name);
+    expect(indexes).toContain(`${REMINDERS}_ended_idx`);
   });
 
   it('records stateAt on success and carries it through a failed poll', async () => {
     await at(0, []);
     expect((await snapshot())!.stateAt).toBe(iso(0));
-    await at(1, [], { DISCORD_CHANNEL_IDS: '' }).catch(() => undefined);
+    await at(1, [], { DISCORD_CHANNEL_IDS: '' });
     expect((await snapshot())).toMatchObject({ stateAt: iso(0), error: expect.any(String) });
-    await at(2, [entry('QCTT_TWR')]);
-    expect((await snapshot())!.state!.QCTT_TWR!.seenAfter).toBe(iso(0));
+    await at(2, [twr()]);
+    await at(6, []);
+    await at(7, []);
+    expect(await rows()).toMatchObject([{ online_since: ms(0) }]);
   });
 
-  it('a future stored stateAt is not trusted', async () => {
-    await seedSnapshot({ state: {}, stateAt: iso(60) });
-    await at(0, [entry('QCTT_TWR')]);
-    expect((await snapshot())!.state!.QCTT_TWR!.seenAfter).toBeUndefined();
+  it('an older snapshot with seenAfter sessions loads and saves without it', async () => {
+    const legacy = {
+      sessionId: 1, userId: VID, callsign: 'QCTT_TWR', frequency: 118.1, position: 'TWR', station: null,
+      location: null, since: iso(-5), missed: 0, seenAfter: iso(-6),
+      messages: [{ channelId: PUBLIC, messageId: '800000000000009999' }],
+    } as TrackedAtc;
+    await seedSnapshot({ state: { QCTT_TWR: legacy }, stateAt: iso(-1), lastPollStartedAt: ms(-1) });
+    await at(0, [twr()]);
+    expect((await snapshot())!.state!.QCTT_TWR).toMatchObject({ since: iso(-5), missed: 0 });
+    expect(Object.hasOwn((await snapshot())!.state!.QCTT_TWR!, 'seenAfter')).toBe(false);
+  });
+});
+
+describe('short-session units', () => {
+  const tracked = (callsign: string, extra: Partial<TrackedAtc> = {}): TrackedAtc => ({
+    sessionId: 1, userId: VID, callsign, frequency: 118.1, position: callsign.split('_').at(-1)!, station: null,
+    location: null, since: iso(0), missed: 0, ...extra,
+  });
+
+  it('loadSessions and loadPendingOffline strip a leftover seenAfter, never the entry', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const withSeenAfter = { ...tracked('QCTT_TWR', { firstSessionId: 1 }), seenAfter: iso(-1) } as TrackedAtc;
+    const job = {
+      event: { ...withSeenAfter, missed: 2, missingSince: iso(9), endedAt: iso(9), durationSeconds: 540 },
+      messages: [{ channelId: PUBLIC, messageId: '800000000000000001' }], channelIds: [],
+    } as PendingOffline;
+    expect(loadSessions({ QCTT_TWR: withSeenAfter })).toEqual({ QCTT_TWR: tracked('QCTT_TWR', { firstSessionId: 1 }) });
+    const [loaded] = loadPendingOffline([job]);
+    expect(Object.hasOwn(loaded!.event, 'seenAfter')).toBe(false);
+    expect(loadSessions({ QCTT_TWR: tracked('QCTT_TWR') })).toEqual({ QCTT_TWR: tracked('QCTT_TWR') });
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it('F9: trusts a stored poll time only within the last poll start and after every stored session time', () => {
+    const sessions = { A: tracked('A_TWR', { since: iso(-10), missingSince: iso(-1) }) };
+    expect(trustedStateAt(iso(0), START, START, sessions)).toBe(iso(0));
+    expect(trustedStateAt(iso(0), START, ms(-1), sessions)).toBeUndefined();
+    expect(trustedStateAt(iso(0), START, undefined, sessions)).toBeUndefined();
+    expect(trustedStateAt(iso(-2), START, START, sessions)).toBeUndefined();
+    expect(trustedStateAt(iso(-5), START, START, { A: tracked('A_TWR', { since: iso(-4) }) })).toBeUndefined();
+    expect(trustedStateAt(iso(1), START, ms(1), {})).toBeUndefined();
+    expect(trustedStateAt('garbage', START, START, {})).toBeUndefined();
+    expect(trustedStateAt(START, START, START, {})).toBeUndefined();
+  });
+
+  it('P3-3: whole minutes of the bound, from 1 to 29', () => {
+    expect([0, 59_999, 60_000, 15.9 * 60_000, 29.9 * 60_000, 45 * 60_000].map(reminderMinutes)).toEqual([1, 1, 1, 15, 29, 29]);
   });
 
   it('builds a friendly, escaped reminder with a singular minute', () => {
