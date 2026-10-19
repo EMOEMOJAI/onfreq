@@ -550,6 +550,36 @@ test('pre-push notes, without blocking, pushed commits that change Gitleaks sett
   assert.match(result.stderr, /^pre-push: note — could not check the pushed commits for Gitleaks settings changes or gitleaks:allow\.$/m);
 });
 
+test('pre-push notes a gitleaks:allow line or Gitleaks settings change that only a merge resolution adds', (t) => {
+  const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
+  // Neither parent adds the file; only the merge commit's own diff does, and no
+  // later commit removes it, since a removal would be named too.
+  const mergeOnly = (f, name, text) => {
+    f.git('checkout', '--quiet', '-b', 'side');
+    writeFileSync(join(f.repo, 'side.txt'), 'side\n');
+    f.git('add', 'side.txt');
+    f.git('commit', '--quiet', '--no-verify', '-m', 'side change');
+    f.git('checkout', '--quiet', 'main');
+    writeFileSync(join(f.repo, 'public.txt'), 'main\n');
+    f.git('commit', '--quiet', '--no-verify', '-am', 'main change');
+    f.git('merge', '--quiet', '--no-ff', '--no-commit', 'side');
+    writeFileSync(join(f.repo, name), text);
+    f.git('add', name);
+    f.git('commit', '--quiet', '--no-verify', '-m', 'merge side');
+    return [f.git('rev-parse', 'HEAD'), f.git('log', '-1', '--format=%h')];
+  };
+  for (const [name, text] of [['allowed.txt', 'example = "synthetic" # gitleaks:allow\n'], ['.gitleaksignore', '# synthetic\n']]) {
+    for (const diffMerges of [undefined, 'off']) {
+      const f = fixture(t);
+      if (diffMerges) f.git('config', 'log.diffMerges', diffMerges);
+      const [merge, mergeShort] = mergeOnly(f, name, text);
+      const result = f.push([ref(merge, 'refs/heads/main', f.head)]);
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stderr, note(mergeShort), `${name} log.diffMerges=${diffMerges}`);
+    }
+  }
+});
+
 test('pre-push refuses pushed commits other than HEAD before running checks (other:main bypass)', (t) => {
   const f = fixture(t);
   for (const lines of [[ref(f.first)], [ref(f.head), ref(f.first, 'refs/heads/other')], [ref(f.first).trimEnd()]]) {

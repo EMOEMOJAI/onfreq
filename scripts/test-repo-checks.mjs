@@ -146,13 +146,19 @@ test('checks commit trailer emails, allowing only noreply identities, and redact
     assert.deepEqual(failures, [`${'c'.repeat(12)}: commit trailer email must use a noreply address`], trailer);
   }
   // URL handle paths are not addresses; an address anywhere else in a URL still is.
-  for (const trailer of ['Reviewed-on: https://social.example/@person', 'Link: https://example.test/a/@b/c']) {
+  for (const trailer of ['Reviewed-on: https://social.example/@person', 'Link: https://example.test/a/@b/c',
+    'Reviewed-on: HTTPS://Social.example/@Person']) {
     assert.deepEqual(privateCommitEmails(row(`${allowed[0]}\x1f${trailer}`)), [], trailer);
   }
   for (const trailer of ['Link: https://a.test/x;person@private.example',
     'Co-authored-by: X <https://a.test/>,<person@private.example>', 'Link: https://tracker.test/u/person@private.example',
     'Link: https://a.test/@person@private.example', 'Link: https://person@example.test/x', 'Co-authored-by: X <person@localhost>',
-    'Co-authored-by: noreply@github.com@person.example', 'Signed-off-by: person@example.test.']) {
+    'Co-authored-by: noreply@github.com@person.example', 'Signed-off-by: person@example.test.',
+    // `/@` is ignored only inside a scheme:// URL.
+    'Signed-off-by: person/@private.example', 'Co-authored-by: X <person/@private.example>',
+    'Link: mailto:person@private.example', 'Link: person@private.example://x',
+    'Link: https://a.test/x person/@private.example', 'Link: https:/@private.example',
+    'Reviewed-on: https://social.example/@person\x1fSigned-off-by: person/@private.example']) {
     const failures = privateCommitEmails(row(trailer));
     assert.deepEqual(failures, [`${'c'.repeat(12)}: commit trailer email must use a noreply address`], trailer);
     assert.doesNotMatch(failures.join(' '), /person|private\.example|example\.test|localhost/, trailer);
