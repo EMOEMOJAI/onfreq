@@ -58,7 +58,8 @@ const ALL_TABLES = [ONLINE, REMINDERS, ...OLD_TABLES];
 
 export interface ShortSessionConfig {
   memberRoleId: string;
-  verifiedRoleId: string;
+  /** When set, a nickname VID is trusted only for members also holding this role (as for GCA). */
+  verifiedRoleId?: string;
 }
 
 export type ShortSessionMode =
@@ -68,19 +69,20 @@ export type ShortSessionMode =
 
 /**
  * "true" enables the feature, "purge" deletes its data, anything else keeps
- * it off. It reuses the GCA guild, member-role and verified-role IDs (all
- * required), but not GCA_DM_ENABLED or the GCA policy. Invalid IDs disable
- * it for the poll; this never throws.
+ * it off. It reuses the GCA guild and member-role IDs (required) and the
+ * optional verified role, exactly as GCA reminders do, but not GCA_DM_ENABLED
+ * or the GCA policy. Invalid IDs disable it for the poll; this never throws.
  */
 export function shortSessionMode(env: Env): ShortSessionMode {
   if (env.SHORT_SESSION_DM_ENABLED === 'purge') return { kind: 'purge' };
   if (env.SHORT_SESSION_DM_ENABLED !== 'true') return { kind: 'disabled' };
   const verifiedRoleId = env.GCA_VERIFIED_ROLE_ID?.trim();
-  if (!isSnowflake(env.GCA_DISCORD_GUILD_ID) || !isSnowflake(env.GCA_MEMBER_ROLE_ID) || !isSnowflake(verifiedRoleId)) {
+  if (!isSnowflake(env.GCA_DISCORD_GUILD_ID) || !isSnowflake(env.GCA_MEMBER_ROLE_ID) ||
+      (verifiedRoleId && !isSnowflake(verifiedRoleId))) {
     console.error(JSON.stringify({ event: 'short_session_config_invalid' }));
     return { kind: 'disabled' };
   }
-  return { kind: 'enabled', config: { memberRoleId: env.GCA_MEMBER_ROLE_ID, verifiedRoleId } };
+  return { kind: 'enabled', config: { memberRoleId: env.GCA_MEMBER_ROLE_ID, ...(verifiedRoleId ? { verifiedRoleId } : {}) } };
 }
 
 /**

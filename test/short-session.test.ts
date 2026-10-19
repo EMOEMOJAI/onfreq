@@ -28,6 +28,8 @@ const RECORDED_KEY = 'short-session-recorded-v1';
 const BACKOFF_KEY = 'gca-discord-backoff-v1';
 const EXCLUDED = { EXCLUDED_CALLSIGNS: 'QCXX_CTR' };
 const OFF = { SHORT_SESSION_DM_ENABLED: 'false' };
+/** A set but invalid verified role: the feature logs short_session_config_invalid and stays off. */
+const MISCONFIGURED = { GCA_VERIFIED_ROLE_ID: 'not-a-role' };
 const PURGE = { SHORT_SESSION_DM_ENABLED: 'purge' };
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
 const ms = (minutes: number) => START + minutes * 60_000;
@@ -401,15 +403,16 @@ describe('short-session reminders: presence regressions send nothing', () => {
   });
 
   it.each([
-    ['V1: enabled after a TWR session closed while off', OFF],
-    ['V2: re-enabled after a TWR session closed under purge', PURGE],
-    ['PR2: valid again after a TWR session closed while misconfigured', { GCA_VERIFIED_ROLE_ID: '' }],
-  ])('%s', async (_label, gap: Partial<Env>) => {
+    ['V1: enabled after a TWR session closed while off', OFF, false],
+    ['V2: re-enabled after a TWR session closed under purge', PURGE, false],
+    ['PR2: valid again after a TWR session closed while misconfigured', MISCONFIGURED, true],
+  ])('%s', async (_label, gap: Partial<Env>, invalid) => {
     await at(0, []);
     await at(1, [twr()]);
     await at(60, [twr()]);
     await at(61, [], gap);
     await at(62, [], gap);
+    expect(logged('short_session_config_invalid').length > 0).toBe(invalid);
     await at(63, [app()]);
     await at(70, [app()]);
     await at(71, []);
@@ -432,10 +435,10 @@ describe('short-session reminders: presence regressions send nothing', () => {
   });
 
   it.each([
-    ['PR1: off', OFF],
-    ['PR2: misconfigured', { GCA_VERIFIED_ROLE_ID: '' }],
-    ['control: on throughout', {}],
-  ])('%s while at an excluded position, then a short TWR session soon after', async (_label, gap: Partial<Env>) => {
+    ['PR1: off', OFF, false],
+    ['PR2: misconfigured', MISCONFIGURED, true],
+    ['control: on throughout', {}, false],
+  ])('%s while at an excluded position, then a short TWR session soon after', async (_label, gap: Partial<Env>, invalid) => {
     const between = { ...EXCLUDED, ...gap };
     await at(-400, [], EXCLUDED);
     await at(-300, [], EXCLUDED);
@@ -443,6 +446,7 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await at(0, [], between);
     await during(1, 96, 5, [excludedCtr(1)], between);
     await at(100, [], between);
+    expect(logged('short_session_config_invalid').length > 0).toBe(invalid);
     await at(101, [twr(2)], EXCLUDED);
     await at(106, [twr(2)], EXCLUDED);
     await at(107, [], EXCLUDED);
@@ -769,7 +773,16 @@ describe('short-session reminders: delivery', () => {
     expect(dmRecipients).toEqual([]);
   });
 
-  it('trusts a nickname VID only with the verified role', async () => {
+  it('F7: without a verified role, the member role and nickname VID are enough, as for GCA', async () => {
+    members = [member(VID, MEMBER, [ROLE])];
+    await shortSession(5, { GCA_VERIFIED_ROLE_ID: '' });
+    await at(15, [], { GCA_VERIFIED_ROLE_ID: '' });
+    expect(logged('short_session_config_invalid')).toEqual([]);
+    expect(await statuses()).toEqual(['sent']);
+    expect(dmRecipients).toEqual([MEMBER]);
+  });
+
+  it('F7: with a verified role set, a member without it is not trusted', async () => {
     members = [member(VID, MEMBER, [ROLE])];
     await shortSession();
     await at(15, []);
@@ -808,8 +821,7 @@ describe('short-session reminders: delivery', () => {
     ['disabled', OFF, false],
     ['an invalid guild', { GCA_DISCORD_GUILD_ID: 'not-a-guild' }, true],
     ['an invalid member role', { GCA_MEMBER_ROLE_ID: '' }, true],
-    ['an invalid verified role', { GCA_VERIFIED_ROLE_ID: 'not-a-role' }, true],
-    ['F7: an unset verified role', { GCA_VERIFIED_ROLE_ID: '' }, true],
+    ['F7: a set but invalid verified role', MISCONFIGURED, true],
   ])('%s never breaks cards and does no work', async (_label, overrides: Partial<Env>, invalid) => {
     await shortSession(5, overrides);
     await at(15, [], overrides);
