@@ -22,8 +22,10 @@ const syntheticKey = () => ['AKIA', 'Q7RZ', 'LX2M', 'NB4K', 'TWPJ'].join('');
 // helpers (range arguments, secret scan, Gitleaks settings guard) are copied in
 // and committed, as the hooks run them from the repository root. With realRange,
 // npm range checks run the real check-privacy.mjs too; gitleaks: 'real' uses the
-// installed Gitleaks, 'missing' none. Global and system Git configuration are
-// ignored so the scanned log format is predictable.
+// installed Gitleaks, 'missing' none. The fake answers `gitleaks version` without
+// logging: 8.30.1, FAKE_GITLEAKS_VERSION, or a failure with FAKE_GITLEAKS_VERSION_FAIL.
+// Global and system Git configuration are ignored so the scanned log format is
+// predictable.
 function fixture(t, { npmExit = 0, realRange = false, gitleaks = 'fake', gitleaksExit = 0 } = {}) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-hooks-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -44,6 +46,11 @@ exit "$NPM_EXIT"
 `, { mode: 0o700 });
   if (gitleaks === 'fake') {
     writeFileSync(join(bin, 'gitleaks'), `#!/bin/sh
+if [ "\${1:-}" = version ]; then
+  if [ -n "\${FAKE_GITLEAKS_VERSION_FAIL:-}" ]; then exit 1; fi
+  printf '%s\\n' "\${FAKE_GITLEAKS_VERSION:-8.30.1}"
+  exit 0
+fi
 printf '[%s]' "$@" >> "$GITLEAKS_LOG"
 printf '\\n' >> "$GITLEAKS_LOG"
 if [ -n "\${GITLEAKS_CONFIG+x}\${GITLEAKS_CONFIG_TOML+x}" ]; then printf 'config variable set\\n' >> "$GITLEAKS_LOG"; fi
@@ -370,10 +377,12 @@ test('CI and pre-push share scripts/secret-scan.sh; it reports unreadable histor
   assert.equal(workflow.match(/^ +uses: \.\/\.github\/actions\/install-gitleaks$/gm)?.length, 3);
   const action = readFileSync(new URL('../.github/actions/install-gitleaks/action.yml', import.meta.url), 'utf8');
   assert.equal(action.match(/ sha256=[0-9a-f]{64} ;;$/gm)?.length, 3);
-  // Both hooks share one Gitleaks settings guard.
+  // Both hooks share one Gitleaks settings guard, followed by the version notice.
   for (const file of ['./hooks/pre-push', './hooks/pre-commit']) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
     assert.match(source, /^\. scripts\/hooks\/lib\/gitleaks-settings\.sh$/m, file);
+    const name = file.split('/').at(-1);
+    assert.match(source, new RegExp(`^gitleaks_settings_guard ${name} .* \\|\\| exit 1\ngitleaks_version_notice ${name}$`, 'm'), file);
     assert.doesNotMatch(source, /in \.gitleaks\.toml|untracked or ignored|GITLEAKS_CONFIG/, file);
   }
 });
@@ -465,6 +474,80 @@ test('pre-push refuses untracked, ignored or unstaged Gitleaks settings (S19-29)
   assert.equal(result.status, 1);
   assert.match(result.stderr, /unstaged changes to package files, scripts\/ or Gitleaks settings/);
   assert.equal(result.gitleaks, '');
+});
+
+test('both hooks warn, without blocking, when the local Gitleaks is not the version CI pins', (t) => {
+  const f = fixture(t);
+  // pre-commit scans a staged change; pre-push needs the index to match HEAD.
+  const run = (hook, extraEnv) => {
+    if (hook === 'pre-push') return f.push([ref(f.head)], undefined, extraEnv);
+    writeFileSync(join(f.repo, 'public.txt'), 'staged\n');
+    f.git('add', 'public.txt');
+    const result = f.commitHook({ extraEnv });
+    f.git('checkout', '--quiet', 'HEAD', '--', 'public.txt');
+    return result;
+  };
+  for (const hook of ['pre-commit', 'pre-push']) {
+    for (const env of [{}, { FAKE_GITLEAKS_VERSION: 'v8.30.1' }]) {
+      const result = run(hook, env);
+      assert.equal(result.status, 0, `${hook}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr, /warning/, hook);
+    }
+    for (const [env, shown] of [[{ FAKE_GITLEAKS_VERSION: '8.18.0' }, '8.18.0'], [{ FAKE_GITLEAKS_VERSION_FAIL: '1' }, 'unknown']]) {
+      const result = run(hook, env);
+      assert.equal(result.status, 0, `${hook} ${shown}: ${result.stderr}`);
+      assert.match(result.stderr,
+        new RegExp(`^${hook}: warning — Gitleaks ${shown} is not the 8\\.30\\.1 CI uses; local scan results may differ\\.$`, 'm'), hook);
+      // The scan still runs.
+      assert.match(result.gitleaks, /^\[stdin\]/, hook);
+    }
+  }
+  // The hooks' pin is the version CI installs.
+  const pinned = readFileSync(new URL('./hooks/lib/gitleaks-settings.sh', import.meta.url), 'utf8')
+    .match(/^gitleaks_pinned_version=(\S+)$/m)?.[1];
+  const action = readFileSync(new URL('../.github/actions/install-gitleaks/action.yml', import.meta.url), 'utf8');
+  assert.equal(pinned, '8.30.1');
+  assert.equal(action.match(/^ +version=(\S+)$/m)?.[1], pinned);
+  assert.equal(action.match(/^ +- name: Install verified Gitleaks (\S+)$/m)?.[1], pinned);
+});
+
+test('pre-push notes, without blocking, pushed commits that change Gitleaks settings or add gitleaks:allow', (t) => {
+  const f = fixture(t);
+  const commit = (message, files) => {
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(f.repo, name), text);
+    f.git('add', ...Object.keys(files));
+    f.git('commit', '--quiet', '--no-verify', '-m', message);
+    return [f.git('rev-parse', 'HEAD'), f.git('log', '-1', '--format=%h')];
+  };
+  const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
+  let result = f.push([ref(f.head)]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /note/);
+  const [ignore, ignoreShort] = commit('ignore list', { '.gitleaksignore': '# synthetic\n' });
+  result = f.push([ref(ignore, 'refs/heads/main', f.head)]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, note(ignoreShort));
+  const [allow, allowShort] = commit('allow', { 'allowed.txt': 'example = "synthetic" # gitleaks:allow\n' });
+  result = f.push([ref(allow, 'refs/heads/main', ignore)]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, note(allowShort));
+  assert.equal(result.gitleaks, leakScan(allow), 'the scan is unchanged');
+  // Each commit is named once, whichever way it qualifies.
+  const [both, bothShort] = commit('both', { '.gitleaksignore': '# synthetic\n# more\n', 'allowed.txt': 'x = 1 # gitleaks:allow\n' });
+  result = f.push([ref(both, 'refs/heads/main', f.head)]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, note(`${bothShort} ${ignoreShort} ${allowShort}`));
+  // A later ordinary commit is not named.
+  const [plain] = commit('plain', { 'public.txt': 'plain\n' });
+  result = f.push([ref(plain, 'refs/heads/main', both)]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /note/);
+  // A history Git cannot read blocks the scan; the note says it could not check.
+  const blob = f.git('rev-parse', `${f.first}:public.txt`);
+  rmSync(join(f.repo, '.git', 'objects', blob.slice(0, 2), blob.slice(2)));
+  result = f.push([ref(plain)]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /^pre-push: note — could not check the pushed commits for Gitleaks settings changes or gitleaks:allow\.$/m);
 });
 
 test('pre-push refuses pushed commits other than HEAD before running checks (other:main bypass)', (t) => {

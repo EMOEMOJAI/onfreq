@@ -20,6 +20,7 @@ fi
 # shellcheck source-path=SCRIPTDIR/../.. source=scripts/hooks/lib/gitleaks-settings.sh
 . scripts/hooks/lib/gitleaks-settings.sh
 gitleaks_settings_guard pre-commit Stage commit || exit 1
+gitleaks_version_notice pre-commit
 
 if ! tmp=$(mktemp -d); then
   printf 'pre-commit: BLOCKED — could not create a temporary directory.\n' >&2

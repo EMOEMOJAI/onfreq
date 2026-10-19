@@ -27,6 +27,20 @@ test('rejects private paths independently of gitignore, allowing public template
   }
 });
 
+test('.gitignore ignores exactly the config/ paths privatePath treats as private', (t) => {
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-ignore-')));
+  t.after(() => rmSync(repo, { recursive: true, force: true }));
+  const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+  assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: repo, env }).status, 0);
+  copyFileSync(new URL('../.gitignore', import.meta.url), join(repo, '.gitignore'));
+  for (const [file, ignored] of [['config/.example', true], ['config/optional-secrets.example', false],
+    ['config/x.example', false], ['config/a.example/file', true]]) {
+    const status = spawnSync('git', ['check-ignore', '--no-index', '-q', file], { cwd: repo, env }).status;
+    assert.equal(status, ignored ? 0 : 1, file);
+    assert.equal(privatePath(file), ignored, file);
+  }
+});
+
 test('checks every tracked Wrangler config, including nested and JSON files, and refuses TOML', () => {
   const safe = Buffer.from(JSON.stringify({ kv_namespaces: [{ id: '0'.repeat(32) }] }));
   const leaked = Buffer.from('{ "account_id": "synthetic-private-value" }');
@@ -130,6 +144,18 @@ test('checks commit trailer emails, allowing only noreply identities, and redact
     'Co-authored-by: Person <noreply@anthropic.com.example.test>']) {
     const failures = privateCommitEmails([row(allowed[0]), row(`${allowed[1]}\x1f${trailer}`)].join('\0'));
     assert.deepEqual(failures, [`${'c'.repeat(12)}: commit trailer email must use a noreply address`], trailer);
+  }
+  // URL handle paths are not addresses; an address anywhere else in a URL still is.
+  for (const trailer of ['Reviewed-on: https://social.example/@person', 'Link: https://example.test/a/@b/c']) {
+    assert.deepEqual(privateCommitEmails(row(`${allowed[0]}\x1f${trailer}`)), [], trailer);
+  }
+  for (const trailer of ['Link: https://a.test/x;person@private.example',
+    'Co-authored-by: X <https://a.test/>,<person@private.example>', 'Link: https://tracker.test/u/person@private.example',
+    'Link: https://a.test/@person@private.example', 'Link: https://person@example.test/x', 'Co-authored-by: X <person@localhost>',
+    'Co-authored-by: noreply@github.com@person.example', 'Signed-off-by: person@example.test.']) {
+    const failures = privateCommitEmails(row(trailer));
+    assert.deepEqual(failures, [`${'c'.repeat(12)}: commit trailer email must use a noreply address`], trailer);
+    assert.doesNotMatch(failures.join(' '), /person|private\.example|example\.test|localhost/, trailer);
   }
   assert.equal(privateCommitEmails(['d'.repeat(40), 'noreply@anthropic.com', 'noreply@anthropic.com', ''].join('\t')).length, 1);
   // Author and trailer failures are reported separately.

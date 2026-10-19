@@ -23,3 +23,20 @@ gitleaks_settings_guard() {
     return 1
   fi
 }
+
+# The Gitleaks version CI installs; must match .github/actions/install-gitleaks/action.yml.
+gitleaks_pinned_version=8.30.1
+
+# gitleaks_version_notice <hook>
+# Rules and defaults change between Gitleaks releases, so a different local
+# version can pass what CI blocks, or the reverse. Warns only; never blocks.
+gitleaks_version_notice() {
+  gitleaks_version=$(gitleaks version </dev/null 2>/dev/null) || gitleaks_version=
+  gitleaks_version=$(printf '%s\n' "$gitleaks_version" | sed -n '1{s/[[:space:]]//g;s/^v//;p;}') ||
+    gitleaks_version=
+  if [ "$gitleaks_version" != "$gitleaks_pinned_version" ]; then
+    printf '%s: warning — Gitleaks %s is not the %s CI uses; local scan results may differ.\n' \
+      "$1" "${gitleaks_version:-unknown}" "$gitleaks_pinned_version" >&2
+  fi
+  return 0
+}

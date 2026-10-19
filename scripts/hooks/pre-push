@@ -68,6 +68,7 @@ fi
 # shellcheck source-path=SCRIPTDIR/../.. source=scripts/hooks/lib/gitleaks-settings.sh
 . scripts/hooks/lib/gitleaks-settings.sh
 gitleaks_settings_guard pre-push Commit push || exit 1
+gitleaks_version_notice pre-push
 
 # Scans one pushed ref. check-privacy.mjs computes the range, one revision
 # argument per line, for both the secret scan and its own range check: HEAD
@@ -82,6 +83,22 @@ scan_range() {
 $range
 EOF
   sh scripts/secret-scan.sh "$@" </dev/null
+}
+
+# Prints, space-separated, the short hashes of commits in one pushed range that
+# change the Gitleaks settings or add or remove a gitleaks:allow line. The scan
+# honours both, so a push can relax its own scan; they are named for review.
+pushed_gitleaks_changes() {
+  changes_range=$1
+  set --
+  while IFS= read -r changes_arg; do
+    if [ -n "$changes_arg" ]; then set -- "$@" "$changes_arg"; fi
+  done <<EOF
+$changes_range
+EOF
+  changes_settings=$(git log --no-show-signature --format=%h "$@" -- .gitleaks.toml .gitleaksignore </dev/null) &&
+    changes_allow=$(git log --no-show-signature --text --no-textconv --no-ext-diff -G 'gitleaks:allow' --format=%h "$@" -- </dev/null) || return 1
+  printf '%s\n%s\n' "$changes_settings" "$changes_allow" | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
 }
 
 # New commits per ref. The checks never print matched private values; Gitleaks redacts.
@@ -99,6 +116,13 @@ for remote_oid in "$@"; do
       *) scan_failed=true ;;
     esac
     if [ "$status" != 0 ]; then printf '\n%s\n' "$output" >&2; fi
+    # A note only; the scan above already decided whether the push is blocked.
+    if ! gitleaks_note=$(pushed_gitleaks_changes "$range" 2>/dev/null); then
+      printf 'pre-push: note — could not check the pushed commits for Gitleaks settings changes or gitleaks:allow.\n' >&2
+    elif [ -n "$gitleaks_note" ]; then
+      printf 'pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow (%s); the scan honoured them, so review those changes.\n' \
+        "$gitleaks_note" >&2
+    fi
   else
     unreadable=true
   fi

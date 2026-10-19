@@ -83,8 +83,12 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-18 | T2-1 | P3 | Health passed with webhook-only polling; stale pending alarm blocked new hints; early poll at +30 s randomly displaced cron | 4b2c8a9 |
 | 2026-10-18 | T3-1 | P3 | Rotation records stale and `.gitleaks.toml` in no chunk; setup upgrade and secret-reuse wording | b003a5c |
 | 2026-10-18 | T3-2 | P3 | Secret-scan history assertions scanned an empty commit; NaN budget case could not fail | b003a5c |
+| 2026-10-19 | T1-5 | P3 | Hooks did not warn when local Gitleaks differs from CI's 8.30.1; now warn without blocking | pending |
+| 2026-10-19 | T1-5 | P3 | A push could relax its own scan via Gitleaks settings or `gitleaks:allow` unnoticed; pre-push now names those commits | pending |
+| 2026-10-19 | T1-5 | P3 | Trailer-email check flagged URL handle paths (`/@person`); now ignored, other addresses in URLs still flagged | pending |
+| 2026-10-19 | T1-5 | P3 | `.gitignore` re-included `config/.example` and files under `config/*.example/`, unlike `privatePath`; now aligned | pending |
 
-Deferred: hook warning for a non-8.30.1 local Gitleaks; a commit can add a Gitleaks ignore within its own push (by design); test pool runtime older than deploy runtime (no fallback warning; bump when a matching release exists); trailer-email check flags any `@` in a trailer (false positives only).
+Deferred: test pool runtime older than deploy runtime (vitest-pool-workers 0.23.0 still bundles miniflare 5.20260815.0-alpha vs compatibility date 2026-08-16; bump when a matching release exists). Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
 ## Dependency overrides
 

@@ -45,6 +45,8 @@ CLAUDE.local.md
 docs/pr-audit-*.md
 /nano-banana-*.png
 
-# Operator settings; only the public .example templates are tracked.
+# Operator settings; only the public top-level .example templates are tracked,
+# not a bare .example or files under an .example directory.
 config/*
-!config/*.example
+!config/?*.example
+config/?*.example/

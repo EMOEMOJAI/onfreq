@@ -129,7 +129,9 @@ export function privateCommitEmails(log) {
       errors.push(`${hash.slice(0, 12)}: commit email must use GitHub noreply`);
     }
     // Any address in a trailer (Co-authored-by, Signed-off-by...) is published too.
-    const trailers = rest.join('\t');
+    // A URL handle path such as https://social.example/@person is not an address;
+    // an address elsewhere in a URL is still flagged.
+    const trailers = rest.join('\t').replace(/\/@/g, '/');
     const emails = [...trailers.matchAll(/[^\s<>()"',;\x1f]+@[^\s<>()"',;\x1f]+/g)].map(([email]) => email);
     if (!emails.every((email) => trailerNoreply.test(email))) {
       errors.push(`${hash.slice(0, 12)}: commit trailer email must use a noreply address`);
