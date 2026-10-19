@@ -18,8 +18,8 @@ Each of these changes makes the named chunk due at once, whatever its date:
 - Webhook signing, replay or filtering change, or an IVAO webhook format change: T1-2.
 - IVAO or Discord credential handling, or token cache changes: T1-3.
 - GCA policy format, DM, history or cleanup changes: T1-4.
-- Short-session change: T1-6.
 - A new secret or config name, or a hook or privacy-check change: T1-5.
+- Short-session change: T1-6.
 - Throttle, alarm, health or snapshot schema changes: T2-1.
 - `runPoll`, state or roster changes, or an IVAO feed shape change: T2-2.
 - A new or bumped dependency, an override change, or a workflow change: T2-5.
@@ -50,7 +50,7 @@ Each of these changes makes the named chunk due at once, whatever its date:
 | T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | b0bcc2a | 2026-10-19 | clean |
 | T1-4 | GCA reminders and member data | `src/gca.ts`, `src/retention.ts` | Policy parsing fails closed, DM reservations and dedup ledgers, history privacy, cleanup vs polling | b0bcc2a | 2026-10-19 | clean |
 | T1-5 | Secrets hygiene and privacy gates | `scripts/check-privacy.mjs`, `scripts/secret-scan.sh`, `scripts/hooks/**`, `.github/actions/**`, `.gitignore`, `.gitleaks.toml`, `.dev.vars.example`, `config/**`, `src/env.d.ts` | No real IDs or secrets in history, hook coverage, optional-secret boundaries | b0bcc2a | 2026-10-19 | clean |
-| T1-6 | Short-session reminders | `src/short-session.ts` | Presence invariants, continuity/baseline, at-most-once and daily cap, GCA interaction, retention/purge, log privacy | b0bcc2a | 2026-10-19 | clean |
+| T1-6 | Short-session reminders | `src/short-session.ts`; `src/poll.ts` and `src/coordinator.ts` call sites | Presence invariants, continuity/baseline, at-most-once and daily cap, GCA interaction, retention/purge, log privacy | b0bcc2a | 2026-10-19 | clean |
 
 ## Tier 2 (semi-annually; due 2027-04-18)
 

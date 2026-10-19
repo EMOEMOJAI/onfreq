@@ -4,7 +4,7 @@ TypeScript Discord bot on Cloudflare Workers. Read [README.md](README.md) and [s
 
 ## Source map
 
-[src/index.ts](src/index.ts) routes HTTP and cron events; [src/webhook.ts](src/webhook.ts) handles the optional IVAO webhook that requests early polls; [src/coordinator.ts](src/coordinator.ts) serializes polling. [src/poll.ts](src/poll.ts), [src/state.ts](src/state.ts) and [src/roster.ts](src/roster.ts) handle notification delivery. [src/gca.ts](src/gca.ts) handles optional reminders. Tests live in [test/](test/); deployment and Git hook scripts live in [scripts/](scripts/).
+[src/index.ts](src/index.ts) routes HTTP and cron events; [src/webhook.ts](src/webhook.ts) handles the optional IVAO webhook that requests early polls; [src/coordinator.ts](src/coordinator.ts) serializes polling. [src/poll.ts](src/poll.ts), [src/state.ts](src/state.ts) and [src/roster.ts](src/roster.ts) handle notification delivery. [src/gca.ts](src/gca.ts) handles optional reminders. [src/short-session.ts](src/short-session.ts) handles optional short-session reminders. Tests live in [test/](test/); deployment and Git hook scripts live in [scripts/](scripts/).
 
 ## Checks
 
@@ -18,6 +18,7 @@ After staging changes, run `npm run check:repo` for privacy, deployment setup an
 - `src/state.ts` handles sessions; `poll.ts` and `roster.ts` handle delivery. Public delivery is at least once.
 - `gca.ts` parses private region coverage and approvals, and manages durable DM reservations. Invalid policy disables reminders; cleanup must preserve deduplication and occurrence ledgers.
 - Health reads never poll or refresh success time. Cleanup must not race polling.
+- `short-session.ts` keeps online records only while enabled; `purge` must drop all its tables and keys.
 
 ## Workflow and privacy
 

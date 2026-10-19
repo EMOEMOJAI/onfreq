@@ -13,6 +13,8 @@ const preCommit = fileURLToPath(new URL('./hooks/pre-commit', import.meta.url));
 const zero = '0'.repeat(40);
 const hookHelpers = ['check-privacy.mjs', 'repo-files.mjs', 'secret-scan.sh', 'hooks/lib/gitleaks-settings.sh'];
 const hasGitleaks = spawnSync('gitleaks', ['version'], { stdio: 'ignore' }).status === 0;
+// Locally a missing Gitleaks skips the real-scan tests; in CI they run and fail.
+const gitleaksSkip = !hasGitleaks && !process.env.CI && 'gitleaks is not installed';
 // A synthetic AWS-format key assembled at runtime, so this file never contains it.
 const syntheticKey = () => ['AKIA', 'Q7RZ', 'LX2M', 'NB4K', 'TWPJ'].join('');
 
@@ -197,7 +199,7 @@ test('pre-push blocks when Gitleaks reports a finding or is not installed (S19-2
 });
 
 test('pre-push Gitleaks scan catches a secret committed with --no-verify and redacts it (S19-24)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\n`);
@@ -219,7 +221,7 @@ test('pre-push Gitleaks scan catches a secret committed with --no-verify and red
   });
 
 test('pre-push Gitleaks scan reads the literal bytes of binary, -diff and textconv files (S19-28)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     // Without --text/--no-textconv, git log -p shows these as "Binary files differ"
@@ -255,7 +257,7 @@ test('pre-push Gitleaks scan reads the literal bytes of binary, -diff and textco
   });
 
 test('pre-push Gitleaks scan catches a secret only a merge resolution adds (S19-28)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     const { merge, head } = mergeOnlySecret(f, token);
@@ -277,7 +279,7 @@ test('pre-push Gitleaks scan catches a secret only a merge resolution adds (S19-
   });
 
 test('pre-push Gitleaks scan still diffs merges when log.diffMerges is off (S19-30)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     const { head } = mergeOnlySecret(f, token);
@@ -388,7 +390,7 @@ test('CI and pre-push share scripts/secret-scan.sh; it reports unreadable histor
 });
 
 test('secret-scan.sh finds a secret anywhere in history with the real Gitleaks, as CI runs it (C47)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
     const scan = () => spawnSync('/bin/sh', ['scripts/secret-scan.sh', 'HEAD'], { cwd: f.repo, env, encoding: 'utf8' });
@@ -430,7 +432,7 @@ test('pre-push ignores Gitleaks configuration variables (S19-29)', (t) => {
 });
 
 test('pre-push Gitleaks scan cannot be emptied by configuration variables (S19-29)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     // A configuration with no rules reports nothing when Gitleaks honours it.
     const rules = join(f.repo, '..', 'rules.toml');
@@ -746,6 +748,10 @@ function stageSyntheticKey(f) {
   return token;
 }
 
+test('Gitleaks is installed when tests run in CI', { skip: !process.env.CI && 'not running in CI' }, () => {
+  assert.ok(hasGitleaks, 'CI must install Gitleaks; the real-scan tests would otherwise be skipped');
+});
+
 test('pre-commit passes a clean commit, directly and as an installed hook (S19-31)', (t) => {
   const f = fixture(t, { gitleaks: hasGitleaks ? 'real' : 'fake' });
   writeFileSync(join(f.repo, 'public.txt'), 'clean\n');
@@ -767,7 +773,7 @@ test('pre-commit ignores Gitleaks configuration variables (S19-31)', (t) => {
 });
 
 test('pre-commit Gitleaks scan cannot be emptied by configuration variables (S19-31)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     // A configuration with no rules reports nothing when Gitleaks honours it.
     const rules = join(f.repo, '..', 'rules.toml');
@@ -860,7 +866,7 @@ test('pre-commit reports a Gitleaks that exits before reading a large staged dif
 });
 
 test('pre-commit passes a commit that removes a committed secret, but blocks an added one (C63)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     const secret = new RegExp(token.slice(4));
@@ -895,7 +901,7 @@ test('pre-commit passes a commit that removes a committed secret, but blocks an 
   });
 
 test('hunk-header or GIT_DIFF_OPTS context naming a committed secret does not block an edit below it, but an added secret still blocks (C64 C68)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     const secret = new RegExp(token.slice(4));
@@ -958,7 +964,7 @@ test('hunk-header or GIT_DIFF_OPTS context naming a committed secret does not bl
   });
 
 test('secret-scan.sh scans commit messages whatever format.pretty prints (C65)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     const secret = new RegExp(token.slice(4));
@@ -999,7 +1005,7 @@ test('secret-scan.sh scans commit messages whatever format.pretty prints (C65)',
   });
 
 test('secret-scan.sh scans commit messages whatever encoding header the commit declares (C69)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     const secret = new RegExp(token.slice(4));
@@ -1030,7 +1036,7 @@ test('secret-scan.sh scans commit messages whatever encoding header the commit d
   });
 
 test('diff.interHunkContext cannot turn a committed secret between two edits into scanned context (C66)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     const token = syntheticKey();
     const secret = new RegExp(token.slice(4));
@@ -1102,7 +1108,7 @@ function scanAssignment(f, text) {
 }
 
 test('the repository Gitleaks rule blocks low-entropy values of its secret names (T1-5)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     // Gitleaks' default allowlist treats one repeated character as a placeholder,
     // so the low-entropy fixture alternates two.
@@ -1133,7 +1139,7 @@ test('the repository Gitleaks rule blocks low-entropy values of its secret names
   });
 
 test('the repository Gitleaks allowlist matches whole synthetic fixture values only (T1-5)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     commitRules(f, repoRules());
     for (const value of ['aaaaaaaa-synthetic-aaaaaaaa', 'notsynthetic-aaaaaaaaaaaa', 'synthetic-aaaaaaaa.aaaaaaaa',
@@ -1220,7 +1226,7 @@ test('pre-push prints the could-not-check note when the message search fails (RO
   const realGit = spawnSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
   writeFileSync(join(f.repo, '..', 'bin', 'git'), `#!/bin/sh
 for arg in "$@"; do case "$arg" in --grep=*) exit 1 ;; esac; done
-exec ${realGit} "$@"
+exec "${realGit}" "$@"
 `, { mode: 0o700 });
   const result = f.push([ref(f.head)]);
   assert.equal(result.status, 0, result.stderr);
@@ -1233,7 +1239,7 @@ const realShaped = ['7341258963', '14752089'].join('');
 const otherReal = ['8862014473', '20518630'].join('');
 
 test('the repository Gitleaks rules block real-shaped Discord IDs and private JSON literals, redacted (ROT-1)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     commitRules(f, repoRules());
     const blocked = (text, secret, label) => {
@@ -1259,7 +1265,7 @@ test('the repository Gitleaks rules block real-shaped Discord IDs and private JS
   });
 
 test('the repository Gitleaks rules pass synthetic IDs, empty values, references and expressions (ROT-1)',
-  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+  { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     commitRules(f, repoRules());
     const reference = (name) => `${name}: env.${name},\n`;

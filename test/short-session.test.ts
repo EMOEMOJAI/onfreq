@@ -175,9 +175,12 @@ async function shortSession(endMinute = 5, overrides: Partial<Env> = {}, others:
 }
 
 /** No reminder recorded and no DM sent. */
-async function expectNothing() {
+async function expectNothing({ allowPollFailure = false } = {}) {
   expect(await rows()).toEqual([]);
   expect(dms).toEqual([]);
+  // A scenario that recorded nothing must not have done so by failing.
+  if (!allowPollFailure) expect(logged('short_session_poll_failed')).toEqual([]);
+  expect((await snapshot())?.error).toBeUndefined();
 }
 
 beforeEach(() => {
@@ -267,6 +270,8 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // A test may leave a due alarm (a webhook hint), which must not fire in the next one.
+  await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.deleteAlarm());
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   await reset();
@@ -654,7 +659,7 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await at(10, []);
     await at(11, []);
     await at(25, []);
-    await expectNothing();
+    await expectNothing({ allowPollFailure: true });
     expect(logged('short_session_baseline')).toHaveLength(2);
   });
 
@@ -920,15 +925,18 @@ describe('short-session reminders: delivery', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
       if (!url.includes('/members?')) throw new Error(`Unexpected request ${url}`);
-      memberListCalls++;
+      // Counts lookups started (first pages); the list has a second page.
+      if (url.includes('after=0')) memberListCalls++;
       // Each page is slow: the first one alone uses six seconds.
       now += 6_000;
       return Response.json(url.includes('after=0') ? page : []);
     }));
+    // Delivery for the poll at minute 15, when the reminder is due.
     const deliver = (budget: number) => runInDurableObject(stub(), async (_instance, ctx) => {
+      await ctx.storage.put(RECORDED_KEY, ms(15));
       const handoff: ShortSessionHandoff = {
         config: { memberRoleId: ROLE, verifiedRoleId: VERIFIED }, limits: await DiscordRateLimits.load(ctx.storage),
-        stateAtMs: ms(6), presentVids: [], trackedBefore: 0, current: 0,
+        stateAtMs: ms(15), presentVids: [], trackedBefore: 0, current: 0,
         memberCache: { fetched: false, members: null }, gcaAttempted: false,
       };
       await sendShortSessionReminders(settings(), ctx.storage, handoff, Date.now() + budget);
@@ -939,6 +947,9 @@ describe('short-session reminders: delivery', () => {
     expect(await statuses()).toEqual(['pending']);
     expect([await storageGet('gca-member-list-backoff-v1'), await storageGet('gca-member-list-deadline-failures-v1')])
       .toEqual([undefined, undefined]);
+    // Control: with a full budget the same delivery does start one lookup.
+    await deliver(15_000);
+    expect(memberListCalls).toBe(1);
   });
 
   it('V5: short-session lookups that run out of budget never trip the GCA member-list backoff', async () => {

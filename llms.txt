@@ -2,7 +2,7 @@
 
 > onfreq is an MIT-licensed, self-hosted Discord bot for IVAO air traffic control (ATC) notifications, built with TypeScript on Cloudflare Workers.
 
-Use it to show controller connections, disconnections and flight information region (FIR) coverage in Discord. Features include live session cards, durable retries and optional GCA reminders with privately configured coverage. Public delivery is at least once. Deployment credentials, region policies and member approval records are operator-managed and excluded from this repository.
+Use it to show controller connections, disconnections and flight information region (FIR) coverage in Discord. Features include live session cards, durable retries, optional GCA reminders with privately configured coverage and optional short-session reminders. Public delivery is at least once. Deployment credentials, region policies and member approval records are operator-managed and excluded from this repository.
 
 ## Documentation
 
