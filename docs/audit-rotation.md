@@ -66,8 +66,8 @@ Each of these changes makes the named chunk due at once, whatever its date:
 
 | ID | Chunk | Paths | Focus | Baseline | Last pass | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| T3-1 | Docs and agent instructions | `README.md`, `docs/**`, `llms.txt`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SECURITY.md`, `LICENSE`, `.github/copilot-instructions.md`, `.github/ISSUE_TEMPLATE/**`, `assets/**` | Trigger: before each release, or when setup or security guidance changes. Docs match code; no unsafe advice; no private data | b003a5c | 2026-10-18 | clean |
-| T3-2 | Tests and repo-check tests | `test/**`, `scripts/test-hooks.mjs`, `scripts/test-repo-checks.mjs` | Trigger: when fixtures or helpers change, or when a chunk audit flags untested paths. Fixtures stay synthetic; tests can fail | b003a5c | 2026-10-18 | clean |
+| T3-1 | Docs and agent instructions | `README.md`, `docs/**`, `llms.txt`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SECURITY.md`, `LICENSE`, `.github/copilot-instructions.md`, `.github/ISSUE_TEMPLATE/**`, `assets/**` | Trigger: before each release, or when setup or security guidance changes. Docs match code; no unsafe advice; no private data | 8cd89c7 | 2026-10-19 | clean |
+| T3-2 | Tests and repo-check tests | `test/**`, `scripts/test-hooks.mjs`, `scripts/test-repo-checks.mjs` | Trigger: when fixtures or helpers change, or when a chunk audit flags untested paths. Fixtures stay synthetic; tests can fail | 8cd89c7 | 2026-10-19 | clean |
 
 Baseline `932364b` is `main` after the full pre-ship audit (code quality, security, dependencies and build) finished on 2026-09-27. Changes since then were reviewed per change rather than per chunk, so the first pass of any touched chunk should review its whole delta.
 
@@ -105,6 +105,8 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-19 | T1-6 | P3 | Due and expiry used the clock rather than the recorded poll; disabling kept the member-list pause key; coverage added for limits and retries | b0bcc2a |
 | 2026-10-19 | T1-6 | P4 | Deferred: the DM channel id is kept in the shared rate-limit map | b0bcc2a |
 | 2026-10-19 | T1-5 | P4 | Deferred: whole-message email check; gitleaks:allow in author names or paths; a COORDINATOR_NAME or FIR_PREFIXES rule | b0bcc2a |
+| 2026-10-19 | T3-1 | P2 | Rollback advice said "let one poll run" though purge needs a successful poll; docs now say to wait for `short_session_purged`. Short-session wording, AGENTS.md and llms.txt updated | 8cd89c7 |
+| 2026-10-19 | T3-2 | P3 | A budget test could not fail, "sends nothing" tests passed on a swallowed error, a stray alarm could run; real-Gitleaks tests now fail in CI if Gitleaks is missing. Deferred: a direct test of the poll.ts send-detection wrapper | 8cd89c7 |
 
 Deferred: test pool runtime older than deploy runtime (vitest-pool-workers 0.23.0 still bundles miniflare 5.20260815.0-alpha vs compatibility date 2026-08-16; bump when a matching release exists). Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
