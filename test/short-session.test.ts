@@ -32,6 +32,11 @@ const OFF = { SHORT_SESSION_DM_ENABLED: 'false' };
 const MISCONFIGURED = { GCA_VERIFIED_ROLE_ID: 'not-a-role' };
 const PURGE = { SHORT_SESSION_DM_ENABLED: 'purge' };
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
+/** GCA reminders on, for a synthetic region where VID 600002 is a guest. */
+const GCA_ON: Partial<Env> = {
+  GCA_DM_ENABLED: 'true', GCA_REGIONS: JSON.stringify({ AD: { name: 'Example East', prefixes: ['QC'] } }),
+  GCA_APPROVALS: '{}', GCA_HOME_OVERRIDES: JSON.stringify({ 600002: 'AC' }), GCA_COPY_USER_ID: '',
+};
 const ms = (minutes: number) => START + minutes * 60_000;
 const iso = (minutes: number) => new Date(ms(minutes)).toISOString();
 const keyAt = (minutes: number) => `${VID}:${ms(minutes)}`;
@@ -49,7 +54,21 @@ let dms: { embeds: DiscordEmbed[]; allowed_mentions?: unknown }[];
 let dmRecipients: string[];
 let members: unknown[];
 let memberListCalls: number;
-let dmFailure: 'none' | 'timeout' | 'global429' | 'forbidden' | 'wrong_recipient';
+let dmFailure: 'none' | 'timeout' | 'global429' | 'route429' | 'forbidden' | 'wrong_recipient';
+let feedCalls: number;
+/** While set, the feed request or the DM message POST waits for it; `held` records that one is waiting. */
+let feedGate: Promise<void> | undefined;
+let dmGate: Promise<void> | undefined;
+let held: string[];
+let dmOpenDelayMs: number;
+let dmOpenStatus: number[];
+let cardStatus: number;
+let listStatus: number;
+let slowListMs: number;
+/** Delay of an otherwise normal member-list response; `listAt` records when that lookup started. */
+let listDelayMs: number;
+let listAt: number | undefined;
+let openAt: number[];
 let statusDuringPost: string[];
 let stateAtDuringPost: (string | undefined)[];
 let activeCtx: DurableObjectState | undefined;
@@ -165,6 +184,18 @@ beforeEach(() => {
   now = START;
   feed = [];
   feedStatus = 200;
+  feedCalls = 0;
+  feedGate = undefined;
+  dmGate = undefined;
+  held = [];
+  dmOpenDelayMs = 0;
+  dmOpenStatus = [];
+  cardStatus = 200;
+  listStatus = 200;
+  slowListMs = 0;
+  listDelayMs = 0;
+  listAt = undefined;
+  openAt = [];
   calls = [];
   dms = [];
   dmRecipients = [];
@@ -180,21 +211,38 @@ beforeEach(() => {
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
-    if (url === IVAO_ATC_SUMMARY_URL) return Response.json([entry('EGLL_TWR', 1), ...feed], { status: feedStatus });
+    if (url === IVAO_ATC_SUMMARY_URL) {
+      feedCalls++;
+      if (feedGate) { held.push('feed'); await feedGate; }
+      return Response.json([entry('EGLL_TWR', 1), ...feed], { status: feedStatus });
+    }
     if (url.includes('/guilds/') && url.includes('/members?')) {
       memberListCalls++;
+      listAt ??= now;
+      now += listDelayMs;
+      if (listStatus !== 200) return Response.json({ message: 'Missing Access' }, { status: listStatus });
+      if (slowListMs) {
+        // A full page of synthetic members, slowly: the lookup needs another page.
+        now += slowListMs;
+        return Response.json(Array.from({ length: 1000 }, (_, n) => member(800000 + n, String(400000000000000000n + BigInt(n)))));
+      }
       return Response.json(members);
     }
     if (url.endsWith('/users/@me/channels')) {
       const recipient = (JSON.parse(String(init?.body)) as { recipient_id: string }).recipient_id;
       calls.push('dm_open');
+      openAt.push(now);
       dmRecipients.push(recipient);
+      now += dmOpenDelayMs;
+      const openStatus = dmOpenStatus.shift();
+      if (openStatus) return Response.json({ message: 'synthetic failure' }, { status: openStatus });
       const shown = dmFailure === 'wrong_recipient' ? OTHER_MEMBER : recipient;
       return Response.json({ id: DM_CHANNEL, type: 1, recipients: [{ id: shown }] });
     }
     if (url.endsWith(`/channels/${DM_CHANNEL}/messages`)) {
       calls.push('dm_post');
       dms.push(JSON.parse(String(init?.body)));
+      if (dmGate) { held.push('dm'); await dmGate; }
       const ctx = activeCtx!;
       stateAtDuringPost.push((await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY))?.stateAt);
       if (ctx.storage.sql.exec('SELECT 1 FROM sqlite_master WHERE name = ?', REMINDERS).toArray().length) {
@@ -203,6 +251,7 @@ beforeEach(() => {
       }
       if (dmFailure === 'timeout') throw new Error('Synthetic timeout after Discord may have delivered');
       if (dmFailure === 'global429') return Response.json({ retry_after: 120, global: true }, { status: 429 });
+      if (dmFailure === 'route429') return Response.json({ retry_after: 1, global: false }, { status: 429 });
       if (dmFailure === 'forbidden') return Response.json({ message: 'Cannot send messages to this user' }, { status: 403 });
       return Response.json({ id: '300000000000000002' });
     }
@@ -210,6 +259,7 @@ beforeEach(() => {
       const method = init?.method ?? 'GET';
       calls.push(`card_${method}`);
       if (method === 'POST') onCardPost?.();
+      if (method === 'POST' && cardStatus !== 200) return Response.json({ message: 'synthetic rejection' }, { status: cardStatus });
       return Response.json({ id: method === 'POST' ? `80000000000000${String(++cardId).padStart(4, '0')}` : url.split('/').at(-1) });
     }
     throw new Error(`Unexpected request ${url}`);
@@ -579,9 +629,17 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await expectNothing();
   });
 
-  it('F5: no delivery in a poll whose recording failed, though its snapshot was saved', async () => {
-    await shortSession();
+  it('F5: no delivery in a poll whose recording failed, though its snapshot and closeout card were saved', async () => {
+    const other = entry('QCZZ_CTR', 700001, 125.1, 9);
+    await at(0, []);
+    await at(1, [twr(), other]);
+    await at(5, [other]);
+    await at(6, [other]);
+    await at(14, []);
+    calls = [];
     await at(15, [], {}, failRecording);
+    // The other controller's closeout card still posts in the failing poll.
+    expect(calls).toEqual(['card_PATCH']);
     expect((await snapshot())!.stateAt).toBe(iso(15));
     expect(dms).toEqual([]);
     expect(logged('short_session_skipped')).toContainEqual({ event: 'short_session_skipped', reason: 'unrecorded_poll' });
@@ -643,10 +701,14 @@ describe('short-session reminders: delivery', () => {
   });
 
   it.each([
-    ['sent', true], ['reserved', true], ['failed', true], ['baseline', false], ['unmapped', false],
-  ])('a GCA reminder %s during this presence suppresses: %s', async (status, suppressed) => {
-    await seedGca((db) => db.exec('INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)',
-      `${VID}:1`, status, START));
+    ['sent', false, true], ['reserved', false, true], ['failed', true, true], ['failed', false, false],
+    ['baseline', false, false], ['unmapped', false, false],
+  ])('a GCA reminder %s (occurrence kept: %s) during this presence suppresses: %s', async (status, occurrence, suppressed) => {
+    await seedGca((db) => {
+      db.exec('INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)', `${VID}:1`, status, START);
+      // GCA keeps a failed reminder's occurrence only when it was possibly delivered.
+      if (occurrence) db.exec('INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, ?, 1)', `${VID}:1`, VID);
+    });
     await shortSession();
     await at(15, []);
     expect(await statuses()).toEqual([suppressed ? 'skipped_gca' : 'sent']);
@@ -901,12 +963,11 @@ describe('short-session reminders: delivery', () => {
     expect([await storageGet('gca-member-list-backoff-v1'), await storageGet('gca-member-list-deadline-failures-v1')])
       .toEqual([undefined, undefined]);
     expect(await statuses()).toEqual(['pending']);
+    expect(logged('gca_member_list_failed')).toEqual(Array(2).fill(
+      { event: 'gca_member_list_failed', reason: 'deadline', status: 'unavailable', counted: false }));
   });
 
-  const gca: Partial<Env> = {
-    GCA_DM_ENABLED: 'true', GCA_REGIONS: JSON.stringify({ AD: { name: 'Example East', prefixes: ['QC'] } }),
-    GCA_APPROVALS: '{}', GCA_HOME_OVERRIDES: JSON.stringify({ 600002: 'AC' }), GCA_COPY_USER_ID: '',
-  };
+  const gca = GCA_ON;
 
   it('F5: skips sending in a poll where GCA sent a DM, then sends on the next poll', async () => {
     members = [...members, member(600002, OTHER_MEMBER)];
@@ -930,6 +991,275 @@ describe('short-session reminders: delivery', () => {
   });
 });
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+/** Runs `scenario` on one coordinator instance at minute `minutes`, so concurrent triggers share its in-flight poll. */
+function withCoordinator<T>(
+  minutes: number, current: IvaoAtcSummaryEntry[], scenario: (coordinator: PollCoordinator, ctx: DurableObjectState) => Promise<T>,
+  overrides: Partial<Env> = {},
+): Promise<T> {
+  now = ms(minutes);
+  feed = current;
+  return runInDurableObject(stub(), (_instance, ctx) => {
+    activeCtx = ctx;
+    return scenario(new PollCoordinator(ctx, settings(overrides)), ctx);
+  });
+}
+
+describe('ROT-1: the coordinator around the DM step', () => {
+  it.each([
+    ['runs when the throttle allows', 60_000, { skipped: false }, 2],
+    ['is throttled otherwise', 0, { skipped: true }, 1],
+  ])('a trigger joining during the DM step of a saved poll %s', async (_label, wait, second, feeds) => {
+    await shortSession();
+    const before = feedCalls;
+    const hold = deferred();
+    dmGate = hold.promise;
+    const results = await withCoordinator(15, [], async (coordinator) => {
+      const first = coordinator.poll();
+      await vi.waitFor(() => expect(held).toEqual(['dm']));
+      dmGate = undefined;
+      const joined = coordinator.poll();
+      now += wait;
+      hold.resolve();
+      return Promise.all([first, joined]);
+    });
+    expect(results).toEqual([{ skipped: false }, second]);
+    expect(feedCalls - before).toBe(feeds);
+  });
+
+  it('a trigger joining a failing in-flight poll rejects with the same error', async () => {
+    await at(0, []);
+    const hold = deferred();
+    feedGate = hold.promise;
+    feedStatus = 503;
+    const results = await withCoordinator(5, [], async (coordinator) => {
+      const first = coordinator.poll().catch((err: Error) => err.message);
+      await vi.waitFor(() => expect(held).toEqual(['feed']));
+      const joined = coordinator.poll().catch((err: Error) => err.message);
+      hold.resolve();
+      return Promise.all([first, joined]);
+    });
+    expect(results).toEqual(['IVAO API responded with 503', 'IVAO API responded with 503']);
+  });
+
+  it('a trigger joining during the DM step of a poll saved with a delivery error rejects with that error', async () => {
+    await shortSession();
+    cardStatus = 400;
+    const hold = deferred();
+    dmGate = hold.promise;
+    const before = feedCalls;
+    const results = await withCoordinator(15, [entry('QCZZ_CTR', 700001, 125.1, 9)], async (coordinator) => {
+      const first = coordinator.poll().catch((err: Error) => err.message);
+      await vi.waitFor(() => expect(held).toEqual(['dm']));
+      dmGate = undefined;
+      const joined = coordinator.poll().catch((err: Error) => err.message);
+      now += 60_000;
+      hold.resolve();
+      return Promise.all([first, joined]);
+    });
+    expect(results).toEqual(['all Discord notifications failed', 'all Discord notifications failed']);
+    expect(feedCalls - before).toBe(1);
+  });
+
+  it('a webhook hint is dropped before the in-flight poll saves, but schedules an early poll during its DM step', async () => {
+    await shortSession();
+    const feedHold = deferred();
+    const dmHold = deferred();
+    feedGate = feedHold.promise;
+    dmGate = dmHold.promise;
+    const [beforeSave, duringDm, alarm] = await withCoordinator(15, [], async (coordinator, ctx) => {
+      const first = coordinator.poll();
+      await vi.waitFor(() => expect(held).toEqual(['feed']));
+      const dropped = await coordinator.requestEarlyPoll();
+      feedGate = undefined;
+      feedHold.resolve();
+      await vi.waitFor(() => expect(held).toEqual(['feed', 'dm']));
+      const scheduled = await coordinator.requestEarlyPoll();
+      const stored = await ctx.storage.getAlarm();
+      dmGate = undefined;
+      dmHold.resolve();
+      await first;
+      return [dropped, scheduled, stored];
+    });
+    expect(beforeSave).toBeNull();
+    expect(duringDm).toEqual(expect.any(Number));
+    // Workerd moves an alarm already due on its real clock to now, so only its presence is compared.
+    expect(alarm).toEqual(expect.any(Number));
+  });
+
+  it('a throw from short-session delivery is logged, leaving the poll result and snapshot intact', async () => {
+    await shortSession();
+    const result = await withCoordinator(15, [], (coordinator, ctx) => {
+      const get = ctx.storage.get.bind(ctx.storage) as (key: string) => Promise<unknown>;
+      let reads = 0;
+      // The second read of the continuity key is delivery's.
+      vi.spyOn(ctx.storage, 'get').mockImplementation((async (key: string) => {
+        if (key === RECORDED_KEY && ++reads === 2) throw new TypeError('synthetic delivery failure');
+        return get(key);
+      }) as never);
+      return coordinator.poll();
+    });
+    expect(result).toEqual({ skipped: false });
+    expect(await snapshot()).toMatchObject({ stateAt: iso(15) });
+    expect((await snapshot())?.error).toBeUndefined();
+    expect(logged('short_session_poll_failed')).toEqual([{ event: 'short_session_poll_failed', error: 'TypeError' }]);
+    expect(dms).toEqual([]);
+  });
+
+  it('history cleanup during a held DM POST reports busy', async () => {
+    await shortSession();
+    const hold = deferred();
+    dmGate = hold.promise;
+    const busy = await withCoordinator(15, [], async (coordinator) => {
+      const first = coordinator.poll();
+      await vi.waitFor(() => expect(held).toEqual(['dm']));
+      const during = coordinator.cleanupGcaHistory(false);
+      dmGate = undefined;
+      hold.resolve();
+      await first;
+      return during;
+    });
+    expect(busy).toEqual({ busy: true });
+  });
+});
+
+describe('ROT-1: delivery limits', () => {
+  it.each([
+    ['a 403', 403, 0, 'gca-member-list-backoff-v1'],
+    ['its deadline', 200, 30_000, 'gca-member-list-deadline-failures-v1'],
+  ])('when GCA\'s member lookup fails with %s, short-session makes no second lookup', async (_label, status, slow, key) => {
+    members = [...members, member(600002, OTHER_MEMBER)];
+    await shortSession(5, GCA_ON);
+    listStatus = status;
+    slowListMs = slow;
+    const puts: unknown[] = [];
+    await at(15, [entry('QCGG_APP', 600002, 119.1, 7)], GCA_ON, (ctx) => {
+      const put = ctx.storage.put.bind(ctx.storage) as (...args: unknown[]) => Promise<void>;
+      vi.spyOn(ctx.storage, 'put').mockImplementation(((...args: unknown[]) => {
+        puts.push(args[0]);
+        return put(...args);
+      }) as never);
+    });
+    expect(memberListCalls).toBe(1);
+    expect(puts.filter((put) => put === key)).toHaveLength(1);
+    expect(puts.filter((put) => typeof put === 'string' && put.startsWith('gca-member-list') && put !== key)).toEqual([]);
+    expect(await statuses()).toEqual(['pending']);
+    expect(dms).toEqual([]);
+  });
+
+  it('a route-limited 429 leaves the reminder pending without the shared backoff, then sends', async () => {
+    dmFailure = 'route429';
+    await shortSession();
+    await at(15, []);
+    expect(await rows()).toMatchObject([{ status: 'pending', attempts: 1 }]);
+    expect(await storageGet(BACKOFF_KEY)).toBeUndefined();
+    dmFailure = 'none';
+    await at(16, []);
+    expect(await rows()).toMatchObject([{ status: 'sent', attempts: 2 }]);
+  });
+
+  it('five route-limited 429s reject the reminder, and a later one is still sent', async () => {
+    dmFailure = 'route429';
+    await shortSession();
+    await during(15, 19, 1, []);
+    expect(await rows()).toMatchObject([{ status: 'rejected', attempts: 5 }]);
+    dmFailure = 'none';
+    await at(70, []);
+    await at(71, [entry('QCTT_GND', VID, 121.9, 2)]);
+    await at(75, []);
+    await at(76, []);
+    await at(85, []);
+    expect(await statuses()).toEqual(['rejected', 'sent']);
+  });
+
+  it('sends at most three reminders per poll', async () => {
+    const stayers = [1, 2, 3, 4].map((n) => entry(`QCS${n}_CTR`, 700000 + n, 125.1, 20 + n));
+    const leavers = [1, 2, 3, 4].map((n) => entry(`QCL${n}_TWR`, 610000 + n, 118.1, 30 + n));
+    members = leavers.map((item, n) => member(item.userId, String(500000000000000000n + BigInt(n))));
+    await at(0, stayers);
+    for (let n = 1; n <= 4; n++) await at(n, [...stayers, ...leavers.slice(0, n)]);
+    await at(10, stayers);
+    await at(11, stayers);
+    expect(await statuses()).toEqual(Array(4).fill('pending'));
+    await at(20, stayers);
+    expect(dms).toHaveLength(3);
+    await at(21, stayers);
+    expect(dms).toHaveLength(4);
+    expect(await statuses()).toEqual(Array(4).fill('sent'));
+  });
+
+  it('does not POST when opening the DM leaves under 10 seconds of budget', async () => {
+    dmOpenDelayMs = 6_000;
+    await shortSession();
+    await at(15, []);
+    expect(calls).toContain('dm_open');
+    expect(calls).not.toContain('dm_post');
+    expect(await rows()).toMatchObject([{ status: 'pending', attempts: 0 }]);
+  });
+
+  it.each([
+    [0, true], [4, true], [7, false],
+  ])('after a member lookup taking %s s, a DM open starts only with 10 s of budget left (opened: %s)', async (seconds, opened) => {
+    listDelayMs = seconds * 1000;
+    await shortSession();
+    await at(15, []);
+    // Delivery starts its 15 s budget just before the lookup.
+    for (const at of openAt) expect(at - listAt!).toBeLessThanOrEqual(5_000);
+    expect(calls.includes('dm_open')).toBe(opened);
+    expect(await statuses()).toEqual([opened ? 'sent' : 'pending']);
+    expect(await rows()).toMatchObject([{ attempts: opened ? 1 : 0 }]);
+  });
+
+  it('retries after a failed DM open', async () => {
+    dmOpenStatus = [500];
+    await shortSession();
+    await at(15, []);
+    expect(await rows()).toMatchObject([{ status: 'pending', attempts: 1 }]);
+    expect(dms).toEqual([]);
+    await at(16, []);
+    expect(await rows()).toMatchObject([{ status: 'sent', attempts: 2 }]);
+  });
+
+  it('never revives a sent reminder when the same presence later ends short again', async () => {
+    await at(0, []);
+    await at(1, [twr()]);
+    await at(5, []);
+    await at(6, []);
+    await sql(`UPDATE ${REMINDERS} SET status = 'sent'`);
+    await at(8, [app()]);
+    await at(12, []);
+    await at(13, []);
+    await at(25, []);
+    expect(await rows()).toMatchObject([{ status: 'sent', ended_at: ms(5) }]);
+    expect(dms).toEqual([]);
+  });
+
+  it('more than ten new members in one poll have unknown starts, even when they are a minority', async () => {
+    const stayers = Array.from({ length: 12 }, (_, n) => entry(`QCS${String.fromCharCode(65 + n)}_CTR`, 700100 + n, 125.1, 100 + n));
+    const arrivals = Array.from({ length: 11 }, (_, n) => entry(`QCN${String.fromCharCode(65 + n)}_TWR`, 620001 + n, 118.1, 200 + n));
+    await at(0, stayers);
+    await at(1, [...stayers, ...arrivals]);
+    expect(logged('short_session_mass_reappearance')).toEqual([{ event: 'short_session_mass_reappearance', count: 11 }]);
+    await at(5, [...stayers, ...arrivals.slice(1)]);
+    await at(6, [...stayers, ...arrivals.slice(1)]);
+    await at(20, [...stayers, ...arrivals.slice(1)]);
+    await expectNothing();
+  });
+
+  it('due and expiry follow the poll time, not the clock after slow cards', async () => {
+    await shortSession();
+    onCardPost = () => { now += 60_000; };
+    await at(14.9, [entry('QCZZ_CTR', 700001, 125.1, 9)]);
+    expect(dms).toEqual([]);
+    expect(await statuses()).toEqual(['pending']);
+  });
+});
+
 describe('short-session storage', () => {
   it('enabling then disabling keeps no online records and no continuity key, but reminders still expire', async () => {
     await shortSession();
@@ -937,9 +1267,11 @@ describe('short-session storage', () => {
       status, due_at, expires_at) VALUES ('old', 1, 'X', 0, ?, 1, 'sent', 0, 0)`, ms(-8 * 1440));
     expect(await shortSessionTables()).toEqual([ONLINE, REMINDERS]);
     expect(await storageGet(RECORDED_KEY)).toBe(ms(6));
+    await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.put('short-session-member-list-v1', { failures: 1 }));
     await at(20, [twr(2)], OFF);
     expect(await shortSessionTables()).toEqual([REMINDERS]);
     expect(await storageGet(RECORDED_KEY)).toBeUndefined();
+    expect(await storageGet('short-session-member-list-v1')).toBeUndefined();
     expect((await rows()).map((row) => row.session_key)).toEqual([keyAt(0)]);
     expect(dms).toEqual([]);
   });

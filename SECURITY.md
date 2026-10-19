@@ -2,7 +2,7 @@
 
 Report vulnerabilities through [GitHub private reporting](https://github.com/EMOEMOJAI/onfreq/security/advisories/new). Never include credentials or unredacted member records in public issues.
 
-Keep deployment values in Wrangler secrets and ignored `.dev.vars`, `wrangler.local.jsonc`, `*.local.sh` or non-example `config/` files. Do not publish working-directory ZIPs; use a reviewed Git archive. Rotate any exposed credential at its provider.
+Keep deployment values in Wrangler secrets and ignored `.dev.vars`, `.envrc`, `wrangler.local.jsonc`, `*.local.sh` or `config/` files; only `config/optional-secrets.example` is public. Do not publish working-directory ZIPs; use a reviewed Git archive. Rotate any exposed credential at its provider.
 
 The optional `POST /ivao/webhook` is authenticated by the IVAO (Hook0) HMAC signature keyed by `IVAO_WEBHOOK_SECRET`, is disabled while that secret is unset, shorter than 32 characters or reused, and never stores or logs payloads.
 

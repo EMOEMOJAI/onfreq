@@ -13,6 +13,11 @@ worker-configuration.d.ts
 .env
 .env.*
 !.env.example
+# direnv files export variables, often real secrets
+.envrc
+.envrc.*
+!.envrc.example
+.envrc.example/
 
 # Key material and ad-hoc secret dumps
 *.pem
@@ -45,8 +50,8 @@ CLAUDE.local.md
 docs/pr-audit-*.md
 /nano-banana-*.png
 
-# Operator settings; only the public top-level .example templates are tracked,
-# not a bare .example or files under an .example directory.
+# Operator settings; only the public optional-settings template is tracked,
+# never a directory of that name or any other file.
 config/*
-!config/?*.example
-config/?*.example/
+!config/optional-secrets.example
+config/optional-secrets.example/

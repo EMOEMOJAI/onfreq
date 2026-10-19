@@ -72,8 +72,14 @@ function within(at: unknown, now: number, windowMs: number): boolean {
 }
 
 /** One object owns this bot's session state and serializes both trigger sources. */
+/** The poll in progress; `saved` once its snapshot is persisted (its DM step may still run). */
+interface InFlightPoll {
+  promise: Promise<PollResult>;
+  saved: boolean;
+}
+
 export class PollCoordinator extends DurableObject<Env> {
-  private inFlight?: Promise<PollResult>;
+  private inFlight?: InFlightPoll;
 
   /**
    * A regular poll. It always uses the scheduled-poll throttle, whether or not
@@ -114,7 +120,9 @@ export class PollCoordinator extends DurableObject<Env> {
    */
   async requestEarlyPoll(): Promise<number | null> {
     const pending = await this.ctx.storage.getAlarm();
-    if (this.inFlight) return pending;
+    // Before the in-flight poll saves, its feed fetch still covers this hint;
+    // once it has saved (its DM step may still run), the hint is scheduled.
+    if (this.inFlight && !this.inFlight.saved) return pending;
     const snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
     const now = Date.now();
     // Future start times are not trusted, as in runOnce's throttle.
@@ -181,19 +189,27 @@ export class PollCoordinator extends DurableObject<Env> {
     }
   }
 
-  private async serialized(kind: PollKind, attempt?: { ran: boolean }): Promise<PollResult> {
+  private async serialized(kind: PollKind, attempt?: { ran: boolean }, retry = true): Promise<PollResult> {
     // Set synchronously before yielding: external fetches permit other RPCs
     // to enter this object, so storage consistency alone is not a mutex.
-    if (this.inFlight) {
-      await this.inFlight;
-      return { skipped: true };
+    const running = this.inFlight;
+    if (running) {
+      // A trigger that joins before the in-flight poll saves is covered by its
+      // feed fetch. One that joins after (during its DM step) is not: once that
+      // poll resolves, it runs once more, and the throttle decides. A failed
+      // poll rejects its waiters with the same error, as before.
+      const joinedAfterSave = running.saved;
+      await running.promise;
+      if (!retry || !joinedAfterSave) return { skipped: true };
+      return this.serialized(kind, attempt, false);
     }
-    this.inFlight = this.runOnce(kind, attempt);
-    try {
-      return await this.inFlight;
-    } finally {
-      this.inFlight = undefined;
-    }
+    const run = { saved: false } as InFlightPoll;
+    // Cleared as soon as the poll settles, before any waiter resumes.
+    run.promise = this.runOnce(kind, attempt, run).finally(() => {
+      if (this.inFlight === run) this.inFlight = undefined;
+    });
+    this.inFlight = run;
+    return run.promise;
   }
 
   async getState(): Promise<StateMap | null> {
@@ -252,7 +268,7 @@ export class PollCoordinator extends DurableObject<Env> {
     return { records, nextCursor: rows.length > 100 ? String(rows[99]!.cursor) : null };
   }
 
-  private async runOnce(kind: PollKind, attempt?: { ran: boolean }): Promise<PollResult> {
+  private async runOnce(kind: PollKind, attempt?: { ran: boolean }, run?: { saved: boolean }): Promise<PollResult> {
     let snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
     if (!snapshot) {
       snapshot = { state: await this.env.ATC_STATE.get<StateMap>(STATE_KEY, 'json') };
@@ -316,6 +332,7 @@ export class PollCoordinator extends DurableObject<Env> {
     // No successful response or in-memory checkpoint precedes persistence.
     await this.persist({ ...outcome, stateAt: nowIso }, startedAt, scheduledAt,
       outcome.error ? snapshot.lastSuccessfulPollAt : Date.now(), outcome.error);
+    if (run) run.saved = true;
     // Optional short-session DMs run only after the snapshot is saved, still
     // inside the serialized poll, with a budget of their own.
     if (outcome.shortSession) {

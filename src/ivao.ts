@@ -301,6 +301,15 @@ const TOKEN_INVALIDATE_BACKOFF_MS = 30 * 60 * 1000;
 let lastInvalidatedAt = 0;
 
 /**
+ * Tracker only: until this epoch ms the feed is fetched anonymously, with no
+ * token read, mint or KV access, because the tracker rejected our token (a
+ * 401 for one minted in that same call, or a 403 for any). Profile lookups
+ * keep their own token handling. In isolate memory, like the token cache.
+ */
+let trackerAnonymousUntil = 0;
+const TRACKER_ANONYMOUS_MS = 30 * 60_000;
+
+/**
  * Drop the in-memory cached token so the next call mints a fresh one.
  * Safe for production use by any caller whose request was rejected with a
  * token that should no longer be trusted (e.g. member-country profile
@@ -328,6 +337,7 @@ export function resetTokenCache(): void {
   memoryToken = null;
   tokenFailedUntil = 0;
   lastInvalidatedAt = 0;
+  trackerAnonymousUntil = 0;
 }
 
 function isCachedToken(value: unknown): value is CachedToken {
@@ -369,14 +379,22 @@ export async function getAccessToken(
   auth: IvaoAuth,
   opts: { forceRefresh?: boolean } = {},
 ): Promise<string> {
+  return (await obtainToken(auth, opts)).token;
+}
+
+/** `getAccessToken`, also saying whether the token was minted by this call. */
+async function obtainToken(
+  auth: IvaoAuth,
+  opts: { forceRefresh?: boolean } = {},
+): Promise<{ token: string; minted: boolean }> {
   const now = Date.now();
   if (!opts.forceRefresh) {
-    if (memoryToken && memoryToken.expiresAt > now) return memoryToken.token;
+    if (memoryToken && memoryToken.expiresAt > now) return { token: memoryToken.token, minted: false };
 
     const stored = await readCachedToken(auth.kv);
     if (isCachedToken(stored) && stored.expiresAt > now) {
       memoryToken = stored;
-      return stored.token;
+      return { token: stored.token, minted: false };
     }
   }
 
@@ -427,7 +445,7 @@ export async function getAccessToken(
       // lifetime; only cross-isolate reuse is lost.
       console.warn(JSON.stringify({ event: 'ivao_token_cache_write_failed', error: String(err) }));
     }
-    return entry.token;
+    return { token: entry.token, minted: true };
   } catch (err) {
     tokenFailedUntil = now + TOKEN_FAIL_BACKOFF_MS;
     throw err;
@@ -445,17 +463,19 @@ export function ivaoAuthFromEnv(env: Env): IvaoAuth | undefined {
 async function authHeaders(
   auth: IvaoAuth | undefined,
   opts: { forceRefresh?: boolean } = {},
-): Promise<Record<string, string>> {
+): Promise<{ headers: Record<string, string>; minted: boolean }> {
   const headers: Record<string, string> = { accept: 'application/json' };
-  if (!auth) return headers;
+  if (!auth) return { headers, minted: false };
   try {
-    headers.authorization = `Bearer ${await getAccessToken(auth, opts)}`;
+    const { token, minted } = await obtainToken(auth, opts);
+    headers.authorization = `Bearer ${token}`;
+    return { headers, minted };
   } catch (err) {
     // Bad or temporarily unavailable credentials must not take the bot down:
     // the tracker endpoint still serves unauthenticated callers.
     console.error(JSON.stringify({ event: 'ivao_auth_failed', error: String(err) }));
   }
-  return headers;
+  return { headers, minted: false };
 }
 
 /**
@@ -472,13 +492,23 @@ export async function fetchDivisionAtc(
   /** Filled with the VIDs of every division entry, before duplicate callsigns are merged. */
   presentVids?: number[],
 ): Promise<OnlineAtc[]> {
-  const headers = await authHeaders(auth);
-  let res = await fetchBuffered(IVAO_ATC_SUMMARY_URL, { headers }, { maxBytes: IVAO_ATC_SUMMARY_MAX_BYTES });
+  const feed = (headers: Record<string, string>) =>
+    fetchBuffered(IVAO_ATC_SUMMARY_URL, { headers }, { maxBytes: IVAO_ATC_SUMMARY_MAX_BYTES });
+  // While the tracker is known to reject our tokens, skip them entirely.
+  const first = auth && trackerAnonymousUntil <= Date.now()
+    ? await authHeaders(auth)
+    : { headers: { accept: 'application/json' }, minted: false };
+  let res = await feed(first.headers);
+  const authRejected = (status: number) => status === 401 || status === 403;
+  // A rejection of a request that carried a token: its status and whether
+  // that token was minted in this call. An anonymous request's 401 or 403 is
+  // never a token problem and is not retried.
+  let rejected = first.headers.authorization && authRejected(res.status)
+    ? { status: res.status, fresh: first.minted } : undefined;
 
-  // A token rejected before its stated expiry (revoked, rotated) is worth
-  // exactly one retry with a freshly minted one — but only when we actually
-  // sent one: an anonymous request rejected with 401 is not a token problem.
-  if (res.status === 401 && auth && headers.authorization) {
+  // A cached token rejected with 401 (revoked or rotated before its stated
+  // expiry) is worth exactly one retry with a freshly minted one.
+  if (rejected && rejected.status === 401 && !rejected.fresh && auth) {
     // Drop the rejected token and count this as the invalidation window, so a
     // profile 401 right after cannot discard the token minted below.
     memoryToken = null;
@@ -490,9 +520,22 @@ export async function fetchDivisionAtc(
       // below skips reading a possibly-still-present stale KV entry anyway.
       console.warn(JSON.stringify({ event: 'ivao_token_delete_failed', error: String(err) }));
     }
-    res = await fetchBuffered(IVAO_ATC_SUMMARY_URL, {
-      headers: await authHeaders(auth, { forceRefresh: true }),
-    }, { maxBytes: IVAO_ATC_SUMMARY_MAX_BYTES });
+    const retry = await authHeaders(auth, { forceRefresh: true });
+    res = await feed(retry.headers);
+    // A failed re-mint sends the retry anonymously: its result stands.
+    rejected = retry.headers.authorization && authRejected(res.status)
+      ? { status: res.status, fresh: retry.minted } : undefined;
+  }
+  // A token minted in this call rejected with 401, or any token with 403: the
+  // tracker rejects our credentials, not a stale token. Fetch anonymously now
+  // and for TRACKER_ANONYMOUS_MS (the KV token is kept); one authenticated
+  // attempt follows the window. Logged once per window, without the body.
+  if (rejected) {
+    trackerAnonymousUntil = Date.now() + TRACKER_ANONYMOUS_MS;
+    console.warn(JSON.stringify({
+      event: 'ivao_tracker_auth_rejected', status: rejected.status, fresh: rejected.fresh, fallback: 'anonymous',
+    }));
+    res = await feed({ accept: 'application/json' });
   }
 
   if (!res.ok) {

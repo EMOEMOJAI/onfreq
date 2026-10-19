@@ -18,6 +18,7 @@ Each of these changes makes the named chunk due at once, whatever its date:
 - Webhook signing, replay or filtering change, or an IVAO webhook format change: T1-2.
 - IVAO or Discord credential handling, or token cache changes: T1-3.
 - GCA policy format, DM, history or cleanup changes: T1-4.
+- Short-session change: T1-6.
 - A new secret or config name, or a hook or privacy-check change: T1-5.
 - Throttle, alarm, health or snapshot schema changes: T2-1.
 - `runPoll`, state or roster changes, or an IVAO feed shape change: T2-2.
@@ -49,6 +50,7 @@ Each of these changes makes the named chunk due at once, whatever its date:
 | T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | 4b2c8a9 | 2026-10-18 | clean (unchanged) |
 | T1-4 | GCA reminders and member data | `src/gca.ts`, `src/retention.ts` | Policy parsing fails closed, DM reservations and dedup ledgers, history privacy, cleanup vs polling | 4b2c8a9 | 2026-10-18 | clean (unchanged) |
 | T1-5 | Secrets hygiene and privacy gates | `scripts/check-privacy.mjs`, `scripts/secret-scan.sh`, `scripts/hooks/**`, `.github/actions/**`, `.gitignore`, `.gitleaks.toml`, `.dev.vars.example`, `config/**`, `src/env.d.ts` | No real IDs or secrets in history, hook coverage, optional-secret boundaries | 04af6c6 | 2026-10-18 | clean |
+| T1-6 | Short-session reminders | `src/short-session.ts` | Presence invariants, continuity/baseline, at-most-once and daily cap, GCA interaction, retention/purge, log privacy | pending | 2026-10-19 | fixes pending |
 
 ## Tier 2 (semi-annually; due 2027-04-18)
 
@@ -89,6 +91,20 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-19 | T1-5 | P3 | `.gitignore` re-included `config/.example` and files under `config/*.example/`, unlike `privatePath`; now aligned | fd1b363 |
 | 2026-10-19 | T1-5 | P4 | Trailer-email check ignored `/@` anywhere, so `person/@domain` passed; now ignored only inside a scheme:// URL | d912d3a |
 | 2026-10-19 | T1-5 | P4 | Pre-push note missed `gitleaks:allow` lines that only a merge resolution adds; merge diffs now included, as in the scan | d912d3a |
+| 2026-10-19 | T2-1 | P2 | A trigger or webhook hint arriving during a saved poll's DM step was dropped; it now runs once, or schedules an early poll, as the throttle allows | pending |
+| 2026-10-19 | T1-6 | P3 | Short-session DM requests could start with too little budget left; each now needs 10 s (the request timeout) | pending |
+| 2026-10-19 | T1-3 | P2 | A tracker that rejected fresh tokens was retried with a new token every poll; it now falls back to anonymous reads for 30 minutes | pending |
+| 2026-10-19 | T1-5 | P3 | Pre-push did not name commits whose message carries gitleaks:allow; now named, whatever the message encoding | pending |
+| 2026-10-19 | T1-5 | P2 | No Gitleaks rule for operator Discord IDs or private JSON settings; added, with synthetic-fixture allowlists (constants and other names remain uncovered) | pending |
+| 2026-10-19 | T1-5 | P3 | Any `config/*.example` was public; now only `config/optional-secrets.example` | pending |
+| 2026-10-19 | T1-5 | P3 | The Gitleaks configuration could drop default rules (extend, path, disabledRules, top-level allowlists, CRLF); check:setup now rejects them | pending |
+| 2026-10-19 | T1-5 | P3 | `.envrc` files were neither private nor ignored | pending |
+| 2026-10-19 | T2-4 | P4 | The wrangler.jsonc secret-name comment was unchecked; check:setup now compares it with the settings | pending |
+| 2026-10-19 | T2-2 | P4 | GCA send detection assumed every request had options | pending |
+| 2026-10-19 | T1-4, T1-6 | P3 | A definitely undelivered GCA reminder suppressed short-session DMs; GCA budget comment outdated; member-list failure log now says whether a short-session failure counted | pending |
+| 2026-10-19 | T1-6 | P3 | Due and expiry used the clock rather than the recorded poll; disabling kept the member-list pause key; coverage added for limits and retries | pending |
+| 2026-10-19 | T1-6 | P4 | Deferred: the DM channel id is kept in the shared rate-limit map | pending |
+| 2026-10-19 | T1-5 | P4 | Deferred: whole-message email check; gitleaks:allow in author names or paths; a COORDINATOR_NAME or FIR_PREFIXES rule | pending |
 
 Deferred: test pool runtime older than deploy runtime (vitest-pool-workers 0.23.0 still bundles miniflare 5.20260815.0-alpha vs compatibility date 2026-08-16; bump when a matching release exists). Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 

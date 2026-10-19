@@ -621,6 +621,9 @@ export async function fetchMembersWithBackoff(
       : 'network';
     console.warn(JSON.stringify({
       event: 'gca_member_list_failed', reason, status: httpError ? err.status : 'unavailable', ...rateLimitDetail(err),
+      // Only a caller with its own deadline (short-session reminders) can make
+      // a failure that does not count towards this lookup's backoff.
+      ...(countDeadline ? {} : { counted: !(err instanceof GcaDeadlineError) }),
     }));
     // A caller with a budget of its own (short-session reminders) handles its
     // own deadline failures: they never count towards GCA's lookup backoff.
@@ -867,9 +870,10 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits
 
 /**
  * Serialized by the coordinator; copy failures never retry the member's DM.
- * `deadline` is the poll's single DM budget: one shared deadline across
- * member reminders and staff copies (and, in a poll, later DM features), as
- * independent 25s budgets could together delay the public cards by much more.
+ * `deadline` is GCA's DM budget for the poll: one shared deadline across
+ * member reminders and staff copies, as independent budgets could together
+ * delay the public cards that follow by much more. Short-session reminders
+ * run after the snapshot is saved, with a separate budget of their own.
  */
 export async function sendGcaReminders(
   env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number,

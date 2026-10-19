@@ -757,9 +757,9 @@ export async function runPoll(
   const gcaLimits = new Proxy(limits, {
     get(target, property) {
       if (property === 'fetch') {
-        return (path: string, init: RequestInit) => {
-          if (init.method === 'POST') gcaAttempted = true;
-          return target.fetch(path, init);
+        return (path: string, init?: RequestInit) => {
+          if (init?.method === 'POST') gcaAttempted = true;
+          return target.fetch(path, init ?? {});
         };
       }
       const value: unknown = Reflect.get(target, property);

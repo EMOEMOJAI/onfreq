@@ -4,12 +4,15 @@ export function privatePath(file) {
   const name = file.split('/').at(-1);
   return /(^|\/)(?:\.local|\.wrangler|node_modules)(\/|$)/.test(file) ||
     /^(?:\.env|\.dev\.vars)(?:\..*)?$/.test(name) && !['.env.example', '.dev.vars.example'].includes(name) ||
+    // Any .envrc or .envrc.* path segment, as .gitignore ignores, except a file named exactly .envrc.example.
+    file.split('/').some((part, index, parts) => /^\.envrc(?:\..*)?$/.test(part) &&
+      !(index === parts.length - 1 && part === '.envrc.example')) ||
     /(?:\.local\.(?:sh|jsonc?|md)|\.(?:pem|key|p12|pfx|log)|-secret(?:\.txt)?)$/i.test(name) ||
     /^(?:secrets\.json|poll-secret|poll-endpoint|settings\.local\.json|gitleaks-report\..*)$/.test(name) ||
     /^(?:wrangler\.local\..*|\.npmrc|\.DS_Store)$/.test(name) ||
     /^docs\/pr-audit-[^/]*\.md$/.test(file) ||
-    // config/ holds operator settings; only its top-level .example templates are public.
-    /^config\//.test(file) && !/^config\/[^/]+\.example$/.test(file);
+    // config/ holds operator settings; only the optional-settings template is public.
+    /^config\//.test(file) && file !== 'config/optional-secrets.example';
 }
 
 /** Validate every tracked Wrangler config without printing its values; TOML cannot be checked. */

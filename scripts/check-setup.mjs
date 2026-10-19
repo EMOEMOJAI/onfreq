@@ -44,6 +44,100 @@ export function validateTestBindings(vitestConfig, envTypes) {
   for (const name of [...optionalSecretNames(envTypes), ...FIRST_RUN]) assert.ok(names.has(name), `Missing test binding: ${name}`);
 }
 
+// One single-line TOML literal string, which cannot contain ''' or a newline.
+const LITERAL = String.raw`'''(?:(?!''')[^\n])*'''`;
+const BASIC = String.raw`"[^"\\\n]*"`;
+/**
+ * The only key = value shapes the Gitleaks configuration may use, per table:
+ * bare keys from a fixed list, with values of a fixed form. `regexes` may also
+ * open a multi-line array of literal strings, one per line, closed by `]`.
+ */
+const GITLEAKS_KEYS = {
+  top: { title: new RegExp(`^${BASIC}$`) },
+  extend: { useDefault: /^true$/ },
+  rules: {
+    // Only this repository's own ids: a later rule with a default or repeated
+    // id would replace that rule in Gitleaks.
+    id: /^"onfreq-[a-z0-9-]+"$/,
+    description: new RegExp(`^${BASIC}$`),
+    regex: new RegExp(`^${LITERAL}$`),
+    secretGroup: /^[0-9]$/,
+    keywords: /^\["[a-z0-9_]+"(?:, "[a-z0-9_]+")*\]$/,
+  },
+  allowlists: {
+    description: new RegExp(`^${BASIC}$`),
+    regexTarget: /^"secret"$/,
+    regexes: new RegExp(`^(?:\\[|\\[${LITERAL}(?:, ${LITERAL})*\\])$`),
+  },
+};
+const GITLEAKS_HEADERS = { '[extend]': 'extend', '[[rules]]': 'rules', '[[rules.allowlists]]': 'allowlists' };
+
+/**
+ * The Gitleaks configuration must keep the default rules and add only this
+ * repository's rules. A strict line grammar fails closed: every line is blank,
+ * a full-line comment, one of three exact table headers, or a bare key from a
+ * fixed per-table list with a value of a fixed form. Rule ids must be this
+ * repository's own (onfreq-*), unique, and each rule needs an id, regex and
+ * description. Quoted, escaped or dotted keys, inline tables, other headers
+ * (including allowlists outside a rule), duplicate keys, a missing or repeated
+ * [extend] and CRLF all fail. Errors are
+ * fixed and never quote the file.
+ */
+export function validateGitleaksConfig(text) {
+  const fail = () => assert.fail('Gitleaks configuration does not match the reviewed grammar');
+  if (text.includes('\r') || !text.endsWith('\n')) fail();
+  let section = 'top';
+  let keys = new Set();
+  let inArray = false;
+  let extend = 0;
+  let sawRule = false;
+  const ids = new Set();
+  // Each [[rules]] block needs its own id, regex and description.
+  let rule;
+  const closeRule = () => {
+    if (rule && !['id', 'regex', 'description'].every((key) => rule.has(key))) fail();
+    rule = undefined;
+  };
+  for (const line of text.slice(0, -1).split('\n')) {
+    if (inArray) {
+      if (line === ']') inArray = false;
+      else if (!new RegExp(`^  ${LITERAL},$`).test(line)) fail();
+      continue;
+    }
+    if (line === '' || line.startsWith('#')) continue;
+    if (Object.hasOwn(GITLEAKS_HEADERS, line)) {
+      section = GITLEAKS_HEADERS[line];
+      keys = new Set();
+      if (section !== 'allowlists') closeRule();
+      if (section === 'rules') rule = keys;
+      if (section === 'extend' && ++extend > 1) fail();
+      if (section === 'rules') sawRule = true;
+      if (section === 'allowlists' && !sawRule) fail();
+      continue;
+    }
+    const match = /^([A-Za-z]+) = (.+)$/.exec(line);
+    const allowed = GITLEAKS_KEYS[section];
+    if (!match || !Object.hasOwn(allowed, match[1]) || keys.has(match[1]) || !allowed[match[1]].test(match[2])) fail();
+    keys.add(match[1]);
+    if (section === 'rules' && match[1] === 'id') {
+      if (ids.has(match[2])) fail();
+      ids.add(match[2]);
+    }
+    if (match[2] === '[') inArray = true;
+  }
+  closeRule();
+  if (inArray || extend !== 1 || !text.includes('\n[extend]\nuseDefault = true\n')) fail();
+}
+
+/** The secret-name comment in wrangler.jsonc lists exactly the optional and first-run secrets. */
+export function validateWranglerSecretNames(text, envTypes) {
+  const lines = text.split('\n').filter((line) => /^ {2}\/\/ {3}[A-Z]/.test(line));
+  const listed = lines.flatMap((line) => line.match(/[A-Z][A-Z0-9_]*/g) ?? []);
+  assert.equal(new Set(listed).size, listed.length, 'Duplicate secret name in wrangler.jsonc');
+  assert.deepEqual([...listed].sort(), [...new Set([...optionalSecretNames(envTypes), ...FIRST_RUN])].sort(),
+    'wrangler.jsonc secret-name comment must list exactly the optional and first-run secrets');
+}
+
 export function validateSetup(config, pkg, examples) {
   assert.deepEqual(publicConfig(config), [], 'Public configuration contains operator settings');
   assert.deepEqual(config.kv_namespaces, [{ binding: 'ATC_STATE', id: '0'.repeat(32) }]);
@@ -134,10 +228,12 @@ if (isMain(import.meta.url)) {
     const envTypes = readIndexed('src/env.d.ts').toString();
     validateOptionalSecrets(readIndexed('config/optional-secrets.example').toString(), envTypes);
     validateTestBindings(readIndexed('vitest.config.ts').toString(), envTypes);
+    validateWranglerSecretNames(readIndexed('wrangler.jsonc').toString(), envTypes);
+    validateGitleaksConfig(readIndexed('.gitleaks.toml').toString());
     testDeployGuard(readIndexed('scripts/check-deploy.mjs'), pkg.scripts.deploy);
     console.log('Deployment setup checks passed');
   } catch {
-    console.error('Deployment setup check failed; inspect public configuration, prompts, optional settings, test bindings, hooks and deploy guard locally');
+    console.error('Deployment setup check failed; inspect public configuration, prompts, optional settings, test bindings, Gitleaks settings, hooks and deploy guard locally');
     process.exitCode = 1;
   }
 }

@@ -1168,3 +1168,108 @@ test('privacy checks reject private emails in commit trailers, allowing noreply 
     assert.doesNotMatch(result.stderr + result.stdout, /person@example/);
   }
 });
+
+test('pre-push names commits whose message carries gitleaks:allow, however encoded (ROT-1)', (t) => {
+  const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
+  const f = fixture(t);
+  let base = f.head;
+  let n = 0;
+  const commit = (message, { file = 'public.txt', text, config = [] } = {}) => {
+    writeFileSync(join(f.repo, file), text ?? `change ${++n}\n`);
+    f.git('add', file);
+    f.git(...config, 'commit', '--quiet', '--no-verify', '-m', message);
+    return [f.git('rev-parse', 'HEAD'), f.git('log', '-1', '--encoding=none', '--format=%h')];
+  };
+  const pushNew = (oid) => {
+    const result = f.push([ref(oid, 'refs/heads/main', base)]);
+    base = oid;
+    assert.equal(result.status, 0, result.stderr);
+    return result;
+  };
+  // Message only, in any case.
+  let [oid, short] = commit('synthetic change\n\nGitleaks:Allow');
+  assert.match(pushNew(oid).stderr, note(short));
+  // A UTF-16 encoding header, then a UTF-16 log output encoding, cannot hide it.
+  [oid, short] = commit('synthetic gitleaks:allow', { config: ['-c', 'i18n.commitEncoding=UTF-16'] });
+  assert.match(pushNew(oid).stderr, note(short));
+  f.git('config', 'i18n.logOutputEncoding', 'UTF-16');
+  [oid, short] = commit('synthetic gitleaks:allow again');
+  assert.match(pushNew(oid).stderr, note(short));
+  f.git('config', '--unset', 'i18n.logOutputEncoding');
+  // A merge carrying it in its message.
+  f.git('checkout', '--quiet', '-b', 'side');
+  commit('side change', { file: 'side.txt' });
+  f.git('checkout', '--quiet', 'main');
+  f.git('merge', '--quiet', '--no-ff', '--no-verify', '-m', 'merge side gitleaks:allow', 'side');
+  const merge = f.git('rev-parse', 'HEAD');
+  const mergeShort = f.git('log', '-1', '--format=%h');
+  const sideShort = f.git('log', '-1', '--format=%h', 'side');
+  const mergeResult = pushNew(merge);
+  assert.match(mergeResult.stderr, note(mergeShort));
+  assert.doesNotMatch(mergeResult.stderr, new RegExp(sideShort));
+  // In both the message and the diff: named once.
+  [oid, short] = commit('both gitleaks:allow', { file: 'allowed.txt', text: 'x = 1 # gitleaks:allow\n' });
+  assert.match(pushNew(oid).stderr, note(short));
+  // A plain commit is not named.
+  [oid] = commit('plain');
+  assert.doesNotMatch(pushNew(oid).stderr, /note/);
+});
+
+test('pre-push prints the could-not-check note when the message search fails (ROT-1)', (t) => {
+  const f = fixture(t);
+  const realGit = spawnSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  writeFileSync(join(f.repo, '..', 'bin', 'git'), `#!/bin/sh
+for arg in "$@"; do case "$arg" in --grep=*) exit 1 ;; esac; done
+exec ${realGit} "$@"
+`, { mode: 0o700 });
+  const result = f.push([ref(f.head)]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /^pre-push: note — could not check the pushed commits for Gitleaks settings changes or gitleaks:allow\.$/m);
+});
+
+// ROT-1: operator Discord IDs and private JSON settings. Values are built at
+// runtime so this file never holds an assignment the rules would flag.
+const realShaped = ['7341258963', '14752089'].join('');
+const otherReal = ['8862014473', '20518630'].join('');
+
+test('the repository Gitleaks rules block real-shaped Discord IDs and private JSON literals, redacted (ROT-1)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const blocked = (text, secret, label) => {
+      const { hook, scan } = scanAssignment(f, text);
+      for (const result of hook) {
+        assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+        assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret), label);
+      }
+      assert.equal(scan.status, 1, `${label}: ${scan.stderr}`);
+      assert.doesNotMatch(scan.stderr + scan.stdout, new RegExp(secret), label);
+    };
+    for (const name of ['MENTION_ROLE_ID', 'GCA_DISCORD_GUILD_ID', 'GCA_MEMBER_ROLE_ID', 'GCA_VERIFIED_ROLE_ID',
+      'GCA_COPY_USER_ID', 'DISCORD_CHANNEL_IDS']) blocked(assignment(name, realShaped), realShaped, name);
+    blocked(assignment('DISCORD_CHANNEL_IDS', `900000000000000001,${otherReal}`), otherReal, 'mixed list');
+    const vid = ['73', '4125'].join('');
+    for (const name of ['GCA_REGIONS', 'GCA_APPROVALS', 'GCA_HOME_OVERRIDES', 'FIR_LABELS']) {
+      blocked(`${name}='{"${vid}":"AC"}'\n`, vid, name);
+    }
+    // Setting names match in any case.
+    const lower = (name) => name.toLowerCase();
+    blocked(assignment(lower('GCA_MEMBER_ROLE_ID'), realShaped), realShaped, 'lowercase ID name');
+    blocked(`${lower('GCA_HOME_OVERRIDES')}='{"${vid}":"AC"}'\n`, vid, 'lowercase JSON name');
+  });
+
+test('the repository Gitleaks rules pass synthetic IDs, empty values, references and expressions (ROT-1)',
+  { skip: !hasGitleaks && 'gitleaks is not installed' }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const reference = (name) => `${name}: env.${name},\n`;
+    const text = assignment('GCA_MEMBER_ROLE_ID', '100000000000000002')
+      + assignment('DISCORD_CHANNEL_IDS', '900000000000000001,900000000000000002')
+      + assignment('MENTION_ROLE_ID', '') + assignment('GCA_COPY_USER_ID', '200000000000000099')
+      + `GCA_APPROVALS='{}'\nFIR_LABELS='[]'\n` + reference('GCA_DISCORD_GUILD_ID') + 'GCA_VERIFIED_ROLE_ID: VERIFIED,\n'
+      + "GCA_REGIONS: JSON.stringify({ AA: { name: 'Example', prefixes: ['XA'] } }),\n"
+      + `GCA_HOME_OVERRIDES: '{"600001":"ZZ"}',\n`;
+    const { hook, scan } = scanAssignment(f, text);
+    for (const result of hook) assert.equal(result.status, 0, result.stderr);
+    assert.equal(scan.status, 0, scan.stderr);
+  });

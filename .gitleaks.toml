@@ -25,3 +25,41 @@ regexes = [
   '''^\$\{btoa\(\w+\)\}\.synthetic\.token$''',
   '''^env\.[A-Z][A-Z0-9_]*,?$''',
 ]
+
+# Operator Discord IDs: only lists of real-shaped snowflakes (15-20 digits) are
+# flagged, under the setting name in any case, so names, references and empty values pass. Synthetic fixtures are a
+# nonzero digit, eight or more zeros and one to three digits, for every item.
+[[rules]]
+id = "onfreq-discord-id-assignment"
+description = "onfreq Discord ID setting assigned a snowflake list"
+regex = '''\b(?i:MENTION_ROLE_ID|GCA_DISCORD_GUILD_ID|GCA_MEMBER_ROLE_ID|GCA_VERIFIED_ROLE_ID|GCA_COPY_USER_ID|DISCORD_CHANNEL_IDS)\b["']?\s*[=:]\s*["'`]?(\d{15,20}(?:\s*,\s*\d{15,20})*)'''
+secretGroup = 1
+keywords = ["mention_role_id", "gca_discord_guild_id", "gca_member_role_id", "gca_verified_role_id", "gca_copy_user_id", "discord_channel_ids"]
+
+[[rules.allowlists]]
+description = "Synthetic snowflakes only, across the whole list"
+regexTarget = "secret"
+regexes = ['''^[1-9]0{8,}[0-9]{1,3}(?:\s*,\s*[1-9]0{8,}[0-9]{1,3})*$''']
+
+# Private policy and label JSON: a JSON object or array literal assigned to one
+# of these names is flagged, up to its closing bracket before a quote or the
+# end of the line. Expressions such as JSON.stringify(...) are not literals.
+[[rules]]
+id = "onfreq-json-setting-assignment"
+description = "onfreq private JSON setting assigned a literal"
+regex = '''(?m)\b(?i:GCA_REGIONS|GCA_APPROVALS|GCA_HOME_OVERRIDES|FIR_LABELS)\b["']?\s*[=:]\s*["'`]?([\[{][^\n]*?[\]}])(?:["'`]|\s*$)'''
+secretGroup = 1
+keywords = ["gca_regions", "gca_approvals", "gca_home_overrides", "fir_labels"]
+
+[[rules.allowlists]]
+description = "Empty JSON and exact published synthetic fixtures"
+regexTarget = "secret"
+regexes = [
+  '''^\{\}$''',
+  '''^\[\]$''',
+  '''^\{"600001":"ZZ"\}$''',
+]
+
+# Known limits: values held in constants or variables under other names, and
+# files that never write these setting names next to their values, are not
+# covered; check:privacy and review still apply.

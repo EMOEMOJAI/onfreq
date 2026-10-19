@@ -55,7 +55,7 @@ The public `npm run deploy` command runs `wrangler deploy --config wrangler.json
 | --- | --- |
 | `FIR_LABELS`, `EXCLUDED_CALLSIGNS` | Optional private roster labels and excluded positions |
 | `MENTION_ROLE_ID`, `MENTION_COOLDOWN_MINUTES` | Optional role ID pinged for new cards, at most once per channel per cooldown (default 10 minutes; `0` means once per poll) |
-| `IVAO_CLIENT_ID`, `IVAO_CLIENT_SECRET` | IVAO API authentication and member-country lookups |
+| `IVAO_CLIENT_ID`, `IVAO_CLIENT_SECRET` | IVAO API authentication and member-country lookups; if the tracker rejects the bot's token, the feed is read anonymously for 30 minutes (`ivao_tracker_auth_rejected`) |
 | `GCA_DM_ENABLED` | Enables optional reminders when set to `true` |
 | `GCA_DISCORD_GUILD_ID`, `GCA_MEMBER_ROLE_ID` | Limits reminders to eligible members; enable Discord **Server Members Intent** |
 | `GCA_VERIFIED_ROLE_ID` | Optional but strongly recommended staff-only role a member must also hold before their nickname VID is trusted, for GCA and short-session reminders |

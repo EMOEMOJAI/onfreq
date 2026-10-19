@@ -1,6 +1,7 @@
 import { EMBED_FOOTER } from './config';
 import { escapeMarkdown, isSnowflake, type DiscordEmbed } from './discord';
 import type { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
+import { REQUEST_TIMEOUT_MS } from './http';
 import {
   BACKOFF_KEY, classifyDeliveryFailure, discordJson, GcaDeadlineError, indexMemberVids, openDm, readBackoff,
   sharedMembers, type MemberListCache,
@@ -255,7 +256,7 @@ export async function maintainShortSessions(storage: DurableObjectStorage, nowIs
       if (tables.includes(REMINDERS)) reminderRetention(sql, Date.parse(nowIso));
     });
   }
-  const keys = [RECORDED_KEY, ...OLD_KEYS];
+  const keys = [RECORDED_KEY, ...OLD_KEYS, MEMBER_LIST_KEY];
   if ((await storage.get(keys)).size) await storage.delete(keys);
 }
 
@@ -319,16 +320,20 @@ export async function sendShortSessionReminders(
     return;
   }
   const now = Date.now();
+  // Due and expiry follow the poll the online records describe, not the clock.
+  const pollAt = handoff.stateAtMs;
   const due = sql.exec<ReminderRow>(`SELECT session_key, user_id, callsign, online_since, ended_at, duration_minutes,
     attempts, expires_at FROM ${REMINDERS}
     WHERE status = 'pending' AND due_at <= ? AND retry_at <= ? AND attempts < ?
-    ORDER BY due_at, rowid LIMIT 50`, now, now, MAX_ATTEMPTS).toArray();
+    ORDER BY due_at, rowid LIMIT 50`, pollAt, now, MAX_ATTEMPTS).toArray();
   if (!due.length) return;
   const present = new Set(handoff.presentVids);
   // A feed suddenly much smaller than the tracked state cannot show who is still online.
   const feedShrunk = handoff.trackedBefore >= 4 && handoff.current < handoff.trackedBefore / 2;
   // Read-only: this path never creates or writes any GCA table.
-  const gcaTable = existingTables(sql, ['gca_reminders']).length > 0;
+  const gcaTables = existingTables(sql, ['gca_reminders', 'gca_occurrences']);
+  const gcaTable = gcaTables.includes('gca_reminders');
+  const gcaOccurrences = gcaTables.includes('gca_occurrences');
   const finish = (key: string, status: string) => {
     sql.exec(`UPDATE ${REMINDERS} SET status = ? WHERE session_key = ?`, status, key);
     console.log(JSON.stringify({ event: 'short_session_skipped', reason: status }));
@@ -336,7 +341,7 @@ export async function sendShortSessionReminders(
   let index: Map<number, string> | undefined;
   let sends = 0;
   for (const row of due) {
-    if (now > row.expires_at) { finish(row.session_key, 'expired'); continue; }
+    if (pollAt > row.expires_at) { finish(row.session_key, 'expired'); continue; }
     // Online now, or online at any recorded poll since the presence ended.
     const online = sql.exec<{ missing_since: number | null }>(
       `SELECT missing_since FROM ${ONLINE} WHERE user_id = ?`, row.user_id).toArray()[0];
@@ -346,9 +351,12 @@ export async function sendShortSessionReminders(
     }
     if (feedShrunk) continue;
     // A GCA reminder possibly delivered to this member during this presence
-    // already told them about it.
-    if (gcaTable && sql.exec(`SELECT 1 FROM gca_reminders WHERE session_key LIKE ? AND last_seen >= ?
-      AND status IN ('sent', 'reserved', 'failed') LIMIT 1`, `${row.user_id}:%`, row.online_since).toArray().length) {
+    // already told them about it. A failed one possibly delivered only if it
+    // kept its occurrence (GCA releases it on a definite non-delivery).
+    if (gcaTable && sql.exec(`SELECT 1 FROM gca_reminders r WHERE r.session_key LIKE ? AND r.last_seen >= ?
+      AND (r.status IN ('sent', 'reserved') OR (r.status = 'failed' AND ${gcaOccurrences
+        ? 'EXISTS (SELECT 1 FROM gca_occurrences o WHERE o.session_key = r.session_key)' : '1'})) LIMIT 1`,
+    `${row.user_id}:%`, row.online_since).toArray().length) {
       finish(row.session_key, 'skipped_gca');
       continue;
     }
@@ -360,7 +368,8 @@ export async function sendShortSessionReminders(
     }
     // Never two kinds of DM from this bot in one poll.
     if (handoff.gcaAttempted) break;
-    if (sends >= MAX_SENDS_PER_POLL || Date.now() >= deadline) break;
+    // Each Discord request may take up to REQUEST_TIMEOUT_MS: only start one that can finish in budget.
+    if (sends >= MAX_SENDS_PER_POLL || deadline - Date.now() < REQUEST_TIMEOUT_MS) break;
     if (await readBackoff(storage, BACKOFF_KEY, Date.now()) > Date.now()) break;
     if (!index) {
       // A lookup of its own needs time to finish within this budget.
@@ -387,11 +396,13 @@ export async function sendShortSessionReminders(
     }
     const recipient = index.get(row.user_id);
     if (!recipient) { finish(row.session_key, 'unmapped'); continue; }
+    // Checked again here: the member lookup above may have used the budget.
+    if (deadline - Date.now() < REQUEST_TIMEOUT_MS) break;
     sends++;
     let messageAttempted = false;
     try {
       const channelId = await openDm(limits, env.DISCORD_BOT_TOKEN, recipient);
-      if (Date.now() >= deadline) break;
+      if (deadline - Date.now() < REQUEST_TIMEOUT_MS) break;
       sql.exec(`UPDATE ${REMINDERS} SET status = 'reserved', attempts = attempts + 1 WHERE session_key = ?`,
         row.session_key);
       await storage.sync();

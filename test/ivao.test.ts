@@ -781,16 +781,19 @@ describe('fetchDivisionAtc', () => {
     expect(invalidateCachedToken()).toBe(false);
   });
 
-  it('surfaces a second consecutive 401 instead of retrying forever', async () => {
+  it('falls back to one anonymous request when a freshly minted token is also rejected, instead of retrying forever', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
       .mockResolvedValueOnce(Response.json({ access_token: 'fresh', expires_in: 1800 }))
-      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(Response.json([rawEntry()]));
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(fetchDivisionAtc(['QC'], auth(kv))).rejects.toThrow('IVAO API responded with 401');
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect((fetchMock.mock.calls[3]?.[1]?.headers as Record<string, string>).authorization).toBeUndefined();
   });
 
   it('does not retry a 401 on an anonymous request, since it cannot be a token problem', async () => {
@@ -834,5 +837,165 @@ describe('fetchDivisionAtc', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+  });
+
+  describe('tracker authentication rejected (ROT-1)', () => {
+    const feedUrl = 'https://api.ivao.aero/v2/tracker/now/atc/summary';
+    const tokenUrl = 'https://api.ivao.aero/v2/oauth/token';
+    let now: number;
+    let warn: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      now = Date.parse('2026-10-01T10:00:00Z');
+      vi.spyOn(Date, 'now').mockImplementation(() => now);
+      warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+    });
+    const headersOf = (call: unknown[] | undefined) => (call?.[1] as RequestInit | undefined)?.headers as Record<string, string>;
+    const urls = (mock: ReturnType<typeof vi.fn>) => mock.mock.calls.map(([url]) => String(url));
+    const rejectedLogs = () => warn.mock.calls.map((call: unknown[]) => String(call[0])).filter((line: string) => line.includes('ivao_tracker_auth_rejected'));
+    /** Opens the anonymous window: a token minted in this call is rejected with 401. */
+    async function openWindow(kv: ReturnType<typeof fakeKv>) {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(Response.json({ access_token: 'fresh-token-value', expires_in: 1800 }))
+        .mockResolvedValueOnce(new Response('unauthorized body', { status: 401 }))
+        .mockResolvedValueOnce(Response.json([rawEntry()]));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+      return fetchMock;
+    }
+
+    it('a fresh-token 401 makes exactly one anonymous request, logged once without secrets', async () => {
+      const fetchMock = await openWindow(fakeKv());
+      expect(urls(fetchMock)).toEqual([tokenUrl, feedUrl, feedUrl]);
+      expect(headersOf(fetchMock.mock.calls[1]).authorization).toBe('Bearer fresh-token-value');
+      expect(headersOf(fetchMock.mock.calls[2]).authorization).toBeUndefined();
+      expect(rejectedLogs()).toEqual([JSON.stringify({
+        event: 'ivao_tracker_auth_rejected', status: 401, fresh: true, fallback: 'anonymous',
+      })]);
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/fresh-token-value|unauthorized body/);
+    });
+
+    it('inside the window, each poll makes one anonymous feed request and no token, mint or KV work', async () => {
+      const kv = fakeKv();
+      await openWindow(kv);
+      for (const mock of [kv.get, kv.put, kv.delete]) mock.mockClear();
+      const fetchMock = vi.fn().mockImplementation(async () => Response.json([rawEntry()]));
+      vi.stubGlobal('fetch', fetchMock);
+      for (let poll = 0; poll < 5; poll++) {
+        now += 5 * 60_000;
+        await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+      }
+      expect(urls(fetchMock)).toEqual(Array(5).fill(feedUrl));
+      for (const call of fetchMock.mock.calls) expect(headersOf(call).authorization).toBeUndefined();
+      expect([kv.get.mock.calls.length, kv.put.mock.calls.length, kv.delete.mock.calls.length]).toEqual([0, 0, 0]);
+      expect(rejectedLogs()).toHaveLength(1);
+    });
+
+    it('after the window, makes one authenticated attempt', async () => {
+      const kv = fakeKv();
+      await openWindow(kv);
+      now += 30 * 60_000 + 1;
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(Response.json({ access_token: 'next-token-value', expires_in: 1800 }))
+        .mockResolvedValueOnce(Response.json([rawEntry()]));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+      expect(urls(fetchMock)).toEqual([tokenUrl, feedUrl]);
+      expect(headersOf(fetchMock.mock.calls[1]).authorization).toBe('Bearer next-token-value');
+    });
+
+    it('a profile 401 does not make the tracker go anonymous', async () => {
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'cached', expiresAt: now + 600_000 } });
+      expect(invalidateCachedToken()).toBe(true);
+      const fetchMock = vi.fn().mockResolvedValue(Response.json([rawEntry()]));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+      expect(headersOf(fetchMock.mock.calls[0]).authorization).toBe('Bearer cached');
+      expect(rejectedLogs()).toEqual([]);
+    });
+
+    it('a 403 with a cached token makes one anonymous retry and keeps the KV token', async () => {
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'cached', expiresAt: now + 600_000 } });
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(new Response('forbidden', { status: 403 }))
+        .mockResolvedValueOnce(Response.json([rawEntry()]));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+      expect(urls(fetchMock)).toEqual([feedUrl, feedUrl]);
+      expect(headersOf(fetchMock.mock.calls[1]).authorization).toBeUndefined();
+      expect(kv.delete).not.toHaveBeenCalled();
+      expect(kv.store.has('ivao-token-v1')).toBe(true);
+      expect(rejectedLogs()).toEqual([JSON.stringify({
+        event: 'ivao_tracker_auth_rejected', status: 403, fresh: false, fallback: 'anonymous',
+      })]);
+    });
+
+    it.each([401, 403])('a %s on an anonymous request is not retried and throws, inside the window too', async (status) => {
+      let fetchMock = vi.fn().mockResolvedValue(new Response('denied', { status }));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(fetchDivisionAtc(['QC'])).rejects.toThrow(`IVAO API responded with ${status}`);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await openWindow(fakeKv());
+      fetchMock = vi.fn().mockResolvedValue(new Response('denied', { status }));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(fetchDivisionAtc(['QC'], auth(fakeKv()))).rejects.toThrow(`IVAO API responded with ${status}`);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('an anonymous payload missing userId still throws as an outage', async () => {
+      const { userId: _missing, ...noUser } = rawEntry();
+      vi.stubGlobal('fetch', vi.fn()
+        .mockResolvedValueOnce(Response.json({ access_token: 'fresh-token-value', expires_in: 1800 }))
+        .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+        .mockResolvedValueOnce(Response.json([noUser, noUser])));
+      await expect(fetchDivisionAtc(['QC'], auth(fakeKv()))).rejects.toThrow('treating as feed outage');
+    });
+
+    it('makes at most five subrequests in the worst case', async () => {
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: now + 600_000 } });
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+        .mockResolvedValueOnce(Response.json({ access_token: 'fresh-token-value', expires_in: 1800 }))
+        .mockResolvedValueOnce(new Response('forbidden', { status: 403 }))
+        .mockResolvedValueOnce(new Response('unavailable', { status: 503 }));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(fetchDivisionAtc(['QC'], auth(kv))).rejects.toThrow('IVAO API responded with 503');
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(5);
+      expect(urls(fetchMock)).toEqual([feedUrl, tokenUrl, feedUrl, feedUrl]);
+    });
+
+    it('an anonymous retry after a tracker 401 when the re-mint fails stands, without opening a window', async () => {
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: now + 600_000 } });
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+        .mockResolvedValueOnce(new Response('mint failed', { status: 500 }))
+        .mockResolvedValueOnce(Response.json([rawEntry()]));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+      expect(urls(fetchMock)).toEqual([feedUrl, tokenUrl, feedUrl]);
+      expect(headersOf(fetchMock.mock.calls[2]).authorization).toBeUndefined();
+      expect(rejectedLogs()).toEqual([]);
+    });
+  });
+
+  it('fills presentVids with every division VID before duplicate callsigns merge, and nothing on failure', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const entries = [
+      rawEntry({ id: 1, userId: 501, callsign: 'QCAA_TWR' }),
+      rawEntry({ id: 2, userId: 502, callsign: 'XAAA_TWR' }),
+      rawEntry({ id: 3, userId: -5, callsign: 'QCBB_TWR' }),
+      rawEntry({ id: 5, userId: 503, callsign: 'QCCC_TWR' }),
+      rawEntry({ id: 6, userId: 504, callsign: 'QCCC_TWR' }),
+      rawEntry({ id: 7, userId: 505, callsign: 'XABB_TWR' }),
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
+    const presentVids: number[] = [];
+    const result = await fetchDivisionAtc(['QC'], undefined, presentVids);
+    expect(result.map((atc) => atc.userId).sort()).toEqual([501, 504]);
+    expect(presentVids.sort()).toEqual([501, 503, 504]);
+    const failed: number[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('down', { status: 503 })));
+    await expect(fetchDivisionAtc(['QC'], undefined, failed)).rejects.toThrow('503');
+    expect(failed).toEqual([]);
   });
 });

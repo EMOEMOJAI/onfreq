@@ -8,8 +8,8 @@ import { spawnSync } from 'node:child_process';
 import { diffTreeRows, fileErrors, imagePrivacy, privateCommitEmails, privatePath, publicConfig, rangeArgs,
   wranglerConfigErrors } from './check-privacy.mjs';
 import { checkExternalLinks, checkLocalLinks, documentLinks } from './check-links.mjs';
-import { isolatedEnv, optionalSecretNames, testDeployGuard, validateHooks, validateOptionalSecrets, validateSetup,
-  validateTestBindings } from './check-setup.mjs';
+import { isolatedEnv, optionalSecretNames, testDeployGuard, validateGitleaksConfig, validateHooks, validateOptionalSecrets,
+  validateSetup, validateTestBindings, validateWranglerSecretNames } from './check-setup.mjs';
 import { isMain, jsonc } from './repo-files.mjs';
 import { CONFIG, lintDocs } from './lint-docs.mjs';
 
@@ -19,9 +19,10 @@ test('rejects private paths independently of gitignore, allowing public template
     'set-secrets.local.sh', '.local/report.txt', '.wrangler/state.db', 'poll-secret', 'poll-endpoint',
     'key.pem', 'private.key', 'trace.log', '.claude/settings.local.json', '.DS_Store', 'assets/.DS_Store',
     'docs/pr-audit-2026-09.md', 'docs/pr-audit-.md', 'config/optional-secrets', 'config/production.env',
-    'config/optional-secrets.example.bak', 'config/nested/settings.example', 'config/.example']) assert.equal(privatePath(file), true, file);
-  for (const file of ['.dev.vars.example', '.env.example', 'wrangler.jsonc', 'config/optional-secrets.example',
-    'config/other.example', 'nested/config/settings.json', 'docs/setup.md', 'docs/pr-audit.md',
+    'config/optional-secrets.example.bak', 'config/nested/settings.example', 'config/.example', 'config/other.example',
+    '.envrc', 'nested/.envrc', '.envrc.local', '.envrc.d/x', '.envrc/x', '.envrc.example/x']) assert.equal(privatePath(file), true, file);
+  for (const file of ['.dev.vars.example', '.env.example', '.envrc.example', 'nested/.envrc.example', 'wrangler.jsonc', 'config/optional-secrets.example',
+    'nested/config/settings.json', 'docs/setup.md', 'docs/pr-audit.md',
     'nested/docs/pr-audit-notes.md', 'docs/pr-audit-notes.txt']) {
     assert.equal(privatePath(file), false, file);
   }
@@ -34,7 +35,10 @@ test('.gitignore ignores exactly the config/ paths privatePath treats as private
   assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: repo, env }).status, 0);
   copyFileSync(new URL('../.gitignore', import.meta.url), join(repo, '.gitignore'));
   for (const [file, ignored] of [['config/.example', true], ['config/optional-secrets.example', false],
-    ['config/x.example', false], ['config/a.example/file', true]]) {
+    ['config/x.example', true], ['config/a.example/file', true], ['config/optional-secrets.example/file', true],
+    ['config/optional-secrets.example.bak', true], ['.envrc', true], ['nested/.envrc', true], ['.envrc.local', true],
+    ['.envrc.example', false], ['nested/.envrc.example', false], ['.envrc.d/x', true], ['.envrc/x', true],
+    ['.envrc.example/x', true]]) {
     const status = spawnSync('git', ['check-ignore', '--no-index', '-q', file], { cwd: repo, env }).status;
     assert.equal(status, ignored ? 0 : 1, file);
     assert.equal(privatePath(file), ignored, file);
@@ -568,4 +572,57 @@ test('docs lint CLI exits 1 with a message on refusals', () => {
     { cwd: new URL('..', import.meta.url), encoding: 'utf8' });
   assert.equal(run.status, 1);
   assert.match(run.stderr, /^Markdown lint: missing-lint-docs-fixture\.md: missing file$/m);
+});
+
+test('the Gitleaks configuration keeps the default rules and cannot be bypassed (ROT-1)', () => {
+  const canonical = readFileSync(new URL('../.gitleaks.toml', import.meta.url), 'utf8');
+  validateGitleaksConfig(canonical);
+  const block = '[extend]\nuseDefault = true\n';
+  for (const [label, changed] of [
+    ['missing block', canonical.replace(block, '')],
+    ['useDefault false', canonical.replace(block, '[extend]\nuseDefault = false\n')],
+    ['spaced header', canonical.replace(block, '[ extend ]\nuseDefault = true\n')],
+    ['quoted header', canonical.replace(block, '["extend"]\nuseDefault = true\n')],
+    ['duplicate block', `${canonical}\n${block}`],
+    ['dotted key', `${canonical}\nextend.useDefault = false\n`],
+    ['inline table', canonical.replace(block, 'extend = { useDefault = true }\n')],
+    ['extend path', canonical.replace(block, `${block}path = "other.toml"\n`)],
+    ['disabled rules', canonical.replace(block, `${block}disabledRules = ["generic-api-key"]\n`)],
+    ['rule path', `${canonical}\n[[rules]]\nid = "x"\npath = '''x'''\n`],
+    ['CRLF', canonical.replace(/\n/g, '\r\n')],
+    ['top-level allowlist', `${canonical}\n[allowlist]\nregexes = ['''.*''']\n`],
+    ['top-level allowlists', `${canonical}\n[[allowlists]]\nregexes = ['''.*''']\n`],
+    // Accepted by an earlier denylist check and honoured by Gitleaks 8.30.1.
+    ['dotted allowlist before the first table', canonical.replace('title = "onfreq"\n', `title = "onfreq"\nallowlist.regexes = ['''.*''']\n`)],
+    ['inline allowlist', `${canonical}allowlist = { regexes = ['''.*'''] }\n`],
+    ['quoted escaped header', `${canonical}\n["\\u0061llowlist"]\nregexes = ['''.*''']\n`],
+    ['escaped key in [extend]', canonical.replace(block, `${block}# note\n"disabled\\u0052ules" = ["generic-api-key"]\n`)],
+    // Other shapes outside the grammar.
+    ['unknown rule key', canonical.replace('secretGroup = 1\n', 'secretGroup = 1\nentropy = 3.5\n')],
+    ['duplicate key', canonical.replace('secretGroup = 1\n', 'secretGroup = 1\nsecretGroup = 1\n')],
+    ['multi-line literal string', canonical.replace(/^regex = '''/m, "regex = '''\n")],
+    ['other regexTarget', canonical.replace('regexTarget = "secret"', 'regexTarget = "line"')],
+    ['trailing comment', canonical.replace('useDefault = true\n', 'useDefault = true # note\n')],
+    ['allowlist before any rule', canonical.replace('[[rules]]', '[[rules.allowlists]]\n\n[[rules]]')],
+    ['unterminated array', `${canonical}\n[[rules]]\nid = "x"\n[[rules.allowlists]]\nregexes = [\n`],
+    ['missing final newline', canonical.trimEnd()],
+    // A later rule with an existing id replaces that rule in Gitleaks 8.30.1.
+    ['default rule replaced', `${canonical}\n[[rules]]\nid = "generic-api-key"\ndescription = "x"\nregex = '''a^'''\n\n[[rules.allowlists]]\nregexes = ['''.*''']\n`],
+    ['repository and default rules replaced', `${canonical}\n[[rules]]\nid = "onfreq-discord-id-assignment"\ndescription = "x"\nregex = '''a^'''\n\n[[rules]]\nid = "discord-client-id"\ndescription = "x"\nregex = '''a^'''\n`],
+    ['duplicate onfreq- id', `${canonical}\n[[rules]]\nid = "onfreq-secret-assignment"\ndescription = "x"\nregex = '''a^'''\n`],
+    ['rule without an id', `${canonical}\n[[rules]]\ndescription = "x"\nregex = '''a^'''\n`],
+    ['rule without a regex', `${canonical}\n[[rules]]\nid = "onfreq-extra"\ndescription = "x"\n`],
+  ]) assert.throws(() => validateGitleaksConfig(changed), undefined, label);
+});
+
+test('the wrangler.jsonc secret-name comment lists exactly the optional and first-run secrets (ROT-1)', () => {
+  const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  const wrangler = read('../wrangler.jsonc');
+  const envTypes = read('../src/env.d.ts');
+  validateWranglerSecretNames(wrangler, envTypes);
+  assert.throws(() => validateWranglerSecretNames(wrangler.replace('SHORT_SESSION_DM_ENABLED, ', ''), envTypes));
+  assert.throws(() => validateWranglerSecretNames(wrangler.replace('COORDINATOR_NAME', 'COORDINATOR_NAME, EXTRA_NAME'), envTypes));
+  assert.throws(() => validateWranglerSecretNames(wrangler.replace('COORDINATOR_NAME', 'COORDINATOR_NAME, POLL_SECRET'), envTypes));
+  assert.throws(() => validateWranglerSecretNames(wrangler, envTypes.replace('  COORDINATOR_NAME?: string;',
+    '  COORDINATOR_NAME?: string;\n  SYNTHETIC_SETTING?: string;')));
 });
