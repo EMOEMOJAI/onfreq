@@ -28,7 +28,10 @@ import {
   newestCardedSession, offlineEventFor,
 } from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
-import { gcaMismatch, gcaRemindersEnabled, parseGcaPolicy, sendGcaReminders, type GcaPolicy } from './gca';
+import {
+  gcaMismatch, gcaRemindersEnabled, parseGcaPolicy, sendGcaReminders, type GcaPolicy, type MemberListCache,
+} from './gca';
+import { recordShortSessions, sendShortSessionReminders, shortSessionConfig, trustedStateAt } from './short-session';
 import { channelIndex, mayHavePosted, nextBudget, syncRosterMessages, type RosterTarget } from './roster';
 import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
 import type {
@@ -677,7 +680,12 @@ export interface RunPollOptions {
   previousRosterPostAttempts?: RosterPostAttempt[];
   previousPendingOffline?: PendingOffline[];
   previousRolePings?: Record<string, number>;
+  /** ISO time of the poll that saved `stored`; absent in older snapshots. */
+  previousStateAt?: string;
 }
+
+/** Every DM feature in a poll shares this budget, so together they cannot hold the poll longer. */
+const DM_BUDGET_MS = 25_000;
 
 /** Called only by the coordinator; all network and notification work is one poll. */
 export async function runPoll(
@@ -731,9 +739,14 @@ export async function runPoll(
   await enrichMemberCountries(current, prev, auth);
   const gcaPolicy = parseGcaPolicy(env);
 
+  // Optional short-session reminders: the feature's config is checked once
+  // per poll, and invalid IDs disable it (logged) without affecting cards.
+  const shortSession = storage ? shortSessionConfig(env) : null;
+  const dmDeadline = Date.now() + DM_BUDGET_MS;
+  const memberCache: MemberListCache = { fetched: false, members: null };
   if (storage) {
     try {
-      await sendGcaReminders(env, current, storage, Date.parse(nowIso), gcaPolicy, labels, limits);
+      await sendGcaReminders(env, current, storage, Date.parse(nowIso), gcaPolicy, labels, limits, dmDeadline, memberCache);
     } catch (err) {
       // DM lookup/storage failures must not break the public ATC cards. Only
       // the error class is logged: a message could carry private details.
@@ -746,7 +759,18 @@ export async function runPoll(
     current,
     nowIso,
     gracePolls,
+    // Presence times are only recorded while the feature that reads them is on.
+    shortSession ? trustedStateAt(options.previousStateAt, Date.parse(nowIso)) : undefined,
   );
+  const trackedBefore = Object.keys(prev).length;
+  if (shortSession && storage) {
+    try {
+      // Never excluded closures: only sessions the feed showed ending.
+      recordShortSessions(storage, prev, next, wentOffline, nowIso);
+    } catch (err) {
+      console.error(JSON.stringify({ event: 'short_session_poll_failed', error: err instanceof Error ? err.name : typeof err }));
+    }
+  }
   // Record the IVAO connection a session was first seen with, for its card
   // nonce. Only sessions first tracked this poll: an older session without it
   // keeps the `since` key any earlier attempt already used.
@@ -866,6 +890,19 @@ export async function runPoll(
     ...roster.postAttempts, ...previousRosterPostAttempts.filter((entry) => !configured(entry)),
   ];
   const rosterFailed = cards.failed || roster.failed;
+
+  // After every public card, with whatever is left of the poll's DM budget.
+  if (shortSession && storage) {
+    try {
+      await sendShortSessionReminders({
+        env, config: shortSession, storage, limits, currentAll, current: current.length, trackedBefore,
+        deadline: dmDeadline, memberCache,
+      });
+    } catch (err) {
+      // Only the error class: a message could carry private details.
+      console.error(JSON.stringify({ event: 'short_session_poll_failed', error: err instanceof Error ? err.name : typeof err }));
+    }
+  }
 
   if (attempted > 0) {
     console.log(

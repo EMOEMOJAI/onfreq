@@ -19,6 +19,7 @@
 - Cards appear when controllers tune in and turn grey when they disconnect.
 - Coverage rosters, reconnect grace and durable retries keep updates useful.
 - Optional approval reminders follow your privately configured policy.
+- Optional short-session reminders DM controllers who disconnect within 30 minutes.
 
 ![Illustrative online and offline session cards; no real member data.](assets/session-preview.svg)
 

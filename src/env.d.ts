@@ -13,6 +13,7 @@ type OptionalSecrets = {
   GCA_APPROVALS?: string;
   GCA_HOME_OVERRIDES?: string;
   GCA_POLICY_URL?: string;
+  SHORT_SESSION_DM_ENABLED?: string;
   IVAO_CLIENT_ID?: string;
   IVAO_CLIENT_SECRET?: string;
   COORDINATOR_NAME?: string;

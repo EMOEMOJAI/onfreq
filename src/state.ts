@@ -72,7 +72,20 @@ export function loadSessions(stored: StateMap): StateMap {
   if (valid.length < entries.length) {
     console.error(JSON.stringify({ event: 'sessions_dropped', reason: 'invalid', count: entries.length - valid.length }));
   }
-  return Object.fromEntries(valid.map(([callsign, session]) => [callsign, stripLegacyRoster(session)]));
+  return Object.fromEntries(valid.map(([callsign, session]) => [callsign, dropInvalidSeenAfter(stripLegacyRoster(session))]));
+}
+
+/**
+ * An unusable `seenAfter` (not a time, or after the session start) is
+ * dropped as a field, never with its session: it only gates the optional
+ * short-session reminder, which then simply never fires for that session.
+ */
+function dropInvalidSeenAfter(session: TrackedAtc): TrackedAtc {
+  if (session.seenAfter === undefined) return session;
+  const at = isString(session.seenAfter) ? Date.parse(session.seenAfter) : NaN;
+  if (Number.isFinite(at) && at <= Date.parse(session.since)) return session;
+  const { seenAfter: _invalid, ...kept } = session;
+  return kept;
 }
 
 /**
@@ -158,12 +171,18 @@ export function offlineEventFor(tracked: TrackedAtc, missed: number, endedAt: st
  * appeared, but not announced until a real frequency shows up (`pending`).
  * A held-back session that disappears again is dropped silently: nothing was
  * announced, so there is nothing to close out.
+ *
+ * With `previousStateAt` (the time of the poll `prev` was saved by), each
+ * newly tracked session gets `seenAfter`: that time, or the earliest
+ * `seenAfter` of the same VID's other sessions in `prev`, so a switch between
+ * positions counts as one presence. If any of those lacks it, so does the new one.
  */
 export function diffState(
   prev: StateMap,
   current: OnlineAtc[],
   nowIso: string,
   gracePolls: number,
+  previousStateAt?: string,
 ): DiffResult {
   const next: StateMap = {};
   const wentOnline: TrackedAtc[] = [];
@@ -213,6 +232,8 @@ export function diffState(
     } else {
       if (existing) close(existing, gracePolls, existing.missingSince ?? nowIso);
       const tracked: TrackedAtc = { ...atc, since: nowIso, missed: 0 };
+      const seenAfter = presenceSeenAfter(prev, atc, previousStateAt);
+      if (seenAfter !== undefined) tracked.seenAfter = seenAfter;
       changed = true;
       if (tuned) {
         wentOnline.push(tracked);
@@ -237,6 +258,18 @@ export function diffState(
   }
 
   return { next, wentOnline, wentOffline, pending, changed };
+}
+
+/** See `diffState`: the `seenAfter` of a session first tracked this poll, if provable. */
+function presenceSeenAfter(prev: StateMap, atc: OnlineAtc, previousStateAt: string | undefined): string | undefined {
+  if (previousStateAt === undefined) return undefined;
+  let earliest = previousStateAt;
+  for (const other of Object.values(prev)) {
+    if (other.userId !== atc.userId || other.callsign === atc.callsign) continue;
+    if (other.seenAfter === undefined) return undefined;
+    if (Date.parse(other.seenAfter) < Date.parse(earliest)) earliest = other.seenAfter;
+  }
+  return earliest;
 }
 
 /**

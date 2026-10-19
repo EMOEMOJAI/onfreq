@@ -12,6 +12,8 @@ export const HEALTH_MAX_AGE_MS = 5 * 60_000;
 
 export interface PollSnapshot {
   state: StateMap | null;
+  /** ISO start of the poll that saved `state`; absent in older snapshots and imported state. */
+  stateAt?: string;
   rosterMessages?: RosterMessage[];
   /** Budget for continuation pages that have never once posted successfully. */
   rosterPostAttempts?: RosterPostAttempt[];
@@ -280,14 +282,16 @@ export class PollCoordinator extends DurableObject<Env> {
     // is still a scheduled start: every poll before early polls was one.
     const scheduledAt = kind === 'scheduled' ? startedAt : lastScheduled ?? 0;
 
+    const nowIso = new Date(startedAt).toISOString();
     let outcome: Awaited<ReturnType<typeof runPoll>>;
     try {
-      outcome = await runPoll(this.env, snapshot.state, new Date(startedAt).toISOString(), {
+      outcome = await runPoll(this.env, snapshot.state, nowIso, {
         storage: this.ctx.storage,
         previousRosterMessages: snapshot.rosterMessages,
         previousRosterPostAttempts: snapshot.rosterPostAttempts,
         previousPendingOffline: snapshot.pendingOffline,
         previousRolePings: snapshot.rolePings,
+        previousStateAt: snapshot.stateAt,
       });
     } catch (err) {
       // runPoll threw (a config/precondition failure or any other error), so
@@ -308,7 +312,7 @@ export class PollCoordinator extends DurableObject<Env> {
       throw err;
     }
     // No successful response or in-memory checkpoint precedes persistence.
-    await this.persist(outcome, startedAt, scheduledAt,
+    await this.persist({ ...outcome, stateAt: nowIso }, startedAt, scheduledAt,
       outcome.error ? snapshot.lastSuccessfulPollAt : Date.now(), outcome.error);
     if (outcome.error) throw new Error(outcome.error);
     return { skipped: false };
@@ -328,6 +332,7 @@ export class PollCoordinator extends DurableObject<Env> {
     const nonEmpty = <T>(list: T[] | undefined) => (list?.length ? list : undefined);
     const next: { [K in keyof Required<PollSnapshot>]: PollSnapshot[K] } = {
       state: carried.state,
+      stateAt: carried.stateAt,
       pendingOffline: nonEmpty(carried.pendingOffline),
       rosterMessages: nonEmpty(carried.rosterMessages),
       rosterPostAttempts: nonEmpty(carried.rosterPostAttempts),

@@ -23,6 +23,7 @@ export default defineConfig({
         GCA_APPROVALS: '{}',
         GCA_HOME_OVERRIDES: '',
         GCA_POLICY_URL: '',
+        SHORT_SESSION_DM_ENABLED: 'false',
         IVAO_CLIENT_ID: '',
         IVAO_CLIENT_SECRET: '',
         // Distinct synthetic values: a HISTORY_SECRET equal to POLL_SECRET disables history routes.

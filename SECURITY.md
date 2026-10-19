@@ -8,7 +8,7 @@ The optional `POST /ivao/webhook` is authenticated by the IVAO (Hook0) HMAC sign
 
 ## Data retention
 
-The bot processes IVAO and Discord IDs. Optional GCA delivery and occurrence ledgers retain member/connection identifiers indefinitely for deduplication. Other inactive reminder records expire after seven days; staff-copy payloads clear after delivery or handled terminal failure, but pending/reserved copies may retain them, including copies for a previous `GCA_COPY_USER_ID`, which are never sent. Only the manual [cleanup](docs/setup.md#private-history-maintenance) removes them: copies older than 30 days, and unsent copies for any account but the current one.
+The bot processes IVAO and Discord IDs. Optional GCA delivery and occurrence ledgers retain member/connection identifiers indefinitely for deduplication. Other inactive reminder records expire after seven days; staff-copy payloads clear after delivery or handled terminal failure, but pending/reserved copies may retain them, including copies for a previous `GCA_COPY_USER_ID`, which are never sent. Only the manual [cleanup](docs/setup.md#private-history-maintenance) removes them: copies older than 30 days, and unsent copies for any account but the current one. Optional short-session reminders keep the member ID and callsign of each short connection for up to seven days, and the member and IVAO connection IDs of every closed connection for about three hours.
 
 Staff-copy cleanup is **not complete member erasure**. It leaves delivery and occurrence records, Discord messages, logs and backups intact. There is no supported selective-erasure operation preserving the same deduplication guarantees. Disable reminders before planning broader deletion; do not manually reset their ledgers while active.
 

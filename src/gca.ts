@@ -13,11 +13,11 @@ const MAX_LEVEL = 3;
 const MAX_POLICY_URL_LENGTH = 2048;
 const names = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none' });
 const INITIALIZED_KEY = 'gca-initialized-v1'; // gitleaks:allow — storage key name, not a credential
-const BACKOFF_KEY = 'gca-discord-backoff-v1';
+export const BACKOFF_KEY = 'gca-discord-backoff-v1';
 // Gates only the member-list fetch, separately from the shared BACKOFF_KEY:
 // a member-list-specific failure (a route 429, a malformed page) must not
 // also block unrelated staff-copy sends, which only check BACKOFF_KEY.
-const MEMBER_LIST_BACKOFF_KEY = 'gca-member-list-backoff-v1';
+export const MEMBER_LIST_BACKOFF_KEY = 'gca-member-list-backoff-v1';
 /** Consecutive member-list lookups that ran out of the poll deadline. */
 const MEMBER_LIST_DEADLINE_KEY = 'gca-member-list-deadline-failures-v1';
 /** A slow lookup is retried at once, but backs off from this many in a row. */
@@ -388,7 +388,7 @@ class GcaMemberListError extends Error {
 }
 
 /** No inline retries: a slow Discord service must not hold the poll indefinitely. */
-async function discordJson(limits: DiscordRateLimits, token: string, path: string, payload?: unknown): Promise<unknown> {
+export async function discordJson(limits: DiscordRateLimits, token: string, path: string, payload?: unknown): Promise<unknown> {
   let response: Response;
   try {
     response = await limits.fetch(path, {
@@ -415,7 +415,7 @@ async function discordJson(limits: DiscordRateLimits, token: string, path: strin
   return response.json().catch(() => null);
 }
 
-async function openDm(limits: DiscordRateLimits, token: string, recipient: string): Promise<string> {
+export async function openDm(limits: DiscordRateLimits, token: string, recipient: string): Promise<string> {
   const channel = await discordJson(limits, token, '/users/@me/channels', { recipient_id: recipient }) as {
     id?: string; type?: number; recipients?: { id: string }[];
   } | null;
@@ -462,7 +462,7 @@ async function fetchMembers(limits: DiscordRateLimits, token: string, guildId: s
 }
 
 /** A stored backoff deadline, or 0 when absent, invalid, or beyond the cap. */
-async function readBackoff(storage: DurableObjectStorage, key: string, now: number): Promise<number> {
+export async function readBackoff(storage: DurableObjectStorage, key: string, now: number): Promise<number> {
   const until = await storage.get<number>(key);
   return typeof until === 'number' && Number.isFinite(until) && until <= now + GCA_MAX_BACKOFF_MS ? until : 0;
 }
@@ -481,7 +481,7 @@ interface DeliveryOutcome {
  * Shared at-most-once retry classification for both member DMs and staff
  * copies, so the two paths can never drift apart on what counts as retryable.
  */
-function classifyDeliveryFailure(err: unknown, attempts: number, messageAttempted: boolean, now: number): DeliveryOutcome {
+export function classifyDeliveryFailure(err: unknown, attempts: number, messageAttempted: boolean, now: number): DeliveryOutcome {
   const rateLimited = err instanceof DiscordRateLimitError;
   const permanent = err instanceof PermanentGcaError ||
     (err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && !rateLimited);
@@ -600,7 +600,7 @@ export function gcaRemindersEnabled(env: Env): boolean {
  * The complete guild member list, or null while reminders or the member-list
  * lookup are backed off. A failed lookup records its own backoff and rethrows.
  */
-async function fetchMembersWithBackoff(
+export async function fetchMembersWithBackoff(
   env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits, now: number, deadline: number,
 ): Promise<GuildMember[] | null> {
   const globalBackoff = await readBackoff(storage, BACKOFF_KEY, now);
@@ -650,6 +650,24 @@ async function fetchMembersWithBackoff(
   });
   if (await storage.get<number>(MEMBER_LIST_DEADLINE_KEY) !== undefined) await storage.delete(MEMBER_LIST_DEADLINE_KEY);
   return members;
+}
+
+/** One poll's member-list lookup, shared by every DM feature so it runs at most once. */
+export interface MemberListCache {
+  fetched: boolean;
+  members: GuildMember[] | null;
+}
+
+/** `fetchMembersWithBackoff`, reusing (or recording) this poll's single attempt; a failed one reads as null. */
+export async function sharedMembers(
+  env: Env, storage: DurableObjectStorage, limits: DiscordRateLimits, now: number, deadline: number,
+  cache?: MemberListCache,
+): Promise<GuildMember[] | null> {
+  if (!cache) return fetchMembersWithBackoff(env, storage, limits, now, deadline);
+  if (cache.fetched) return cache.members;
+  cache.fetched = true;
+  cache.members = await fetchMembersWithBackoff(env, storage, limits, now, deadline);
+  return cache.members;
 }
 
 /**
@@ -733,7 +751,7 @@ async function recordDeliveryFailure(
 /** Called inside the coordinator's serialized poll, before channel notifications. */
 async function sendMemberReminders(
   env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number, limits: DiscordRateLimits,
-  policy: GcaPolicy | null, labels: FirLabel[], deadline: number,
+  policy: GcaPolicy | null, labels: FirLabel[], deadline: number, memberCache?: MemberListCache,
 ): Promise<void> {
   // Missing or unusable configuration disables reminders for this poll; it
   // must never throw, or one bad setting would stop the online cards too.
@@ -761,7 +779,7 @@ async function sendMemberReminders(
   }
   if (stale) console.log(JSON.stringify({ event: 'gca_rebaselined', sessions: current.length }));
   if (!candidates.size) return;
-  const members = await fetchMembersWithBackoff(env, storage, limits, now, deadline);
+  const members = await sharedMembers(env, storage, limits, now, deadline, memberCache);
   if (!members) return;
   const index = indexMemberVids(members, env.GCA_MEMBER_ROLE_ID ?? '', policy.verifiedRoleId);
   let attemptsThisPoll = 0;
@@ -841,19 +859,21 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits
   }
 }
 
-/** Serialized by the coordinator; copy failures never retry the member's DM. */
+/**
+ * Serialized by the coordinator; copy failures never retry the member's DM.
+ * `deadline` is the poll's single DM budget: one shared deadline across
+ * member reminders and staff copies (and, in a poll, later DM features), as
+ * independent 25s budgets could together delay the public cards by much more.
+ */
 export async function sendGcaReminders(
   env: Env, current: OnlineAtc[], storage: DurableObjectStorage, now: number,
   policy: GcaPolicy | null, labels: FirLabel[] = [], rateLimits?: DiscordRateLimits,
+  deadline = Date.now() + 25_000, memberCache?: MemberListCache,
 ): Promise<void> {
   if (env.GCA_DM_ENABLED !== 'true') return;
   const limits = rateLimits ?? await DiscordRateLimits.load(storage);
-  // Single shared deadline across both member reminders and staff copies:
-  // two independent 25s budgets could together delay the public online/
-  // offline cards that run after this by up to 50s.
-  const deadline = Date.now() + 25_000;
   try {
-    await sendMemberReminders(env, current, storage, now, limits, policy, labels, deadline);
+    await sendMemberReminders(env, current, storage, now, limits, policy, labels, deadline, memberCache);
   } finally {
     await sendPendingCopies(env, storage, limits, deadline).catch(() => {
       console.warn(JSON.stringify({ event: 'gca_copy_poll_failed' }));
