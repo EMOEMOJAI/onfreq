@@ -107,6 +107,9 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-19 | T1-5 | P4 | Deferred: whole-message email check; gitleaks:allow in author names or paths; a COORDINATOR_NAME or FIR_PREFIXES rule | b0bcc2a |
 | 2026-10-19 | T3-1 | P2 | Rollback advice said "let one poll run" though purge needs a successful poll; docs now say to wait for `short_session_purged`. Short-session wording, AGENTS.md and llms.txt updated | 8cd89c7 |
 | 2026-10-19 | T3-2 | P3 | A budget test could not fail, "sends nothing" tests passed on a swallowed error, a stray alarm could run; real-Gitleaks tests now fail in CI if Gitleaks is missing. Deferred: a direct test of the poll.ts send-detection wrapper | 8cd89c7 |
+| 2026-10-21 | T1-6 | P3 | Fixed deferred mass-reappearance edges: a member back on the same IVAO session after a feed gap keeps their presence; the mass guard is unchanged | 613e0d8 |
+| 2026-10-21 | T1-6 | P4 | Fixed deferred: expired rate-limit entries, including DM channel ids, are removed on the next load | 613e0d8 |
+| 2026-10-21 | T1-5 | P4 | Fixed deferred: pre-push names gitleaks:allow in author names and paths; rules for multi-line JSON settings and dotenv FIR_PREFIXES/COORDINATOR_NAME. Still deferred: whole-message email check | 1643863 |
 
 Deferred: test pool runtime older than deploy runtime (vitest-pool-workers 0.23.0 still bundles miniflare 5.20260815.0-alpha vs compatibility date 2026-08-16; bump when a matching release exists). Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
