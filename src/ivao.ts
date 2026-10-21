@@ -491,6 +491,8 @@ export async function fetchDivisionAtc(
   auth?: IvaoAuth,
   /** Filled with the VIDs of every division entry, before duplicate callsigns are merged. */
   presentVids?: number[],
+  /** Filled with the (VID, IVAO session id) of the same entries. */
+  presentSessions?: { userId: number; sessionId: number }[],
 ): Promise<OnlineAtc[]> {
   const feed = (headers: Record<string, string>) =>
     fetchBuffered(IVAO_ATC_SUMMARY_URL, { headers }, { maxBytes: IVAO_ATC_SUMMARY_MAX_BYTES });
@@ -589,5 +591,6 @@ export async function fetchDivisionAtc(
     .filter((e) => isDivisionCallsign(e.callsign, prefixes))
     .map(normalizeAtc);
   presentVids?.push(...division.map((atc) => atc.userId));
+  presentSessions?.push(...division.map((atc) => ({ userId: atc.userId, sessionId: atc.sessionId })));
   return dedupeByCallsign(division);
 }

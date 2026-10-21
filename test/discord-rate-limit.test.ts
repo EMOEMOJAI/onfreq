@@ -243,3 +243,58 @@ it.each(['1e12', '1e308', String(MAX_RATE_LIMIT_COOLDOWN_MS)])(
     await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
     expect(network).toHaveBeenCalledTimes(2);
   });
+
+// Synthetic IDs: a DM channel route is only kept while its cooldown is active.
+const STALE_DM = '/channels/900000000000000009/messages';
+const stored = () => runInDurableObject(stub(), (_, ctx) => ctx.storage.get<Record<string, number>>('discord-rate-limits-v1'));
+
+it('load rewrites the stored record without expired, over-cap and non-finite entries', async () => {
+  await runInDurableObject(stub(), (_, ctx) => ctx.storage.put('discord-rate-limits-v1', {
+    [STALE_DM]: START - 1, '/guilds/g/members': START + MAX_RATE_LIMIT_COOLDOWN_MS + 1, '/channels/a/messages': START + 5_000,
+    '*': START + 9_000, bad: 'soon',
+  }));
+  await runInDurableObject(stub(), (_, ctx) => DiscordRateLimits.load(ctx.storage));
+  expect(await stored()).toEqual({ '/channels/a/messages': START + 5_000, '*': START + 9_000 });
+});
+
+it('load deletes the stored record when only expired entries remain', async () => {
+  await runInDurableObject(stub(), (_, ctx) => ctx.storage.put('discord-rate-limits-v1', { [STALE_DM]: START }));
+  await runInDurableObject(stub(), (_, ctx) => DiscordRateLimits.load(ctx.storage));
+  expect(await stored()).toBeUndefined();
+});
+
+it('load does not write storage when nothing is dropped', async () => {
+  await runInDurableObject(stub(), async (_, ctx) => {
+    await ctx.storage.put('discord-rate-limits-v1', { '/channels/a/messages': START + 5_000 });
+    const put = vi.spyOn(ctx.storage, 'put');
+    const del = vi.spyOn(ctx.storage, 'delete');
+    await DiscordRateLimits.load(ctx.storage);
+    await DiscordRateLimits.load(ctx.storage);
+    expect(put).not.toHaveBeenCalled();
+    expect(del).not.toHaveBeenCalled();
+  });
+});
+
+it('load survives a failing cleanup write and logs the existing persist-failure event', async () => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  await runInDurableObject(stub(), async (_, ctx) => {
+    await ctx.storage.put('discord-rate-limits-v1', { [STALE_DM]: START, '*': START + 5_000 });
+    vi.spyOn(ctx.storage, 'put').mockRejectedValueOnce(new Error('synthetic storage failure'));
+    const limits = await DiscordRateLimits.load(ctx.storage);
+    await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).rejects.toMatchObject({ global: true });
+  });
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining('discord_rate_limit_persist_failed'));
+});
+
+it('a new 429 persists without an entry that expired in the meantime', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ retry_after: 30 }, { status: 429 })));
+  await expect(request(STALE_DM)).rejects.toMatchObject({ requestMade: true });
+  expect(await stored()).toEqual({ [STALE_DM]: START + 30_000 });
+  now += 31_000;
+  // Loading would already clean it; an in-memory instance holding it must not persist it again.
+  await runInDurableObject(stub(), async (_, ctx) => {
+    const limits = new DiscordRateLimits(ctx.storage, { [STALE_DM]: START + 30_000 });
+    await expect(limits.fetch('/channels/b/messages', { method: 'POST' })).rejects.toMatchObject({ requestMade: true });
+  });
+  expect(await stored()).toEqual({ '/channels/b/messages': now + 30_000 });
+});

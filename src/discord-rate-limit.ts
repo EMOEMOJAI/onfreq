@@ -69,8 +69,18 @@ export class DiscordRateLimits {
     // A deadline beyond the cap can only come from an older, unclamped write
     // or corrupt storage; dropping it lets delivery resume.
     const now = Date.now();
-    return new DiscordRateLimits(storage, Object.fromEntries(Object.entries(stored)
-      .filter(([, until]) => Number.isFinite(until) && until > now && until <= now + MAX_RATE_LIMIT_COOLDOWN_MS)));
+    const kept = Object.entries(stored)
+      .filter(([, until]) => Number.isFinite(until) && until > now && until <= now + MAX_RATE_LIMIT_COOLDOWN_MS);
+    if (storage && kept.length < Object.keys(stored).length) {
+      // Route keys can hold channel IDs (DM channels included): do not leave
+      // them in storage after their cooldown ends. Best effort, as in `record`.
+      try {
+        await (kept.length ? storage.put(KEY, Object.fromEntries(kept)) : storage.delete(KEY));
+      } catch (err) {
+        console.warn(JSON.stringify({ event: 'discord_rate_limit_persist_failed', error: String(err) }));
+      }
+    }
+    return new DiscordRateLimits(storage, Object.fromEntries(kept));
   }
 
   /**
@@ -159,7 +169,11 @@ export class DiscordRateLimits {
 
   /** Extend and persist a real 429 cooldown; returns the effective deadline for `key`. */
   private async record(key: string, retryAt: number): Promise<number> {
-    this.deadlines[key] = Math.max(this.deadlines[key] ?? 0, retryAt);
+    const effective = Math.max(this.deadlines[key] ?? 0, retryAt);
+    this.deadlines[key] = effective;
+    // Expired entries (possibly DM channel IDs) are not persisted again.
+    const now = Date.now();
+    for (const [route, until] of Object.entries(this.deadlines)) if (until <= now) delete this.deadlines[route];
     // Persist before returning to callers. A storage failure here must not
     // mask the rate-limit error itself — the in-memory deadline still applies
     // to the rest of this poll either way.
@@ -168,6 +182,6 @@ export class DiscordRateLimits {
     } catch (err) {
       console.warn(JSON.stringify({ event: 'discord_rate_limit_persist_failed', error: String(err) }));
     }
-    return this.deadlines[key]!;
+    return effective;
   }
 }

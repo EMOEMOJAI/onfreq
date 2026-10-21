@@ -709,7 +709,8 @@ export async function runPoll(
   const auth = ivaoAuthFromEnv(env);
   // Every division VID, before duplicate callsigns are merged (short-session presence).
   const presentVids: number[] = [];
-  const currentAll = await fetchDivisionAtc(prefixes, auth, presentVids);
+  const presentSessions: { userId: number; sessionId: number }[] = [];
+  const currentAll = await fetchDivisionAtc(prefixes, auth, presentVids, presentSessions);
 
   // Excluded callsigns (the EXCLUDED_CALLSIGNS list plus `xxxx_X_yyy`
   // special positions) never enter the notification pipeline. Prune them
@@ -790,7 +791,7 @@ export async function runPoll(
         await purgeShortSessions(storage);
       } else if (shortSession.kind === 'enabled') {
         // Never excluded closures: only sessions the feed showed ending.
-        await recordShortSessions(storage, { ended: wentOffline, nowIso, trackedBefore, presentVids, previousStateAt });
+        await recordShortSessions(storage, { ended: wentOffline, nowIso, trackedBefore, presentVids, presentSessions, previousStateAt });
       } else {
         await maintainShortSessions(storage, nowIso);
       }

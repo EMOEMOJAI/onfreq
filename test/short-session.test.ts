@@ -625,6 +625,78 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await expectNothing();
   });
 
+  it('NX-1a: the same IVAO session returning after a gap over 10 minutes keeps its presence', async () => {
+    const other = entry('QCZZ_APP', 600002, 119.1, 7);
+    await at(0, [other]);
+    await at(1, [twr(1), other]);
+    await at(60, [twr(1), other]);
+    await during(61, 75, 2, [other]);
+    await at(76, [twr(1), other]);
+    await at(86, [other]);
+    await at(87, [other]);
+    await at(100, [other]);
+    await expectNothing();
+  });
+
+  it('NX-1a: the same gap with a new IVAO session id is a reconnect and still sends a reminder', async () => {
+    const other = entry('QCZZ_APP', 600002, 119.1, 7);
+    await at(0, [other]);
+    await at(1, [twr(1), other]);
+    await at(60, [twr(1), other]);
+    await during(61, 75, 2, [other]);
+    await at(76, [twr(2), other]);
+    await at(86, [other]);
+    await at(87, [other]);
+    await at(100, [other]);
+    expect(await rows()).toMatchObject([{ session_key: `${VID}:${ms(75)}`, status: 'sent', duration_minutes: 11 }]);
+  });
+
+  it('NX-1a: stores the newest session id seen in the record, never a lower one later', async () => {
+    await at(0, []);
+    await at(1, [twr(5), entry('QCTT_APP', VID, 119.1, 9)]);
+    await at(2, [twr(3)]);
+    expect(await sql(`SELECT user_id, session_id FROM ${ONLINE}`)).toEqual([{ user_id: VID, session_id: 9 }]);
+  });
+
+  it('NX-1a: adds session_id in place to an online table of the earlier shape, keeping its rows', async () => {
+    await at(0, []);
+    await at(1, [twr(4)]);
+    await sql(`ALTER TABLE ${ONLINE} DROP COLUMN session_id`);
+    expect(await sql(`SELECT 1 FROM pragma_table_info('${ONLINE}') WHERE name = 'session_id'`)).toEqual([]);
+    await at(2, [twr(4)]);
+    expect(await sql(`SELECT user_id, online_since, missing_since, session_id FROM ${ONLINE}`))
+      .toEqual([{ user_id: VID, online_since: ms(0), missing_since: null, session_id: 4 }]);
+    await at(6, []);
+    await at(7, []);
+    expect(await rows()).toMatchObject([{ session_key: keyAt(0), duration_minutes: 6 }]);
+  });
+
+  it('NX-1a: a returning division keeps same-session presences but still counts as a mass reappearance', async () => {
+    const six = [1, 2, 3, 4, 5, 6].map((n) => entry(`QCO${n}_CTR`, 700000 + n, 125.1, 10 + n));
+    members = six.map((item) => member(item.userId, `2000000000000001${item.userId % 100}`.padEnd(18, '0')));
+    await at(-61, []);
+    await at(-60, six.slice(0, 1));
+    await at(-59, six.slice(0, 2));
+    await at(-58, six.slice(0, 3));
+    await at(-57, six.slice(0, 4));
+    await at(-56, six.slice(0, 5));
+    await at(-55, six);
+    await at(0, six);
+    await during(1, 15, 2, six.slice(0, 2));
+    // Three come back as the same connections, one on a new session id.
+    const back = [...six.slice(0, 5), { ...six[5]!, id: 99 }];
+    await at(16, back);
+    expect(logged('short_session_mass_reappearance')).toEqual([{ event: 'short_session_mass_reappearance', count: 4 }]);
+    expect(await sql(`SELECT user_id, online_since IS NULL AS unknown FROM ${ONLINE} ORDER BY user_id`)).toEqual([
+      { user_id: 700001, unknown: 0 }, { user_id: 700002, unknown: 0 }, { user_id: 700003, unknown: 0 },
+      { user_id: 700004, unknown: 0 }, { user_id: 700005, unknown: 0 }, { user_id: 700006, unknown: 1 },
+    ]);
+    await at(26, back.slice(0, 5));
+    await at(27, back.slice(0, 5));
+    await at(40, back.slice(0, 5));
+    await expectNothing();
+  });
+
   it('F3: a member hidden by a duplicate callsign is still online', async () => {
     await at(0, []);
     await at(1, [twr(1)]);

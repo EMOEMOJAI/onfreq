@@ -129,10 +129,15 @@ function ensureShortSessionSchema(sql: SqlStorage): void {
   sql.exec(`CREATE INDEX IF NOT EXISTS ${REMINDERS}_ended_idx ON ${REMINDERS} (ended_at)`);
   // One record per member present in the division feed, at any position:
   // online_since is the last recorded poll before they appeared (NULL when
-  // unknown), missing_since the first recorded poll that missed them.
+  // unknown), missing_since the first recorded poll that missed them, and
+  // session_id the newest valid IVAO session id seen during this record.
   sql.exec(`CREATE TABLE IF NOT EXISTS ${ONLINE} (
-    user_id INTEGER PRIMARY KEY, online_since INTEGER, missing_since INTEGER
+    user_id INTEGER PRIMARY KEY, online_since INTEGER, missing_since INTEGER, session_id INTEGER
   )`);
+  // Tables created before session_id existed gain it in place; their rows keep a NULL that never matches.
+  if (!sql.exec(`SELECT 1 FROM pragma_table_info('${ONLINE}') WHERE name = 'session_id'`).toArray().length) {
+    sql.exec(`ALTER TABLE ${ONLINE} ADD COLUMN session_id INTEGER`);
+  }
   sql.exec(`CREATE INDEX IF NOT EXISTS ${ONLINE}_missing_idx ON ${ONLINE} (missing_since)`);
 }
 
@@ -155,6 +160,8 @@ export interface ShortSessionPoll {
   trackedBefore: number;
   /** VIDs of every division entry, at any position, before duplicate callsigns are merged. */
   presentVids: number[];
+  /** The (VID, IVAO session id) of every division entry, with the same scope as `presentVids`. */
+  presentSessions: { userId: number; sessionId: number }[];
   /** The previous poll's time, when trusted (see `trustedStateAt`). */
   previousStateAt: string | undefined;
 }
@@ -165,12 +172,21 @@ export interface ShortSessionPoll {
  * under MIN_SESSION_MS, with MARGIN_MS to spare.
  *
  * A member's presence runs from the last recorded poll before they appeared
- * to the first recorded poll that missed them; a gap shorter than LINK_MS
+ * to the first recorded poll that missed them. A gap shorter than LINK_MS
  * between recorded polls (measured between those polls, so time without
- * recorded polls never splits a presence) continues it. Unless the previous
+ * recorded polls never splits a presence) continues it, and so does a member
+ * who returns with an IVAO session id already seen in their current record:
+ * that is the same connection, merely missing from the feed for a while.
+ * Only the time rule counts towards the mass-reappearance guard, so a feed
+ * that drops and restores many members is still caught. Unless the previous
  * recorded poll is this poll's trusted predecessor, every record starts over
  * with an unknown start, as do records created on a poll where many members
  * appear at once.
+ *
+ * Limits: a record is kept ONLINE_RETENTION_MS after the member was last
+ * missed, so a same-session return after that starts a new presence; and a
+ * short first stretch hidden for longer than REPORT_DELAY_MS can still be
+ * reminded, as its reminder may fall due before the member returns.
  */
 export async function recordShortSessions(storage: DurableObjectStorage, poll: ShortSessionPoll): Promise<void> {
   const sql = storage.sql;
@@ -181,6 +197,12 @@ export async function recordShortSessions(storage: DurableObjectStorage, poll: S
   const previous = poll.previousStateAt === undefined ? undefined : Date.parse(poll.previousStateAt);
   const baseline = previous === undefined || !Number.isFinite(previous) || recorded !== previous;
   const present = new Set(poll.presentVids.filter(isVid));
+  const sessions = new Map<number, Set<number>>();
+  for (const { userId, sessionId } of poll.presentSessions) {
+    if (!present.has(userId) || !isVid(sessionId)) continue;
+    sessions.set(userId, (sessions.get(userId) ?? new Set()).add(sessionId));
+  }
+  const newest = (id: number) => sessions.has(id) ? Math.max(...sessions.get(id)!) : null;
   const { ended, trackedBefore } = poll;
   const anomaly = ended.length > MAX_ENDED_PER_POLL || (trackedBefore >= 4 && ended.length > trackedBefore / 2);
   let fresh = 0;
@@ -189,25 +211,33 @@ export async function recordShortSessions(storage: DurableObjectStorage, poll: S
   storage.transactionSync(() => {
     reminderRetention(sql, nowMs);
     if (baseline) sql.exec(`DELETE FROM ${ONLINE}`);
-    const rows = new Map(sql.exec<{ user_id: number; missing_since: number | null }>(
-      `SELECT user_id, missing_since FROM ${ONLINE}`).toArray().map((row) => [row.user_id, row.missing_since]));
-    const continues = (id: number) => {
-      if (!rows.has(id)) return false;
-      const missing = rows.get(id)!;
-      return missing === null || previous! - missing < LINK_MS;
+    const rows = new Map(sql.exec<{ user_id: number; missing_since: number | null; session_id: number | null }>(
+      `SELECT user_id, missing_since, session_id FROM ${ONLINE}`).toArray().map((row) => [row.user_id, row]));
+    const withinLink = (id: number) => {
+      const row = rows.get(id);
+      return row !== undefined && (row.missing_since === null || previous! - row.missing_since < LINK_MS);
     };
-    const appearing = [...present].filter((id) => !continues(id));
-    fresh = appearing.length;
+    const continues = (id: number) => {
+      if (withinLink(id)) return true;
+      const stored = rows.get(id)?.session_id;
+      return stored !== undefined && stored !== null && sessions.get(id)?.has(stored) === true;
+    };
+    // The mass guard counts the time rule only: a same-session return after a
+    // long gap keeps its presence but still shows the feed dropped it.
+    fresh = [...present].filter((id) => !withinLink(id)).length;
     mass = fresh > MAX_NEW_ONLINE_PER_POLL || (present.size >= 4 && fresh > present.size / 2);
     for (const id of present) {
-      if (continues(id)) sql.exec(`UPDATE ${ONLINE} SET missing_since = NULL WHERE user_id = ?`, id);
+      if (continues(id)) {
+        const stored = rows.get(id)!.session_id;
+        sql.exec(`UPDATE ${ONLINE} SET missing_since = NULL, session_id = ? WHERE user_id = ?`,
+          Math.max(stored ?? 0, newest(id) ?? 0) || null, id);
+      } else {
+        sql.exec(`INSERT OR REPLACE INTO ${ONLINE} (user_id, online_since, missing_since, session_id)
+          VALUES (?, ?, NULL, ?)`, id, baseline || mass ? null : previous!, newest(id));
+      }
     }
-    for (const id of appearing) {
-      sql.exec(`INSERT OR REPLACE INTO ${ONLINE} (user_id, online_since, missing_since) VALUES (?, ?, NULL)`,
-        id, baseline || mass ? null : previous!);
-    }
-    for (const [id, missing] of rows) {
-      if (!present.has(id) && missing === null) {
+    for (const [id, row] of rows) {
+      if (!present.has(id) && row.missing_since === null) {
         sql.exec(`UPDATE ${ONLINE} SET missing_since = ? WHERE user_id = ?`, nowMs, id);
       }
     }

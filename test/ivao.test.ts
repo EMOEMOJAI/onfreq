@@ -456,6 +456,27 @@ describe('fetchDivisionAtc', () => {
     await expect(fetchDivisionAtc(['QC'])).rejects.toThrow('feed outage');
   });
 
+  it('fills presentSessions with every division (VID, session id) before duplicate callsigns merge, and nothing on failure', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const entries = [
+      rawEntry({ id: 11, userId: 100, callsign: 'QCTT_TWR' }),
+      rawEntry({ id: 12, userId: 200, callsign: 'qctt_twr' }),
+      rawEntry({ id: 13, userId: 300, callsign: 'QCTT_APP' }),
+      rawEntry({ id: 14, userId: 400, callsign: 'XXTT_TWR' }),
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
+    const vids: number[] = [];
+    const sessions: { userId: number; sessionId: number }[] = [];
+    await expect(fetchDivisionAtc(['QC'], undefined, vids, sessions)).resolves.toHaveLength(2);
+    expect(vids).toEqual([100, 200, 300]);
+    expect(sessions).toEqual([{ userId: 100, sessionId: 11 }, { userId: 200, sessionId: 12 }, { userId: 300, sessionId: 13 }]);
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('down', { status: 500 })));
+    const failedSessions: { userId: number; sessionId: number }[] = [];
+    await expect(fetchDivisionAtc(['QC'], undefined, [], failedSessions)).rejects.toThrow();
+    expect(failedSessions).toEqual([]);
+  });
+
   it('caps runaway string lengths from the feed', async () => {
     const entries = [rawEntry({
       atcSession: { frequency: 118.1, position: `T${'W'.repeat(300)}R` },
