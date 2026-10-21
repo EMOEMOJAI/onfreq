@@ -1221,6 +1221,64 @@ test('pre-push names commits whose message carries gitleaks:allow, however encod
   assert.doesNotMatch(pushNew(oid).stderr, /note/);
 });
 
+test('pre-push names commits whose author or changed path carries gitleaks:allow (NX-1c)', (t) => {
+  const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
+  const f = fixture(t);
+  // Stored names map to other names here, so the stored and mailmapped
+  // identities differ; the scan prints either, depending on log.mailmap.
+  const mailmap = join(f.repo, '..', 'mailmap');
+  writeFileSync(mailmap, 'Synthetic GitLeaks:Allow <mapped@example.test>\nPlain Name <raw@example.test>\n');
+  f.git('config', 'mailmap.file', mailmap);
+  let base = f.head;
+  let n = 0;
+  const commit = ({ author, file = 'public.txt', rename } = {}) => {
+    const config = author ? ['-c', `user.name=${author[0]}`, '-c', `user.email=${author[1]}`] : [];
+    if (rename) f.git('mv', rename, file);
+    else {
+      writeFileSync(join(f.repo, file), `change ${++n}\n`);
+      f.git('add', file);
+    }
+    f.git(...config, 'commit', '--quiet', '--no-verify', '-m', 'synthetic change');
+    return [f.git('rev-parse', 'HEAD'), f.git('log', '-1', '--format=%h')];
+  };
+  const pushNew = (oid) => {
+    const result = f.push([ref(oid, 'refs/heads/main', base)]);
+    base = oid;
+    assert.equal(result.status, 0, result.stderr);
+    return result.stderr;
+  };
+  for (const [label, author] of [['author name', ['Synthetic gitleaks:allow', 'synthetic@example.test']],
+    ['author email', ['Synthetic', 'GITLEAKS:ALLOW@example.test']],
+    ['mailmapped name only', ['Mapped Author', 'mapped@example.test']],
+    ['stored name only', ['Raw gitleaks:allow', 'raw@example.test']]]) {
+    const [oid, short] = commit({ author });
+    assert.match(pushNew(oid), note(short), label);
+  }
+  // A path, added or as either side of a rename, without the marker in any
+  // line of the diff: -G alone would not name these commits.
+  const marked = 'notes-GitLeaks:Allow.txt';
+  let [oid, short] = commit({ file: marked });
+  assert.match(pushNew(oid), note(short), 'added path');
+  [oid, short] = commit({ file: 'renamed.txt', rename: marked });
+  assert.match(pushNew(oid), note(short), 'renamed from');
+  [oid, short] = commit({ file: `again-${marked}`, rename: 'renamed.txt' });
+  assert.match(pushNew(oid), note(short), 'renamed to');
+  // A path only a merge resolution adds.
+  f.git('checkout', '--quiet', '-b', 'side');
+  commit({ file: 'side.txt' });
+  f.git('checkout', '--quiet', 'main');
+  commit();
+  f.git('merge', '--quiet', '--no-ff', '--no-commit', 'side');
+  writeFileSync(join(f.repo, 'merge-gitleaks:allow.txt'), 'merge\n');
+  f.git('add', 'merge-gitleaks:allow.txt');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'merge side');
+  const merge = f.git('rev-parse', 'HEAD');
+  assert.match(pushNew(merge), note(f.git('log', '-1', '--format=%h')), 'merge-only path');
+  // Ordinary commits by an ordinary author are not named.
+  [oid] = commit();
+  assert.doesNotMatch(pushNew(oid), /note/);
+});
+
 test('pre-push prints the could-not-check note when the message search fails (ROT-1)', (t) => {
   const f = fixture(t);
   const realGit = spawnSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
@@ -1275,6 +1333,55 @@ test('the repository Gitleaks rules pass synthetic IDs, empty values, references
       + `GCA_APPROVALS='{}'\nFIR_LABELS='[]'\n` + reference('GCA_DISCORD_GUILD_ID') + 'GCA_VERIFIED_ROLE_ID: VERIFIED,\n'
       + "GCA_REGIONS: JSON.stringify({ AA: { name: 'Example', prefixes: ['XA'] } }),\n"
       + `GCA_HOME_OVERRIDES: '{"600001":"ZZ"}',\n`;
+    const { hook, scan } = scanAssignment(f, text);
+    for (const result of hook) assert.equal(result.status, 0, result.stderr);
+    assert.equal(scan.status, 0, scan.stderr);
+  });
+
+// NX-1c: multi-line private JSON literals and deployment settings in dotenv or
+// shell lines. Setting names are joined at runtime, so this file never holds a
+// line the rules would flag; real-looking prefixes appear only in temporary
+// repositories.
+const firPrefixes = ['FIR', 'PREFIXES'].join('_');
+const coordinatorName = ['COORDINATOR', 'NAME'].join('_');
+
+test('the repository Gitleaks rules block multi-line JSON literals and deployment settings, redacted (NX-1c)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    // Each line sits between others, so the match is mid-stream in the scanned log.
+    const blocked = (line, secret, label) => {
+      const { hook, scan } = scanAssignment(f, `# synthetic settings\n${line}# end\n`);
+      for (const result of [...hook, scan]) {
+        assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+        if (secret) assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret), label);
+      }
+    };
+    blocked(`${firPrefixes}="XD, LF"\n`, 'XD, LF', 'quoted list with one real-looking prefix');
+    blocked(`${firPrefixes}=LF\n`, '=LF', 'unquoted prefix');
+    blocked(`${firPrefixes}=XD, LF # note\n`, 'XD, LF', 'unquoted list read to the comment, as dotenv does');
+    blocked(`export ${coordinatorName}="synthetic realname"\n`, 'realname', 'quoted name with a space');
+    blocked(`${coordinatorName}=prod-state\n`, 'prod-state', 'unquoted name');
+    blocked(`${coordinatorName}='prod state'\n`, 'prod state', 'single-quoted name');
+    const vid = ['73', '4125'].join('');
+    for (const [name, open, close] of [['GCA_REGIONS', '{', '}'], ['GCA_APPROVALS', '{', '}'],
+      ['GCA_HOME_OVERRIDES', '{', '}'], ['FIR_LABELS', '[', ']'], ['gca_regions', '{', '}']]) {
+      blocked(`${name}='${open}\n  "${vid}": "AC"\n${close}'\n`, vid, `multi-line ${name}`);
+    }
+  });
+
+test('the repository Gitleaks rules pass synthetic deployment settings, empty values, code and expressions (NX-1c)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const text = `${firPrefixes}="XD,QC"\n${firPrefixes}=""\n${firPrefixes}=xd, q,\n`
+      + `${coordinatorName}=synthetic-state\n${coordinatorName}=synthetic-state # note\n${coordinatorName}=''\n`
+      // Not dotenv or shell lines: TypeScript fixtures, code and commands.
+      + `  ${firPrefixes}: 'XD',\nexport const ${coordinatorName} = 'onfreq';\n`
+      + `npx wrangler secret put ${firPrefixes}\n`
+      // Dotenv names are case-sensitive, so a lowercase name sets nothing.
+      + `${firPrefixes.toLowerCase()}=LF\n`
+      + "GCA_REGIONS: JSON.stringify({\n  AA: { name: 'Example', prefixes: ['XA'] },\n}),\n";
     const { hook, scan } = scanAssignment(f, text);
     for (const result of hook) assert.equal(result.status, 0, result.stderr);
     assert.equal(scan.status, 0, scan.stderr);

@@ -60,6 +60,38 @@ regexes = [
   '''^\{"600001":"ZZ"\}$''',
 ]
 
-# Known limits: values held in constants or variables under other names, and
-# files that never write these setting names next to their values, are not
+# A multi-line JSON literal: the setting's value opens an object or array and
+# the line ends there. Known limit: a pretty-printed first line that continues
+# after the bracket, such as NAME='{"KEY": [, matches neither JSON rule.
+[[rules]]
+id = "onfreq-json-setting-multiline"
+description = "onfreq private JSON setting opens a multi-line literal"
+regex = '''(?m)\b(?i:GCA_REGIONS|GCA_APPROVALS|GCA_HOME_OVERRIDES|FIR_LABELS)\b["']?\s*[=:]\s*["'`]?([\[{])\s*$'''
+secretGroup = 1
+keywords = ["gca_regions", "gca_approvals", "gca_home_overrides", "fir_labels"]
+
+# Deployment settings in dotenv or shell lines (NAME=value, optionally after
+# export), with the exact uppercase names those files use. The secret is the
+# first non-empty group: a whole quoted value, or an unquoted value up to a #
+# comment or the end of the line, as dotenv reads it. TypeScript fixtures and
+# `wrangler secret put` commands have no such line. Synthetic values pass:
+# prefix lists whose every item starts with Q or X, which no ICAO region uses,
+# and names that begin with "synthetic".
+[[rules]]
+id = "onfreq-deploy-setting-assignment"
+description = "onfreq deployment setting assigned a value"
+regex = '''(?m)^[+]?\s*(?:export\s+)?(?:FIR_PREFIXES|COORDINATOR_NAME)\s*=[ \t]*(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([^\s"'`#](?:[^#\n]*[^\s#])?))'''
+keywords = ["fir_prefixes", "coordinator_name"]
+
+[[rules.allowlists]]
+description = "Synthetic FIR prefixes and coordinator names"
+regexTarget = "secret"
+regexes = [
+  '''(?i)^\s*[QX][A-Z]{0,3}(?:\s*,\s*[QX][A-Z]{0,3})*\s*,?\s*$''',
+  '''^synthetic[-A-Za-z0-9]*$''',
+]
+
+# Known limits: values held in constants or variables under other names, files
+# that never write these setting names next to their values, deployment
+# settings outside dotenv or shell lines, and the JSON first line above are not
 # covered; check:privacy and review still apply.

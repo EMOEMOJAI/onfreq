@@ -87,13 +87,16 @@ EOF
 
 # Prints, space-separated, the short hashes of commits in one pushed range that
 # change the Gitleaks settings, add or remove a gitleaks:allow line, or carry
-# gitleaks:allow in their message. The scan reads messages too and honours all
-# of these, so a push can relax its own scan; they are named for review. The
-# message search uses the stored bytes (--encoding=none), as the scan does, so
-# an encoding header or i18n.logOutputEncoding cannot hide the marker.
-# As in the scan, a merge's own diff against each parent is included, whatever
-# log.diffMerges says, so a change only a merge resolution makes is named too;
-# --no-patch keeps those diffs out of the output.
+# gitleaks:allow in their message, author name or email (as stored, %an/%ae,
+# and mailmapped, %aN/%aE) or a changed path (--name-status prints both paths
+# of a rename or copy). The scan reads all of these and honours the marker on
+# any line, so a push can relax its own scan; they are named for review. The
+# committer is not printed by the scan, so it is not checked. Messages and
+# names use the stored bytes (--encoding=none), as the scan does, so an
+# encoding header or i18n.logOutputEncoding cannot hide the marker; the match
+# ignores case. As in the scan, a merge's own diff against each parent is
+# included, whatever log.diffMerges says, so a change only a merge resolution
+# makes is named too; --no-patch keeps those diffs out of the -G output.
 pushed_gitleaks_changes() {
   changes_range=$1
   set --
@@ -104,8 +107,16 @@ $changes_range
 EOF
   changes_settings=$(git log --no-show-signature --diff-merges=separate --no-patch --format=%h "$@" -- .gitleaks.toml .gitleaksignore </dev/null) &&
     changes_allow=$(git log --no-show-signature --diff-merges=separate --no-patch --text --no-textconv --no-ext-diff -G 'gitleaks:allow' --format=%h "$@" -- </dev/null) &&
-    changes_message=$(git log --no-show-signature --encoding=none --format=%h -F -i --grep='gitleaks:allow' "$@" </dev/null) || return 1
-  printf '%s\n%s\n%s\n' "$changes_settings" "$changes_allow" "$changes_message" | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
+    changes_message=$(git log --no-show-signature --encoding=none --format=%h -F -i --grep='gitleaks:allow' "$@" </dev/null) &&
+    changes_author=$(git log --no-show-signature --encoding=none --format='%h %an %ae %aN %aE' "$@" </dev/null) &&
+    changes_path=$(git log --no-show-signature --diff-merges=separate --name-status --format='commit %h' "$@" -- </dev/null) || return 1
+  # Hashes are hex, so only a name, email or path can carry the marker. Path
+  # lines always hold a tab, so they never look like a "commit" line.
+  changes_author=$(printf '%s\n' "$changes_author" | LC_ALL=C awk 'index(tolower($0), "gitleaks:allow") { print $1 }')
+  changes_path=$(printf '%s\n' "$changes_path" |
+    LC_ALL=C awk '/^commit [0-9a-f]+$/ { commit = $2; next } index(tolower($0), "gitleaks:allow") { print commit }')
+  printf '%s\n%s\n%s\n%s\n%s\n' "$changes_settings" "$changes_allow" "$changes_message" "$changes_author" "$changes_path" |
+    awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
 }
 
 # New commits per ref. The checks never print matched private values; Gitleaks redacts.
