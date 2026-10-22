@@ -100,6 +100,26 @@ description = "Synthetic FIR prefixes"
 regexTarget = "secret"
 regexes = ['''(?i)^\s*[QX][A-Z]{0,3}(?:\s*,\s*[QX][A-Z]{0,3})*\s*,?\s*$''']
 
+# FIR prefixes anywhere else on a line, with the exact uppercase name: a quoted
+# list of one to four letter items (blanks, including Unicode spaces, allowed
+# inside the quotes) whose first item does not start with Q or X, as in
+# TypeScript, JSON, YAML or PowerShell (real lists have no Q or X item); an
+# unquoted uppercase list that ends the line, as in YAML or a compose list
+# item; or NAME=list without blanks, as after env or A=1. So code
+# (`NAME: prefixes`), names in prose and `wrangler secret put` pass, and so do
+# values that are not prefix lists. Lists of Q and X items, with empty items,
+# are synthetic.
+[[rules]]
+id = "onfreq-fir-prefixes-property"
+description = "onfreq FIR_PREFIXES assigned a prefix list"
+regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(?:["'`]([\t \p{Zs}\x{FEFF}]*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:[\t \p{Zs}\x{FEFF}]*,[\t \p{Zs}\x{FEFF}]*[A-Za-z]{0,4})*[\t \p{Zs}\x{FEFF}]*)["'`]|([A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)[ \t\r]*(?:#[^\n]*)?$)|\bFIR_PREFIXES=([A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[ \t\r;&|)]|$)'''
+keywords = ["fir_prefixes"]
+
+[[rules.allowlists]]
+description = "Synthetic FIR prefixes"
+regexTarget = "secret"
+regexes = ['''(?i)^\s*[QX][A-Z]{0,3}(?:\s*,\s*(?:[QX][A-Z]{0,3})?)*\s*$''']
+
 # Synthetic coordinator names begin with "synthetic".
 [[rules]]
 id = "onfreq-coordinator-name-assignment"
@@ -133,11 +153,14 @@ regexes = [
 
 # Excluded callsigns: a comma list on one line whose first item contains an
 # underscore, as callsigns do, so a variable (`EXCLUDED_CALLSIGNS: a,`) passes.
+# Leading blanks may include Unicode spaces and a byte order mark; an item runs
+# to a blank, comma, quote, semicolon or closing bracket, so a dash, dot or
+# Unicode space inside an item cannot end the list early.
 # Synthetic callsigns start with Q or X, which no ICAO region uses.
 [[rules]]
 id = "onfreq-excluded-callsigns-assignment"
 description = "onfreq EXCLUDED_CALLSIGNS assigned a callsign list"
-regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*["'`]?[ \t]*([A-Za-z0-9]+_[A-Za-z0-9_]*(?:[ \t]*,[ \t]*[A-Za-z0-9_]*)*)'''
+regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*["'`]?[ \t\p{Zs}\x{FEFF}]*([A-Za-z0-9]+_[^\s,"'`;)}\]]*(?:[ \t]*,[ \t]*[^\s,"'`;)}\]]*)*)'''
 secretGroup = 1
 keywords = ["excluded_callsigns"]
 
@@ -162,15 +185,32 @@ description = "URLs on reserved test hosts"
 regexTarget = "secret"
 regexes = ['''(?i)^https?://(?:[a-z0-9-]+\.)*(?:test|example|invalid)(?:[/?#]\S*)?$''']
 
+# A quote, backtick or backslash inside the userinfo ends the rule above's
+# match early, so a reserved host before it could pass: x.test"@host, as shell
+# quoting joins it. This rule flags a link whose userinfo holds one of them
+# before an @, with no allowlist. A quote followed by a blank or comma ends the
+# link, so a later JSON field or comment holding an address passes.
+[[rules]]
+id = "onfreq-gca-policy-url-quoted-userinfo"
+description = "onfreq GCA_POLICY_URL with quoted userinfo"
+regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*["'`]?[ \t]*([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*["'`\\][A-Za-z0-9._~%!$&*+;=:"'`\\-]*@[^\s"'`]*)'''
+secretGroup = 1
+keywords = ["gca_policy_url"]
+
 # Known limits: values held in constants or variables under other names, files
 # that never write these setting names next to their values, and a
 # pretty-printed JSON first line that ends in a value rather than a bracket,
 # comma or colon are not covered. Neither are values that start on a later line
 # (a bracket on the next line or a YAML block scalar), escaped or encoded
-# setting names, or deployment settings anywhere but at the start of a dotenv
-# or shell line (env NAME=, A=1 NAME=, PowerShell, compose list items).
+# setting names, a coordinator name anywhere but at the start of a dotenv or
+# shell line (env NAME=, A=1 NAME=, PowerShell, compose list items), or FIR
+# prefixes there unquoted, unless as NAME=list or an uppercase list that ends
+# the line.
+# Neither is a quoted FIR prefix list whose first item starts with Q or X.
 # Identifying settings are missed as a quoted IVAO client ID shorter than eight
 # characters or an unquoted one without a digit, a callsign list whose first
 # item has no underscore, and a policy link without a scheme. Gitleaks' default
-# allowlist also passes any value containing "false" or ending in "null".
+# global allowlist passes values that start with "true", contain "false" or
+# end with "null" (any case), $VAR-style templates, one repeated character and
+# system paths; it cannot be removed while the default rules are extended.
 # check:privacy and review still apply.

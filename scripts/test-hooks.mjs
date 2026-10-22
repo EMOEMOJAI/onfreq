@@ -2064,3 +2064,146 @@ test('the repository Gitleaks rules pass identifying-setting fixtures, empty val
     const { hook, scan } = scanAssignment(f, text);
     for (const result of [...hook, scan]) assert.equal(result.status, 0, result.stderr);
   });
+
+// NX4-G1 (1a, 1b, 2b): quoted userinfo in a policy link, callsign lists with
+// dashed, dotted or Unicode-space items, and FIR prefixes outside dotenv lines.
+// Flagged lines are assembled at runtime from joined names, J prefixes and
+// random hosts, so this file never holds one. Each rule's cases pass with that
+// rule removed (or, for the callsign rule, with its previous regex), so the new
+// or widened rule is what blocks them.
+const jPrefix = (letter) => ['J', letter].join('');
+function g1Cases() {
+  const host = `jddd-${randomBytes(3).toString('hex')}.org`;
+  const tower = jsonName('JDDD', 'TWR');
+  const centre = jsonName('JDDD', 'CTR');
+  const [jd, je] = [jPrefix('D'), jPrefix('E')];
+  const lower = (name) => name.toLowerCase();
+  // rule id -> [line, text the redacted output must not show, label]
+  return {
+    'onfreq-gca-policy-url-quoted-userinfo': [
+      [`${policyUrlName}="https://x.test"@${host}/gca\n`, host, 'double quote before @, joined by the shell'],
+      [`${policyUrlName}='https://x.test'@${host}/gca\n`, host, 'single quote before @'],
+      [`${policyUrlName}=https://x.example\`@${host}/gca\n`, host, 'backtick before @'],
+      [`${policyUrlName}="https://x.test"\\@${host}/\n`, host, 'quote and backslash before @'],
+      [`${policyUrlName}='https://x.test'\\''@${host}/'\n`, host, 'shell-escaped single quote before @'],
+      [`  ${lower(policyUrlName)}: "HTTPS://X.INVALID"@${host.toUpperCase()}\n`, host.toUpperCase(), 'lowercase name'],
+    ],
+    'onfreq-excluded-callsigns-assignment': [
+      [`${callsignsName}=QCXX_CTR,QCXX-APP,${tower}\n`, tower, 'dashed item early in the list'],
+      [`  ${callsignsName}: 'QCXX_CTR, QC.X, ${tower}',\n`, tower, 'dotted item early in the list'],
+      [`${callsignsName}=QCXX_CTR,QC.X\n`, '', 'dotted item'],
+      [`"${callsignsName}": "QCXX_CTR,\u00a0${tower}"\n`, tower, 'no-break space before an item'],
+      [`${callsignsName}=QCXX_CTR,QCXX\u00a0${tower}\n`, tower, 'no-break space inside an item'],
+      [`${callsignsName}='\u00a0${centre}'\n`, centre, 'leading no-break space'],
+      [`${callsignsName}="\u3000${centre}"\n`, centre, 'leading ideographic space'],
+      [`${callsignsName}=\ufeff${centre}\n`, centre, 'leading byte order mark'],
+    ],
+    'onfreq-fir-prefixes-property': [
+      [`  ${firPrefixes}: '${jd}',\n`, '', 'TypeScript property'],
+      [`  ${firPrefixes}: '${jd}, XA',\n`, `${jd}, XA`, 'TypeScript list, J item first'],
+      [`"${firPrefixes}": "${jd},${je}"\n`, `${jd},${je}`, 'JSON key'],
+      [`{"${firPrefixes}":"\u00a0${jd}"}\n`, '', 'compact JSON with a no-break space'],
+      [`  ${firPrefixes}: ${jd}, ${je} # note\n`, `${jd}, ${je}`, 'YAML list'],
+      [`  ${firPrefixes}: "${jd}"\n`, '', 'quoted YAML'],
+      [`$env:${firPrefixes} = '${jd},${je}'\n`, `${jd},${je}`, 'PowerShell'],
+      [`      - ${firPrefixes}=${jd}\n`, '', 'compose list item'],
+      [`env ${firPrefixes}=${jd},${je} npm run deploy\n`, `${jd},${je}`, 'env command'],
+      [`A=1 ${firPrefixes}=${jd}\n`, '', 'after another assignment'],
+      [`A=1 ${firPrefixes}=${lower(jd)},${je}; npm test\n`, `${lower(jd)},${je}`, 'lowercase item before a semicolon'],
+      [`(${firPrefixes}=${jd})\n`, '', 'subshell'],
+    ],
+  };
+}
+// The configuration without one rule and its allowlist.
+function withoutRule(rules, id) {
+  const text = rules.toString();
+  const start = text.indexOf(`[[rules]]\nid = "${id}"\n`);
+  assert.ok(start >= 0, id);
+  const next = text.indexOf('\n[[rules]]\n', start);
+  return text.slice(0, start) + (next < 0 ? '' : text.slice(next + 1));
+}
+// The configuration with the callsign rule's regex as before NX4-G1: ASCII
+// blanks before the list and items of letters, digits and underscores.
+function previousCallsignRule(rules) {
+  const item = String.raw`[^\s,"'` + '`' + String.raw`;)}\]]*`;
+  const lines = rules.toString().split('\n');
+  const at = lines.findIndex((line) => line.startsWith(String.raw`regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b`));
+  assert.equal(lines[at].split(item).length, 3);
+  lines[at] = lines[at].replace(String.raw`[ \t\p{Zs}\x{FEFF}]*(`, String.raw`[ \t]*(`).replaceAll(item, '[A-Za-z0-9_]*');
+  assert.ok(!lines[at].includes('p{Zs}') && !lines[at].includes(item), 'previous callsign regex');
+  return lines.join('\n');
+}
+// Commits `text` without the hook and returns secret-scan.sh over that commit alone.
+function scanCommit(f, text) {
+  writeFileSync(join(f.repo, 'settings.env'), text);
+  f.git('add', 'settings.env');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic settings');
+  const scan = secretScan(f, 'HEAD^!');
+  f.git('rm', '--quiet', 'settings.env');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'remove synthetic settings');
+  return scan;
+}
+
+test('each NX4-G1 rule is needed: its cases pass without it (NX4-G1)', { skip: gitleaksSkip }, (t) => {
+  const f = fixture(t, { gitleaks: 'real' });
+  for (const [id, cases] of Object.entries(g1Cases())) {
+    const rules = id === 'onfreq-excluded-callsigns-assignment' ? previousCallsignRule(repoRules()) : withoutRule(repoRules(), id);
+    commitRules(f, rules);
+    const scan = scanCommit(f, cases.map(([line]) => `# synthetic settings\n${line}`).join(''));
+    assert.equal(scan.status, 0, `${id}: ${scan.stderr}`);
+  }
+});
+
+test('the repository Gitleaks rules block quoted userinfo, widened callsign items and FIR prefix properties, redacted (NX4-G1)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const cases of Object.values(g1Cases())) {
+      for (const [index, [line, secret, label]] of cases.entries()) {
+        const text = `# synthetic settings\n${line}# end\n`;
+        // The first case of each rule also goes through pre-commit, directly and as git commit.
+        let results = [scanCommit(f, text)];
+        if (index === 0) {
+          const { hook, scan } = scanAssignment(f, text);
+          results = [...hook, scan];
+        }
+        for (const result of results) {
+          assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+          if (secret) assert.ok(!(result.stderr + result.stdout).includes(secret), label);
+        }
+      }
+    }
+  });
+
+test('the repository Gitleaks rules pass every tracked line naming these settings, and synthetic forms (NX4-G1)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    // The rules file itself, as committed.
+    assert.equal(secretScan(f, 'HEAD^!').status, 0);
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const grep = spawnSync('git', ['grep', '-h', '-I', '-i', '-E', 'GCA_POLICY_URL|EXCLUDED_CALLSIGNS|FIR_PREFIXES'],
+      { cwd: root, env: gitEnv(), encoding: 'utf8' });
+    assert.equal(grep.status, 0, grep.stderr);
+    const tracked = grep.stdout;
+    for (const name of [firPrefixes, callsignsName, policyUrlName]) assert.ok(tracked.includes(`${name}: '`), name);
+    const address = ['owner', 'example.test'].join('@');
+    const jd = jPrefix('D');
+    const text = tracked
+      // Q and X prefixes are synthetic, and a quoted list whose first item is one passes.
+      + `  ${firPrefixes}: 'XD',\n"${firPrefixes}": "QC, QE"\n$env:${firPrefixes} = "XA"\n      - ${firPrefixes}=QC\n`
+      + `env ${firPrefixes}=QC,XA npm test\nA=1 ${firPrefixes}=xd\n  ${firPrefixes}: QC, XA # note\n`
+      + `  ${firPrefixes}: 'XD, ${jd}',\n`
+      // Code and lowercase dotenv names.
+      + `  ${firPrefixes}: prefixes,\n  ${firPrefixes}: JSON.parse(raw),\n  ${firPrefixes}: env.${firPrefixes},\n`
+      + `${firPrefixes.toLowerCase()}=${jd}\n`
+      // Synthetic callsigns after Unicode spaces.
+      + `${callsignsName}='\u00a0QCXX_CTR'\n${callsignsName}=\ufeffQCXX_CTR,QCXX_APP\n`
+      // A reserved policy link followed by a quote, then a field or comment holding an address.
+      + `{"${policyUrlName}": "https://example.test/gca", "contact": "${address}"}\n`
+      + `{"${policyUrlName}":"https://example.test","contact":"${address}"}\n`
+      + `${policyUrlName}=https://example.test/gca # owner ${address}\n`
+      + `${policyUrlName}="https://example.test" # ${address}\n`;
+    const { hook, scan } = scanAssignment(f, text);
+    for (const result of [...hook, scan]) assert.equal(result.status, 0, result.stderr);
+  });
