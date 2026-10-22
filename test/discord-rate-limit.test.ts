@@ -450,26 +450,40 @@ it('trackPosts binds the other methods to the wrapped limits', async () => {
   }
 });
 
-it('defers without a request once the delivery deadline has passed, and sends again when it is cleared', async () => {
+it('starts a request only when it can finish by the delivery deadline, and sends again when it is cleared', async () => {
   const network = vi.fn().mockImplementation(async () => Response.json({ id: 'synthetic' }));
   vi.stubGlobal('fetch', network);
   const limits = new DiscordRateLimits();
-  limits.setDeadline(START + 1000);
+  limits.setDeadline(START + 10_000);
 
+  // Exactly REQUEST_TIMEOUT_MS (10 s) of budget still starts.
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
-  now += 1000;
+  expect(network).toHaveBeenCalledTimes(1);
+  // One millisecond less cannot be guaranteed to finish: defer without a request.
+  now += 1;
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).rejects.toMatchObject({
-    name: 'DiscordRateLimitError', requestMade: false, global: false, reason: 'deadline', retryAt: START + 1000,
+    name: 'DiscordRateLimitError', requestMade: false, global: false, reason: 'deadline', retryAt: START + 10_000,
     message: 'Discord request deferred (poll time budget)',
   });
   expect(network).toHaveBeenCalledTimes(1);
+  // Past the deadline itself also defers.
+  now += 20_000;
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).rejects.toMatchObject({ reason: 'deadline' });
 
   limits.setDeadline(undefined);
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
   expect(network).toHaveBeenCalledTimes(2);
 });
 
-it('never sleeps a soft wait past the delivery deadline', async () => {
+it('canStartBy is always true without a deadline and counts the request timeout with one', () => {
+  const limits = new DiscordRateLimits();
+  expect(limits.canStartBy(10 ** 9)).toBe(true);
+  limits.setDeadline(START + 12_500);
+  expect(limits.canStartBy(2_500)).toBe(true);
+  expect(limits.canStartBy(2_501)).toBe(false);
+});
+
+it('never sleeps a soft wait that would leave less than a request timeout before the delivery deadline', async () => {
   const waits = instantSoftWaits();
   const network = vi.fn()
     .mockImplementationOnce(exhausted('2'))
@@ -478,14 +492,14 @@ it('never sleeps a soft wait past the delivery deadline', async () => {
   const limits = new DiscordRateLimits();
 
   await limits.fetch('/channels/a/messages', { method: 'POST' });
-  limits.setDeadline(START + 1999);
+  limits.setDeadline(START + 11_999);
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
     .rejects.toMatchObject({ requestMade: false, reason: 'deadline' });
   expect(waits).toEqual([]);
   expect(network).toHaveBeenCalledTimes(1);
 
-  // A wait that ends exactly at the deadline still fits the budget.
-  limits.setDeadline(START + 2000);
+  // A wait after which a full request timeout still fits the budget proceeds.
+  limits.setDeadline(START + 12_000);
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
   expect(waits).toEqual([2000]);
 });

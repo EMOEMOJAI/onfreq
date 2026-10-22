@@ -683,6 +683,22 @@ describe('REST calls', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('does not sleep a 5xx backoff whose retry could no longer finish within the delivery deadline', async () => {
+    const fetchMock = stubFetch(
+      Response.json({ message: 'server error' }, { status: 503 }),
+      Response.json({ id: '100000000000000999' }),
+    );
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    const limits = new DiscordRateLimits();
+    // 10.2 s left: the first attempt may start, but a retry after 0.5 s may not.
+    limits.setDeadline(Date.now() + 10_200);
+    const err = await editMessage('token', '100000000000000123', '100000000000000999', buildSessionEndedEmbed(endedEvent, LABELS), limits)
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: 'DiscordRateLimitError', requestMade: false, reason: 'deadline' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(timers.mock.calls.filter(([, ms]) => ms === 500)).toEqual([]);
+  });
+
   it('keeps retrying a PATCH/DELETE on a 5xx, and marks an outage as soon as its retry budget is exhausted', async () => {
     const fetchMock = stubFetch(
       ...Array.from({ length: 4 }, () => Response.json({ message: 'server error' }, { status: 503 })),

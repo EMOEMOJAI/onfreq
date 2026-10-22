@@ -1,4 +1,4 @@
-import { fetchBuffered, ResponseTooLargeError } from './http';
+import { fetchBuffered, REQUEST_TIMEOUT_MS, ResponseTooLargeError } from './http';
 
 const KEY = 'discord-rate-limits-v1'; // gitleaks:allow — storage key name, not a credential
 const GLOBAL = '*';
@@ -132,18 +132,32 @@ export class DiscordRateLimits {
   }
 
   /**
-   * Bound the time this instance may spend on requests: once `deadline` has
-   * passed, `fetch` defers without a request and no soft wait sleeps past it.
+   * Bound the time this instance may spend on requests: `fetch` starts a
+   * request only if it can finish (REQUEST_TIMEOUT_MS) by `deadline`, and no
+   * soft wait or 5xx backoff sleeps past the last moment a request may start.
    * Undefined removes the bound.
    */
   setDeadline(deadline: number | undefined): void {
     this.deliveryDeadline = deadline;
   }
 
+  /**
+   * True when a request begun `delayMs` from now could still finish within the
+   * delivery deadline, assuming the worst case of REQUEST_TIMEOUT_MS. Always
+   * true while no deadline is set. Exactly REQUEST_TIMEOUT_MS of budget fits.
+   */
+  canStartBy(delayMs: number): boolean {
+    return this.deliveryDeadline === undefined ||
+      Date.now() + delayMs + REQUEST_TIMEOUT_MS <= this.deliveryDeadline;
+  }
+
+  /** The deferral for a request that `canStartBy` rejected: no request was made. */
+  deadlineDeferral(): DiscordRateLimitError {
+    return new DiscordRateLimitError(this.deliveryDeadline ?? Date.now(), false, false, 'deadline');
+  }
+
   async fetch(path: string, init: RequestInit): Promise<Response> {
-    if (this.deliveryDeadline !== undefined && Date.now() >= this.deliveryDeadline) {
-      throw new DiscordRateLimitError(this.deliveryDeadline, false, false, 'deadline');
-    }
+    if (!this.canStartBy(0)) throw this.deadlineDeferral();
     const route = routeKey(path);
     const globalDeadline = this.deadlines[GLOBAL] ?? 0;
     const routeDeadline = this.deadlines[route] ?? 0;
@@ -153,7 +167,7 @@ export class DiscordRateLimits {
     if (blockedUntil > Date.now()) {
       const wait = blockedUntil - Date.now();
       // Only the soft deadline blocks, and briefly: wait it out rather than defer.
-      const withinBudget = this.deliveryDeadline === undefined || Date.now() + wait <= this.deliveryDeadline;
+      const withinBudget = this.canStartBy(wait);
       if (hardUntil <= Date.now() && wait <= MAX_SOFT_WAIT_MS && this.softWaitedMs + wait <= MAX_SOFT_WAIT_TOTAL_MS &&
           withinBudget) {
         this.softWaitedMs += wait;

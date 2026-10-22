@@ -570,7 +570,11 @@ async function discordRequest(
       }
       throw new DiscordApiError(status, body);
     }
-    await sleep(500 * 2 ** (attempt - 1));
+    const backoff = 500 * 2 ** (attempt - 1);
+    // The earlier 5xx is handled as above; only the retry is abandoned, and it
+    // is reported as never made, so the deferral is retried by a later poll.
+    if (!limits.canStartBy(backoff)) throw limits.deadlineDeferral();
+    await sleep(backoff);
   }
 }
 
