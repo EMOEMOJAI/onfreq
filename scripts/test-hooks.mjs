@@ -1967,3 +1967,100 @@ test('both scans run the shared stream filter after NUL replacement, each stage 
   assert.match(result.stderr, /^pre-commit: BLOCKED — missing the stream filter scripts\/hooks\/lib\/scan-stream\.awk\.$/m);
   assert.equal(result.gitleaks, '');
 });
+
+// NX3-S2 (F7-F9): identifying settings. Setting names and flagged values are
+// joined at runtime, so this file never holds a line the rules would flag; the
+// lines that must pass are written out. Flagged callsigns use the unassigned J
+// prefix, flagged hosts a random name under .org, and flagged client IDs a
+// low-entropy value that the default rules miss.
+const clientIdName = jsonName('IVAO', 'CLIENT', 'ID');
+const callsignsName = jsonName('EXCLUDED', 'CALLSIGNS');
+const policyUrlName = jsonName('GCA', 'POLICY', 'URL');
+function identifyingCases() {
+  const id = ['ab12', 'ab12', 'ab12'].join('');
+  const tower = jsonName('JDDD', 'TWR');
+  const centre = jsonName('JDDD', 'CTR');
+  const host = `jddd-${randomBytes(3).toString('hex')}.org`;
+  const policy = `https://${host}/gca`;
+  const lower = (name) => name.toLowerCase();
+  // [line, text the redacted output must not show, label]
+  return [
+    [`${clientIdName}="${id}"\n`, id, 'quoted client ID'],
+    [`${clientIdName}=${id}\n`, id, 'unquoted client ID with a digit'],
+    [`  ${clientIdName}: '${id}',\n`, id, 'client ID property'],
+    [`"${clientIdName}": "${id}",\n`, id, 'client ID JSON key'],
+    [`${lower(clientIdName)}=${id}\n`, id, 'lowercase client ID name'],
+    [`${clientIdName}=' ${'abcd'.repeat(2)}'\n`, 'abcdabcd', 'quoted client ID without a digit, after a blank'],
+    [`${clientIdName}='${['aaaa', 'test-client'].join('')}'\n`, 'aaaatest-client', 'client ID ending in the fixture'],
+    [`${clientIdName}='${['test-client', '2'].join('-')}'\n`, 'test-client-2', 'client ID starting with the fixture'],
+    [`${clientIdName}='${['synthetic', 'ab12.ab12'].join('-')}'\n`, 'ab12.ab12', 'synthetic prefix with a dot'],
+    [`${clientIdName}=${['00000000', '0001'].join('-')}\n`, '0000-0001', 'nonzero client ID'],
+    [`${callsignsName}="${centre}"\n`, centre, 'quoted callsign'],
+    [`${callsignsName}=${centre},${tower}\n`, `${centre},${tower}`, 'unquoted callsign list'],
+    [`  ${callsignsName}: 'QCXX_CTR, ${tower}',\n`, tower, 'mixed synthetic and real-shaped list'],
+    [`${lower(callsignsName)}: '${lower(centre)}',\n`, lower(centre), 'lowercase name and callsign'],
+    [`"${callsignsName}": "XA_SYN_CTR,${lower(tower)}"\n`, lower(tower), 'lowercase real-shaped item after a synthetic one'],
+    [`${callsignsName}=' ${centre}'\n`, centre, 'callsign after a blank'],
+    [`${callsignsName}=QCXX_CTR,,${tower}\n`, tower, 'real-shaped item after an empty one'],
+    [`${policyUrlName}=${policy}\n`, host, 'unquoted policy link'],
+    [`${policyUrlName}="${policy}"\n`, host, 'quoted policy link'],
+    [`  ${policyUrlName}: '${policy}?ref=1',\n`, host, 'policy link property'],
+    [`${lower(policyUrlName)}: "HTTPS://${host.toUpperCase()}/GCA"\n`, host.toUpperCase(), 'lowercase name, uppercase link'],
+    [`${policyUrlName}=ftp://${host}/gca\n`, host, 'another scheme'],
+    [`${policyUrlName}=https://x.test@${host}/gca\n`, host, 'reserved userinfo'],
+    [`${policyUrlName}=https://example.test:x@${host}/\n`, host, 'reserved userinfo with a password'],
+    [`${policyUrlName}=https://x.test\\@${host}/\n`, host, 'reserved userinfo after a backslash'],
+    [`${policyUrlName}=https://test.${host}/gca\n`, host, 'reserved label as a subdomain'],
+    [`${policyUrlName}=https://x.example.${host}/gca\n`, host, 'reserved domain as a subdomain'],
+    [`${policyUrlName}=https://${host}/x.test\n`, host, 'reserved name in the path'],
+    [`${policyUrlName}=https://${host}?x.example\n`, host, 'reserved name in the query'],
+    [`${policyUrlName}=https://${host}#x.invalid\n`, host, 'reserved name in the fragment'],
+    [`${policyUrlName}=https://example.test:8443/gca\n`, '', 'reserved host with a port'],
+  ];
+}
+
+test('the repository Gitleaks rules block identifying settings that the default rules miss, redacted (NX3-S2 F7-F9)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const cases = identifyingCases();
+    // Default rules alone pass every case, so only the repository rules can block them.
+    commitRules(f, '[extend]\nuseDefault = true\n');
+    let { hook, scan } = scanAssignment(f, cases.map(([line]) => line).join(''));
+    for (const result of [...hook, scan]) assert.equal(result.status, 0, result.stderr);
+    commitRules(f, repoRules());
+    for (const [line, secret, label] of cases) {
+      ({ hook, scan } = scanAssignment(f, `# synthetic settings\n${line}# end\n`));
+      for (const result of [...hook, scan]) {
+        assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+        if (secret) assert.ok(!(result.stderr + result.stdout).includes(secret), label);
+      }
+    }
+  });
+
+test('the repository Gitleaks rules pass identifying-setting fixtures, empty values, code and reserved hosts (NX3-S2 F7-F9)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    // The tracked fixtures and references, as written in src/, test/, config/ and vitest.config.ts.
+    const text = "    ...env, IVAO_CLIENT_ID: 'test-client', IVAO_CLIENT_SECRET: 'test-secret',\n"
+      + "    expect(ivaoAuthFromEnv({ IVAO_CLIENT_ID: 'a' } as unknown as Env)).toBeUndefined();\n"
+      + "      ivaoAuthFromEnv({ IVAO_CLIENT_ID: ' ', IVAO_CLIENT_SECRET: ' ' } as unknown as Env),\n"
+      + '  IVAO_CLIENT_ID?: string;\n  const clientId = env.IVAO_CLIENT_ID?.trim();\n'
+      + "IVAO_CLIENT_ID=\"\"\n        IVAO_CLIENT_ID: '',\nIVAO_CLIENT_ID=synthetic-ivao-client\n"
+      + "IVAO_CLIENT_ID='00000000-0000-0000-0000-000000000000'\n  IVAO_CLIENT_ID: clientId,\n"
+      + "  IVAO_CLIENT_ID: env.IVAO_CLIENT_ID,\n  IVAO_CLIENT_ID: 'abc1234',\n"
+      + "const EXCLUDED = { EXCLUDED_CALLSIGNS: 'QCXX_CTR' };\n"
+      + "    ['an excluded callsign', entry('QCTT_GND'), { EXCLUDED_CALLSIGNS: 'QCTT_GND' }],\n"
+      + "    ['a listed excluded callsign', {}, { EXCLUDED_CALLSIGNS: 'QC_OTHER, xa_syn_ctr' }],\n"
+      + "    await expect(configuredPoll({ EXCLUDED_CALLSIGNS: a, DISCORD_CHANNEL_IDS: '900000000000000001' }))\n"
+      + '        ...env, EXCLUDED_CALLSIGNS: b,\n  const excluded = parseExcludedCallsigns(env.EXCLUDED_CALLSIGNS);\n'
+      + 'EXCLUDED_CALLSIGNS=""\nEXCLUDED_CALLSIGNS=QCXX_CTR,\n'
+      + "    const parsed = parseGcaPolicy({ ...settings(), GCA_POLICY_URL: 'https://example.test/gca' })!;\n"
+      + "    await gcaConfig({ GCA_DM_ENABLED: 'true', GCA_POLICY_URL: 'http://example.test/gca' });\n"
+      + "      expect(parseGcaPolicy({ ...settings(), GCA_POLICY_URL: String(url) })?.policyUrl).toBeUndefined();\n"
+      + "    await check([atc({ sessionId: 2 })], { ...settings(), GCA_POLICY_URL: ' ' });\n"
+      + 'GCA_POLICY_URL=""\nGCA_POLICY_URL=https://policy.example/gca?ref=1#top\nGCA_POLICY_URL="HTTPS://X.INVALID"\n'
+      + "GCA_POLICY_URL='https://example.test/gca?ref=xxxx'\n";
+    const { hook, scan } = scanAssignment(f, text);
+    for (const result of [...hook, scan]) assert.equal(result.status, 0, result.stderr);
+  });

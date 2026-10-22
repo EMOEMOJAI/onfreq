@@ -112,6 +112,56 @@ description = "Synthetic coordinator names"
 regexTarget = "secret"
 regexes = ['''^synthetic[-A-Za-z0-9]*$''']
 
+# Identifying settings, under the setting name in any case and in any file
+# type. The IVAO client ID is a quoted value of eight or more characters or an
+# unquoted value containing a digit, so code such as `IVAO_CLIENT_ID: clientId`
+# and short test values pass. Synthetic IDs begin with "synthetic-".
+[[rules]]
+id = "onfreq-ivao-client-id-assignment"
+description = "onfreq IVAO_CLIENT_ID assigned a value"
+regex = '''\b(?i:IVAO_CLIENT_ID)\b["']?\s*[=:]\s*(?:["'`][ \t]*([^\s"'`]{8,})|([^\s"'`,;)}\]]*[0-9][^\s"'`,;)}\]]*))'''
+keywords = ["ivao_client_id"]
+
+[[rules.allowlists]]
+description = "Synthetic, published fixture and all-zero client IDs"
+regexTarget = "secret"
+regexes = [
+  '''^synthetic-[A-Za-z0-9-]*$''',
+  '''^test-client$''',
+  '''^0+(?:-0+)*$''',
+]
+
+# Excluded callsigns: a comma list on one line whose first item contains an
+# underscore, as callsigns do, so a variable (`EXCLUDED_CALLSIGNS: a,`) passes.
+# Synthetic callsigns start with Q or X, which no ICAO region uses.
+[[rules]]
+id = "onfreq-excluded-callsigns-assignment"
+description = "onfreq EXCLUDED_CALLSIGNS assigned a callsign list"
+regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*["'`]?[ \t]*([A-Za-z0-9]+_[A-Za-z0-9_]*(?:[ \t]*,[ \t]*[A-Za-z0-9_]*)*)'''
+secretGroup = 1
+keywords = ["excluded_callsigns"]
+
+[[rules.allowlists]]
+description = "Synthetic callsigns only, across the whole list"
+regexTarget = "secret"
+regexes = ['''(?i)^[QX][A-Z0-9_]*(?:[ \t]*,[ \t]*(?:[QX][A-Z0-9_]*)?)*$''']
+
+# The GCA policy link: any scheme://URL. Only hosts under the reserved .test,
+# .example and .invalid domains pass, ending the URL or followed by a path,
+# query or fragment, so userinfo (x.test@host), subdomain (test.host) and path
+# (host/x.test) forms, and ports, are flagged.
+[[rules]]
+id = "onfreq-gca-policy-url-assignment"
+description = "onfreq GCA_POLICY_URL assigned a URL"
+regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*["'`]?[ \t]*([A-Za-z][A-Za-z0-9+.-]*://[^\s"'`]+)'''
+secretGroup = 1
+keywords = ["gca_policy_url"]
+
+[[rules.allowlists]]
+description = "URLs on reserved test hosts"
+regexTarget = "secret"
+regexes = ['''(?i)^https?://(?:[a-z0-9-]+\.)*(?:test|example|invalid)(?:[/?#]\S*)?$''']
+
 # Known limits: values held in constants or variables under other names, files
 # that never write these setting names next to their values, and a
 # pretty-printed JSON first line that ends in a value rather than a bracket,
@@ -119,4 +169,8 @@ regexes = ['''^synthetic[-A-Za-z0-9]*$''']
 # (a bracket on the next line or a YAML block scalar), escaped or encoded
 # setting names, or deployment settings anywhere but at the start of a dotenv
 # or shell line (env NAME=, A=1 NAME=, PowerShell, compose list items).
+# Identifying settings are missed as a quoted IVAO client ID shorter than eight
+# characters or an unquoted one without a digit, a callsign list whose first
+# item has no underscore, and a policy link without a scheme. Gitleaks' default
+# allowlist also passes any value containing "false" or ending in "null".
 # check:privacy and review still apply.
