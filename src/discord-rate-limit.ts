@@ -31,11 +31,13 @@ const UNREADABLE_RATE_LIMIT_COOLDOWN_MS = 60_000;
  * `rate_limit`: a real Discord 429. `soft`: an in-memory cooldown inferred
  * from a 2xx response's rate-limit headers. `outage`: this route/instance
  * recently exhausted its 5xx retry budget and is failing fast instead.
+ * `deadline`: the poll's delivery time budget (`setDeadline`) has run out.
  */
-export type DiscordRateLimitReason = 'rate_limit' | 'soft' | 'outage';
+export type DiscordRateLimitReason = 'rate_limit' | 'soft' | 'outage' | 'deadline';
 
 function messageFor(reason: DiscordRateLimitReason): string {
   switch (reason) {
+    case 'deadline': return 'Discord request deferred (poll time budget)';
     case 'outage': return 'Discord request deferred (outage cooldown)';
     case 'soft': return 'Discord request deferred (soft cooldown from response headers)';
     default: return 'Discord API 429: delivery deferred until cooldown expires';
@@ -73,6 +75,8 @@ export class DiscordRateLimits {
   private softWaitedMs = 0;
   /** Consecutive POST 5xx/timeout failures since Discord last returned a non-5xx, non-429 response. */
   private postFailureStreak = 0;
+  /** In-memory only: epoch ms after which no request is sent, or undefined for no bound. */
+  private deliveryDeadline: number | undefined;
 
   constructor(
     private readonly storage?: DurableObjectStorage,
@@ -127,7 +131,19 @@ export class DiscordRateLimits {
     this.postFailureStreak = 0;
   }
 
+  /**
+   * Bound the time this instance may spend on requests: once `deadline` has
+   * passed, `fetch` defers without a request and no soft wait sleeps past it.
+   * Undefined removes the bound.
+   */
+  setDeadline(deadline: number | undefined): void {
+    this.deliveryDeadline = deadline;
+  }
+
   async fetch(path: string, init: RequestInit): Promise<Response> {
+    if (this.deliveryDeadline !== undefined && Date.now() >= this.deliveryDeadline) {
+      throw new DiscordRateLimitError(this.deliveryDeadline, false, false, 'deadline');
+    }
     const route = routeKey(path);
     const globalDeadline = this.deadlines[GLOBAL] ?? 0;
     const routeDeadline = this.deadlines[route] ?? 0;
@@ -137,11 +153,14 @@ export class DiscordRateLimits {
     if (blockedUntil > Date.now()) {
       const wait = blockedUntil - Date.now();
       // Only the soft deadline blocks, and briefly: wait it out rather than defer.
-      if (hardUntil <= Date.now() && wait <= MAX_SOFT_WAIT_MS && this.softWaitedMs + wait <= MAX_SOFT_WAIT_TOTAL_MS) {
+      const withinBudget = this.deliveryDeadline === undefined || Date.now() + wait <= this.deliveryDeadline;
+      if (hardUntil <= Date.now() && wait <= MAX_SOFT_WAIT_MS && this.softWaitedMs + wait <= MAX_SOFT_WAIT_TOTAL_MS &&
+          withinBudget) {
         this.softWaitedMs += wait;
         await sleep(wait);
       } else {
         const reason: DiscordRateLimitReason =
+          hardUntil <= Date.now() && !withinBudget && wait <= MAX_SOFT_WAIT_MS ? 'deadline' :
           blockedUntil === globalDeadline || blockedUntil === routeDeadline ? 'rate_limit' :
           blockedUntil === this.outageUntil ? 'outage' : 'soft';
         throw new DiscordRateLimitError(blockedUntil, false, blockedUntil === globalDeadline, reason);

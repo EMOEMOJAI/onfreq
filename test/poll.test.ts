@@ -558,6 +558,52 @@ describe('polling through the Durable Object', () => {
     expect(error).toHaveBeenCalledWith(JSON.stringify({ event: 'offline_jobs_dropped', reason: 'expired', count: 1 }));
   });
 
+  it('defers public delivery without requests once the poll time budget runs out, then delivers it next poll', async () => {
+    const jobs = [a, 'QGLL_TWR', 'QHEL_TWR'].map((callsign): PendingOffline => ({
+      event: { ...session(callsign), endedAt: new Date(START - 60_000).toISOString(), durationSeconds: 3600 },
+      messages: [{ channelId: '900000000000000001', messageId: mid(callsign) }], channelIds: [],
+    }));
+    const tail = ['QIST_TWR', 'QJFK_TWR'];
+    jobs.push(...tail.map((callsign): PendingOffline => ({
+      event: { ...session(callsign), endedAt: new Date(START - 60_000).toISOString(), durationSeconds: 3600 },
+      messages: [{ channelId: '900000000000000001', messageId: mid(callsign) }], channelIds: [],
+    })));
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: jobs } satisfies PollSnapshot);
+    });
+    feed = [entry(b)];
+    // A slow Discord: each request takes 20 s of the mocked clock, so the 45 s
+    // budget allows three requests.
+    const original = network.getMockImplementation()!;
+    let slow = true;
+    network.mockImplementation(async (input, init) => {
+      const response = await original(input, init);
+      if (slow && String(input).startsWith('https://discord.com/')) now += 20_000;
+      return response;
+    });
+    const discordCalls = () => network.mock.calls.filter(([input]) => String(input).startsWith('https://discord.com/')).length;
+    const run = () => configuredPoll({ DISCORD_CHANNEL_IDS: '900000000000000001' });
+
+    await expect(run()).rejects.toThrow('some Discord notifications failed');
+    expect(discordCalls()).toBe(3);
+    const stored = (await snapshot())!;
+    expect(stored.pendingOffline?.map((pending) => pending.event.callsign)).toEqual(tail);
+    // The deferred closeouts and the new first card are charged to no budget.
+    expect(stored.pendingOffline?.every((pending) =>
+      pending.attempts === 0 && Object.values(pending.attemptsByChannel ?? {}).every((used) => used === 0))).toBe(true);
+    expect(stored.state?.[b]).toMatchObject({ pendingChannelIds: ['900000000000000001'] });
+    expect(stored.state?.[b]?.onlineAttemptsByChannel ?? {}).toEqual({ '900000000000000001': 0 });
+    expect(stored.state?.[b]?.messages).toBeUndefined();
+
+    slow = false;
+    now += 60_000;
+    await expect(run()).resolves.toEqual({ skipped: false });
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    for (const callsign of [a, 'QGLL_TWR', 'QHEL_TWR', ...tail]) expect(cards.get(mid(callsign))?.title).toContain('OFFLINE');
+    expect(sent.filter((item) => item.method === 'POST' && item.embed.title?.includes(`${b} is now ONLINE`))).toHaveLength(1);
+    expect((await snapshot())?.state?.[b]?.messages).toHaveLength(1);
+  });
+
   it('keeps an expired closeout whose final attempt was deferred without reaching Discord', async () => {
     const error = vi.spyOn(console, 'error');
     const c = 'QGLL_TWR';

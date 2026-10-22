@@ -62,6 +62,12 @@ const MAX_OFFLINE_JOBS = 200;
  * they are tracked silently, like the first-run baseline, instead of carded.
  */
 const MAX_NEW_SESSIONS_PER_POLL = 50;
+/**
+ * How long public delivery (closeouts, first cards, edits, roster pages) may
+ * keep sending requests in one poll. Requests after it are deferred to the
+ * next poll without being sent or charged to any retry budget.
+ */
+export const PUBLIC_DELIVERY_BUDGET_MS = 45_000;
 
 /** Closeout destinations in channels removed from DISCORD_CHANNEL_IDS, kept untouched. */
 interface ParkedDestinations {
@@ -860,102 +866,110 @@ export async function runPoll(
     newlyOnline = [];
   }
 
-  // Close out sessions that ended before announcing any that just started,
-  // so a callsign that goes offline and a replacement taking it over the
-  // same poll are never shown online before their predecessor's closeout.
-  const base: PollBase = { env, labels, limits, nowIso, channelIds };
-  const { jobs, parked } = buildOfflineJobs(channelIds, previousJobs, [...wentOffline, ...excludedClosures]);
-  const offline = await deliverOfflineJobs(base, next, jobs, parked);
-  const { pendingOffline } = offline;
-  let attempted = offline.attempted;
-  let delivered = offline.delivered;
-  let deliveryFailed = offline.failed;
+  // Public delivery gets a time budget so a slow Discord cannot stretch one poll
+  // past the next cron. GCA (own budget) ran above and short-session runs after
+  // the snapshot is saved on this same instance, so both stay unbounded.
+  limits.setDeadline(Date.now() + PUBLIC_DELIVERY_BUDGET_MS);
+  try {
+    // Close out sessions that ended before announcing any that just started,
+    // so a callsign that goes offline and a replacement taking it over the
+    // same poll are never shown online before their predecessor's closeout.
+    const base: PollBase = { env, labels, limits, nowIso, channelIds };
+    const { jobs, parked } = buildOfflineJobs(channelIds, previousJobs, [...wentOffline, ...excludedClosures]);
+    const offline = await deliverOfflineJobs(base, next, jobs, parked);
+    const { pendingOffline } = offline;
+    let attempted = offline.attempted;
+    let delivered = offline.delivered;
+    let deliveryFailed = offline.failed;
 
-  const nowMs = Date.parse(nowIso);
-  const mentionCooldownMs = parseMentionCooldownMs(env.MENTION_COOLDOWN_MINUTES);
-  // Keep only configured channels still within their cooldown. A ping time
-  // in the future (clock skew or corrupt storage) is not trusted.
-  const rolePings = Object.fromEntries(Object.entries(previousRolePings).filter(([id, at]) =>
-    channelIds.includes(id) && typeof at === 'number' && at <= nowMs && nowMs - at < mentionCooldownMs));
-  const ctx: PollContext = {
-    ...base, rolePings, mentionCooldownMs,
-    mentionRoleId: parseMentionRole(env.MENTION_ROLE_ID),
-    // The public marker reveals private approval records: shown only while
-    // reminders themselves are enabled, with a valid policy and valid
-    // guild/member-role IDs (the same checks that gate sending them).
-    highlightPolicy: gcaRemindersEnabled(env) ? gcaPolicy : null,
-    mentionedChannels: new Set(),
-    rosterHolders: new Map(),
-  };
-  for (const atc of newlyOnline) next[atc.callsign]!.pendingChannelIds = channelIds;
-  const announcements = Object.values(next)
-    .filter((entry) => !entry.pending && entry.missed === 0 && entry.pendingChannelIds)
-    .map((entry) => ({ entry, targets: entry.pendingChannelIds!.filter((id) => channelIds.includes(id) &&
-      !entry.messages?.some((ref) => ref.channelId === id)) }));
-  // Cards posted this poll share the newest postedAt, and newestCardedSession
-  // breaks that tie in favour of the later entry: the last poster per channel
-  // is expected to hold the roster.
-  for (const { entry, targets } of announcements) for (const id of targets) ctx.rosterHolders.set(id, entry);
-  const coverage = current.map((atc) => (Object.hasOwn(next, atc.callsign) ? next[atc.callsign] : undefined) ?? atc);
-  for (const { entry, targets } of announcements) {
-    attempted += targets.length;
-    // No destination left needing a first card: skip building/posting
-    // embeds and just run the bookkeeping.
-    const outcome: FirstCardOutcome = targets.length
-      ? await announceOnline(ctx, entry, targets, coverage,
-        // A session first seen before this poll may have used its nonce in an
-        // earlier attempt, even one whose state was never saved.
-        entry.since !== nowIso)
-      : { posted: [], failed: new Map(), unconfirmed: new Set() };
-    delivered += outcome.posted.length + outcome.unconfirmed.size;
-    if (outcome.failed.size) deliveryFailed = true;
-    if (recordFirstCardOutcome(ctx, entry, targets, outcome)) deliveryFailed = true;
-  }
+    const nowMs = Date.parse(nowIso);
+    const mentionCooldownMs = parseMentionCooldownMs(env.MENTION_COOLDOWN_MINUTES);
+    // Keep only configured channels still within their cooldown. A ping time
+    // in the future (clock skew or corrupt storage) is not trusted.
+    const rolePings = Object.fromEntries(Object.entries(previousRolePings).filter(([id, at]) =>
+      channelIds.includes(id) && typeof at === 'number' && at <= nowMs && nowMs - at < mentionCooldownMs));
+    const ctx: PollContext = {
+      ...base, rolePings, mentionCooldownMs,
+      mentionRoleId: parseMentionRole(env.MENTION_ROLE_ID),
+      // The public marker reveals private approval records: shown only while
+      // reminders themselves are enabled, with a valid policy and valid
+      // guild/member-role IDs (the same checks that gate sending them).
+      highlightPolicy: gcaRemindersEnabled(env) ? gcaPolicy : null,
+      mentionedChannels: new Set(),
+      rosterHolders: new Map(),
+    };
+    for (const atc of newlyOnline) next[atc.callsign]!.pendingChannelIds = channelIds;
+    const announcements = Object.values(next)
+      .filter((entry) => !entry.pending && entry.missed === 0 && entry.pendingChannelIds)
+      .map((entry) => ({ entry, targets: entry.pendingChannelIds!.filter((id) => channelIds.includes(id) &&
+        !entry.messages?.some((ref) => ref.channelId === id)) }));
+    // Cards posted this poll share the newest postedAt, and newestCardedSession
+    // breaks that tie in favour of the later entry: the last poster per channel
+    // is expected to hold the roster.
+    for (const { entry, targets } of announcements) for (const id of targets) ctx.rosterHolders.set(id, entry);
+    const coverage = current.map((atc) => (Object.hasOwn(next, atc.callsign) ? next[atc.callsign] : undefined) ?? atc);
+    for (const { entry, targets } of announcements) {
+      attempted += targets.length;
+      // No destination left needing a first card: skip building/posting
+      // embeds and just run the bookkeeping.
+      const outcome: FirstCardOutcome = targets.length
+        ? await announceOnline(ctx, entry, targets, coverage,
+          // A session first seen before this poll may have used its nonce in an
+          // earlier attempt, even one whose state was never saved.
+          entry.since !== nowIso)
+        : { posted: [], failed: new Map(), unconfirmed: new Set() };
+      delivered += outcome.posted.length + outcome.unconfirmed.size;
+      if (outcome.failed.size) deliveryFailed = true;
+      if (recordFirstCardOutcome(ctx, entry, targets, outcome)) deliveryFailed = true;
+    }
 
-  const cards = await syncOnlineCards(ctx, next, current);
-  // Pages and markers in a channel removed from DISCORD_CHANNEL_IDS are kept
-  // untouched (never edited, deleted or swept) in case it is configured again.
-  const configured = (ref: { channelId: string }) => channelIds.includes(ref.channelId);
-  const roster = await syncRosterMessages(
-    env.DISCORD_BOT_TOKEN, previousRosterMessages.filter(configured), cards.targets, limits,
-    previousRosterPostAttempts.filter(configured), channelIds,
-  );
-  const rosterMessages = [...roster.messages, ...previousRosterMessages.filter((ref) => !configured(ref))];
-  const rosterPostAttempts = [
-    ...roster.postAttempts, ...previousRosterPostAttempts.filter((entry) => !configured(entry)),
-  ];
-  const rosterFailed = cards.failed || roster.failed;
-
-  if (attempted > 0) {
-    console.log(
-      JSON.stringify({
-        event: 'notified',
-        channels: channelIds.length,
-        delivered,
-        attempted,
-        online: newlyOnline.map((a) => a.callsign),
-        offline: wentOffline.map((a) => a.callsign),
-      }),
+    const cards = await syncOnlineCards(ctx, next, current);
+    // Pages and markers in a channel removed from DISCORD_CHANNEL_IDS are kept
+    // untouched (never edited, deleted or swept) in case it is configured again.
+    const configured = (ref: { channelId: string }) => channelIds.includes(ref.channelId);
+    const roster = await syncRosterMessages(
+      env.DISCORD_BOT_TOKEN, previousRosterMessages.filter(configured), cards.targets, limits,
+      previousRosterPostAttempts.filter(configured), channelIds,
     );
-  }
+    const rosterMessages = [...roster.messages, ...previousRosterMessages.filter((ref) => !configured(ref))];
+    const rosterPostAttempts = [
+      ...roster.postAttempts, ...previousRosterPostAttempts.filter((entry) => !configured(entry)),
+    ];
+    const rosterFailed = cards.failed || roster.failed;
 
-  // The coordinator atomically saves state and the poll timestamp before
-  // surfacing delivery failure, preserving retries and the grace cadence.
-  return {
-    state: next,
-    rosterMessages,
-    rosterPostAttempts,
-    pendingOffline,
-    rolePings,
-    // Delivered by the coordinator once this poll's snapshot is saved.
-    ...(storage && shortSession.kind === 'enabled' ? {
-      shortSession: {
-        config: shortSession.config, limits, stateAtMs: Date.parse(nowIso), presentVids, trackedBefore,
-        current: current.length, memberCache, gcaAttempted,
-      },
-    } : {}),
-    ...(deliveryFailed && delivered > 0 ? { error: 'some Discord notifications failed' } :
-      attempted > 0 && delivered === 0 ? { error: 'all Discord notifications failed' } :
-      rosterFailed ? { error: 'some Discord roster updates failed' } : {}),
-  };
+    if (attempted > 0) {
+      console.log(
+        JSON.stringify({
+          event: 'notified',
+          channels: channelIds.length,
+          delivered,
+          attempted,
+          online: newlyOnline.map((a) => a.callsign),
+          offline: wentOffline.map((a) => a.callsign),
+        }),
+      );
+    }
+
+    // The coordinator atomically saves state and the poll timestamp before
+    // surfacing delivery failure, preserving retries and the grace cadence.
+    return {
+      state: next,
+      rosterMessages,
+      rosterPostAttempts,
+      pendingOffline,
+      rolePings,
+      // Delivered by the coordinator once this poll's snapshot is saved.
+      ...(storage && shortSession.kind === 'enabled' ? {
+        shortSession: {
+          config: shortSession.config, limits, stateAtMs: Date.parse(nowIso), presentVids, trackedBefore,
+          current: current.length, memberCache, gcaAttempted,
+        },
+      } : {}),
+      ...(deliveryFailed && delivered > 0 ? { error: 'some Discord notifications failed' } :
+        attempted > 0 && delivered === 0 ? { error: 'all Discord notifications failed' } :
+        rosterFailed ? { error: 'some Discord roster updates failed' } : {}),
+    };
+  } finally {
+    limits.setDeadline(undefined);
+  }
 }

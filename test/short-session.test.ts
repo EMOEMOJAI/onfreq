@@ -8,6 +8,7 @@ import { DiscordRateLimits } from '../src/discord-rate-limit';
 import {
   buildShortSessionEmbed, reminderMinutes, sendShortSessionReminders, trustedStateAt, type ShortSessionHandoff,
 } from '../src/short-session';
+import { runPoll } from '../src/poll';
 import { loadPendingOffline, loadSessions } from '../src/state';
 import type { IvaoAtcSummaryEntry, PendingOffline, StateMap, TrackedAtc } from '../src/types';
 import { seedGca } from './helpers';
@@ -1550,5 +1551,45 @@ describe('short-session units', () => {
     expect(embed.title).toBe('⏱️ QC\\*X_TWR — short ATC session');
     expect(embed.description).toBe('You were connected as **QC\\*X_TWR** for about 1 minute. IVAO Rules & Regulations ask controllers to connect only when they can stay online for at least 30 minutes. If something came up, no worries — this is just a friendly reminder.');
     expect(embed.footer).toEqual({ text: 'IVAO ATC Monitor' });
+  });
+});
+
+describe('public delivery time budget', () => {
+  const newcomers = () => [entry('QCAA_TWR', 700001, 118.2, 11), entry('QCBB_TWR', 700002, 118.3, 12)];
+  /** The first public card takes longer than the whole 45 s budget, so the second is deferred. */
+  const slowPublicCard = () => { onCardPost = () => { now += 50_000; }; };
+
+  it('still sends a due reminder when public delivery used up its budget', async () => {
+    await shortSession(16);
+    await at(25, []);
+    calls = [];
+    slowPublicCard();
+    injectsFailure = true;
+    await at(26, newcomers());
+    expect(calls.filter((call) => call === 'card_POST')).toHaveLength(1);
+    expect((await snapshot())?.error).toBe('some Discord notifications failed');
+    expect(dms).toHaveLength(1);
+    expect(await statuses()).toEqual(['sent']);
+  });
+
+  it('leaves the limits it hands to short-session without a deadline', async () => {
+    await shortSession(16);
+    await at(25, []);
+    calls = [];
+    slowPublicCard();
+    now = ms(26);
+    feed = newcomers();
+    const outcome = await runInDurableObject(stub(), async (_instance, ctx) => {
+      const saved = (await ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY))!;
+      return runPoll(settings(), saved.state, iso(26), {
+        storage: ctx.storage, previousStateAt: saved.stateAt, previousPollStartedAt: saved.lastPollStartedAt,
+      });
+    });
+    expect(calls.filter((call) => call === 'card_POST')).toHaveLength(1);
+    expect(outcome.error).toBe('some Discord notifications failed');
+    const response = await outcome.shortSession!.limits.fetch('/users/@me/channels', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ recipient_id: MEMBER }),
+    });
+    expect(response.status).toBe(200);
   });
 });

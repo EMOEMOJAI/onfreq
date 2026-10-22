@@ -449,3 +449,43 @@ it('trackPosts binds the other methods to the wrapped limits', async () => {
     expect(method.mock.contexts[0], name).toBe(target);
   }
 });
+
+it('defers without a request once the delivery deadline has passed, and sends again when it is cleared', async () => {
+  const network = vi.fn().mockImplementation(async () => Response.json({ id: 'synthetic' }));
+  vi.stubGlobal('fetch', network);
+  const limits = new DiscordRateLimits();
+  limits.setDeadline(START + 1000);
+
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+  now += 1000;
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).rejects.toMatchObject({
+    name: 'DiscordRateLimitError', requestMade: false, global: false, reason: 'deadline', retryAt: START + 1000,
+    message: 'Discord request deferred (poll time budget)',
+  });
+  expect(network).toHaveBeenCalledTimes(1);
+
+  limits.setDeadline(undefined);
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+  expect(network).toHaveBeenCalledTimes(2);
+});
+
+it('never sleeps a soft wait past the delivery deadline', async () => {
+  const waits = instantSoftWaits();
+  const network = vi.fn()
+    .mockImplementationOnce(exhausted('2'))
+    .mockImplementation(async () => Response.json({ id: 'second' }));
+  vi.stubGlobal('fetch', network);
+  const limits = new DiscordRateLimits();
+
+  await limits.fetch('/channels/a/messages', { method: 'POST' });
+  limits.setDeadline(START + 1999);
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+    .rejects.toMatchObject({ requestMade: false, reason: 'deadline' });
+  expect(waits).toEqual([]);
+  expect(network).toHaveBeenCalledTimes(1);
+
+  // A wait that ends exactly at the deadline still fits the budget.
+  limits.setDeadline(START + 2000);
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+  expect(waits).toEqual([2000]);
+});
