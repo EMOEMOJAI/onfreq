@@ -1,4 +1,5 @@
-import { git, indexedFiles, isMain, jsonc, readIndexed } from './repo-files.mjs';
+import { execFileSync } from 'node:child_process';
+import { git, indexedFiles, isMain, jsonc, readIndexed, root } from './repo-files.mjs';
 
 export function privatePath(file) {
   const name = file.split('/').at(-1);
@@ -135,14 +136,35 @@ const noreply = /^(?:[^\s@]+@users\.noreply\.github\.com|noreply@github\.com)$/i
 const trailerNoreply = /^(?:[^\s@]+@users\.noreply\.github\.com|noreply@github\.com|noreply@anthropic\.com)$/i;
 const commitHash = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 // Only `/@` inside a scheme:// URL, a handle path such as
-// https://social.example/@person, is ignored.
-const urlHandles = (text) => text.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s<>()"',;\x1f]*/gi, (url) => url.replaceAll('/@', '/'));
+// https://social.example/@person, is ignored. Like the address checks below,
+// a match starts only where a token starts, so a long token is scanned once,
+// not again from each of its characters; the URL still starts at the token's
+// first letter.
+const urlHandles = (text) => text.replace(/(?<![a-z0-9+.-])([0-9+.-]*)([a-z][a-z0-9+.-]*:\/\/[^\s<>()"',;\x1f]*)/gi,
+  (_, prefix, url) => `${prefix}${url.replaceAll('/@', '/')}`);
 // An address-shaped token with an alphabetic top-level domain, so versions such
 // as pkg@1.2.3 or checkout@v4.2.2 are not addresses. Known limits: non-ASCII,
 // quoted or obfuscated addresses, dotless hosts, addresses in author or
 // committer names, and, in a crafted commit object, text after a NUL or text
 // hidden by shift sequences of a stateful encoding header such as ISO-2022-JP.
-const messageAddress = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/gi;
+// Each address is the run of local-part characters before an @, not reaching
+// back into the previous address, and the domain after it: the leftmost match
+// /[A-Za-z0-9._%+-]+@<domain>/g finds, without retrying every start of a run.
+const localChar = /[A-Za-z0-9._%+-]/;
+const domainPart = /[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/y;
+function messageAddresses(text) {
+  const addresses = [];
+  let end = 0;
+  for (let at = text.indexOf('@'); at >= 0; at = text.indexOf('@', at + 1)) {
+    let start = at;
+    while (start > end && localChar.test(text[start - 1])) start--;
+    domainPart.lastIndex = at + 1;
+    if (start === at || !domainPart.test(text)) continue;
+    end = domainPart.lastIndex;
+    addresses.push(text.slice(start, end));
+  }
+  return addresses;
+}
 
 export function privateCommitEmails(log) {
   return log.split('\0').filter(Boolean).flatMap((row) => {
@@ -159,13 +181,13 @@ export function privateCommitEmails(log) {
     // Any address in a trailer (Co-authored-by, Signed-off-by...) is published too.
     // An address outside a URL handle path, including person/@domain, is flagged.
     const trailers = urlHandles(rest.join('\t'));
-    const emails = [...trailers.matchAll(/[^\s<>()"',;\x1f]+@[^\s<>()"',;\x1f]+/g)].map(([email]) => email);
+    const emails = [...trailers.matchAll(/(?<![^\s<>()"',;\x1f])[^\s<>()"',;\x1f]+@[^\s<>()"',;\x1f]+/g)].map(([email]) => email);
     if (!emails.every((email) => trailerNoreply.test(email))) {
       errors.push(`${hash.slice(0, 12)}: commit trailer email must use a noreply address`);
     }
     // The whole message, subject and body, is published as well. Trailers are
     // part of it, so a private trailer address is reported twice.
-    const addresses = [...urlHandles(message).matchAll(messageAddress)].map(([email]) => email);
+    const addresses = messageAddresses(urlHandles(message));
     if (!addresses.every((email) => trailerNoreply.test(email))) {
       errors.push(`${hash.slice(0, 12)}: commit message email must use a noreply address`);
     }
@@ -190,10 +212,18 @@ export function checkPrivacy() {
   for (const [file, { mode }] of indexedFiles()) errors.push(...fileErrors(file, mode, () => readIndexed(file)));
   if (git('rev-parse', '--is-shallow-repository').toString().trim() === 'true') {
     errors.push('Full reachable history is required; fetch with depth 0');
-  } else {
-    errors.push(...privateCommitEmails(git(...COMMIT_EMAIL_LOG, 'HEAD').toString()));
+    return errors;
   }
-  return errors;
+  // A failed log fails closed with a fixed error; Git's output and errors may
+  // hold the addresses being checked, so neither is printed.
+  let log;
+  try {
+    log = execFileSync('git', [...COMMIT_EMAIL_LOG, 'HEAD'],
+      { cwd: root, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+  } catch {
+    return [...errors, 'commit log could not be parsed'];
+  }
+  return [...errors, ...privateCommitEmails(log)];
 }
 
 const oid = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;

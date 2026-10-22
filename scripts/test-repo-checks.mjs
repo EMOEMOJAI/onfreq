@@ -28,7 +28,7 @@ test('rejects private paths independently of gitignore, allowing public template
   }
 });
 
-test('.gitignore ignores exactly the config/ paths privatePath treats as private', (t) => {
+test('.gitignore ignores the config/ and local-settings paths exactly as privatePath treats them', (t) => {
   const repo = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-ignore-')));
   t.after(() => rmSync(repo, { recursive: true, force: true }));
   const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
@@ -38,7 +38,10 @@ test('.gitignore ignores exactly the config/ paths privatePath treats as private
     ['config/x.example', true], ['config/a.example/file', true], ['config/optional-secrets.example/file', true],
     ['config/optional-secrets.example.bak', true], ['.envrc', true], ['nested/.envrc', true], ['.envrc.local', true],
     ['.envrc.example', false], ['nested/.envrc.example', false], ['.envrc.d/x', true], ['.envrc/x', true],
-    ['.envrc.example/x', true]]) {
+    ['.envrc.example/x', true], ['CLAUDE.local.md', true], ['notes.local.md', true], ['nested/x.local.md', true],
+    ['settings.local.json', true], ['.claude/settings.local.json', true], ['nested/settings.local.json', true],
+    ['x.local.json', true], ['x.local.jsonc', true], ['nested/x.local.jsonc', true],
+    ['x.local.json.bak', false], ['local.json', false], ['x.local.txt', false]]) {
     const status = spawnSync('git', ['check-ignore', '--no-index', '-q', file], { cwd: repo, env }).status;
     assert.equal(status, ignored ? 0 : 1, file);
     assert.equal(privatePath(file), ignored, file);
@@ -186,7 +189,7 @@ test('checks both raw commit emails and redacts rejected identities', () => {
 });
 
 test('checks every address in the commit message, allowing only noreply identities, and redacts them (NX-2a)', () => {
-  // Synthetic addresses are assembled at runtime, so this file never contains one.
+  // The flagged addresses are assembled at runtime; noreply identities are written out.
   const at = (local, domain) => [local, domain].join('@');
   const person = at('person', 'example.invalid');
   const hash = 'c'.repeat(40);
@@ -237,6 +240,35 @@ test('checks every address in the commit message, allowing only noreply identiti
     redacted(failures);
   }
   assert.deepEqual(privateCommitEmails(row('subject').replace(hash, 'd'.repeat(64))), []);
+});
+
+test('address checks start only at a token, so a long token is checked in linear time (RA)', () => {
+  const at = (local, domain) => [local, domain].join('@');
+  const hash = 'c'.repeat(40);
+  const row = (message, trailers = '') => `${[hash, '1+example@users.noreply.github.com', 'noreply@github.com', trailers].join('\t')}\x1e${message}`;
+  for (const token of ['a'.repeat(200000), 'a.'.repeat(100000), '1-'.repeat(100000), 'h'.repeat(199997) + '://x',
+    `${'a'.repeat(199990)}@x`, `@${'a.'.repeat(99999)}`, 'a/'.repeat(100000)]) {
+    for (const [message, trailers] of [[token, ''], ['subject', `Link: ${token}`]]) {
+      const start = performance.now();
+      privateCommitEmails(row(message, trailers));
+      assert.ok(performance.now() - start < 1000, `${token.slice(0, 8)}: ${performance.now() - start} ms`);
+    }
+  }
+  // Every address is still found, including one right after another or after a URL handle.
+  const person = at('person', 'private.example');
+  const messageError = `${'c'.repeat(12)}: commit message email must use a noreply address`;
+  const trailerError = `${'c'.repeat(12)}: commit trailer email must use a noreply address`;
+  for (const message of [`${at('noreply', 'github.com')}-${person}`, `${at('noreply', 'github.com')}.${person}`,
+    `x${person}`, `pkg@1.2.3${person}`, `see ${'a'.repeat(5000)}${person}`]) {
+    assert.deepEqual(privateCommitEmails(row(message)), [messageError], message);
+  }
+  for (const trailer of [`Link: 1https://a.example/x@${person}`, `Link: -https://a.example/${person}`]) {
+    assert.deepEqual(privateCommitEmails(row('subject', trailer)), [trailerError], trailer);
+  }
+  // A URL handle path after a non-letter prefix is still not an address.
+  for (const trailer of ['Reviewed-on: 1https://social.example/@person', 'Reviewed-on: -https://social.example/@person']) {
+    assert.deepEqual(privateCommitEmails(row('subject', trailer)), [], trailer);
+  }
 });
 
 function pngChunk(type, payload = Buffer.alloc(0)) {

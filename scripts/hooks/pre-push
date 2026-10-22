@@ -91,12 +91,15 @@ EOF
 # and mailmapped, %aN/%aE) or a changed path (--name-status prints both paths
 # of a rename or copy). The scan reads all of these and honours the marker on
 # any line, so a push can relax its own scan; they are named for review. The
-# committer is not printed by the scan, so it is not checked. Messages and
-# names use the stored bytes (--encoding=none), as the scan does, so an
-# encoding header or i18n.logOutputEncoding cannot hide the marker; the match
-# ignores case. As in the scan, a merge's own diff against each parent is
-# included, whatever log.diffMerges says, so a change only a merge resolution
-# makes is named too; --no-patch keeps those diffs out of the -G output.
+# committer is not printed by the scan, so it is not checked. Messages use the
+# stored bytes (--encoding=none), as the scan does, so an encoding header or
+# i18n.logOutputEncoding cannot hide the marker there; the match ignores case.
+# Git still re-encodes %an/%ae/%aN/%aE from the commit's encoding header to
+# UTF-8, so an ASCII-incompatible header such as UTF-16 can hide the marker in
+# a name or email (an accepted limit). As in the scan, a merge's own diff
+# against each parent is included, whatever log.diffMerges says, so a change
+# only a merge resolution makes is named too; --no-patch keeps those diffs out
+# of the -G output.
 pushed_gitleaks_changes() {
   changes_range=$1
   set --

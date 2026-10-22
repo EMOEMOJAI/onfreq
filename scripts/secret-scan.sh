@@ -19,6 +19,15 @@
 # Git refuses NUL in messages, so the stored bytes are ASCII-compatible for the
 # scanner. Gitleaks redacts findings.
 #
+# Gitleaks reads its input in 100 KB chunks, extending each by at most 25 KB to
+# a blank line, and skips the whole input when the first chunk looks like a
+# binary or archive file. A fixed plain preamble of 36 000 bytes that matches no
+# rule comes first, so no file-type signature (the furthest, ISO 9660's, ends
+# at byte 32 773) can fall on commit content, and sed adds a blank line after
+# every line, so each chunk ends at the end of a line. scripts/hooks/pre-commit
+# does the same. Known limits: a line longer than about 25 KB can still be cut,
+# and a multi-line secret such as a private key can be split between chunks.
+#
 # Exit status: 0 clean; 1 Gitleaks found a secret or failed; 2 the commits
 # could not be read. POSIX sh has no pipefail, so a failed Git or filter stage
 # leaves a marker file instead. A Gitleaks that exits before reading all its
@@ -43,10 +52,12 @@ fi
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 2' HUP INT TERM
 
+preamble() { LC_ALL=C awk 'BEGIN { for (i = 0; i < 1200; i++) print "# onfreq secret-scan preamble" }' </dev/null; }
 status=0
-{ git log --pretty=medium --encoding=none -p -U0 --inter-hunk-context=0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null ||
+{ { preamble &&
+    git log --pretty=medium --encoding=none -p -U0 --inter-hunk-context=0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null; } ||
     : >"$tmp/failed"; } |
-  { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
+  { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' -e G || : >"$tmp/failed"; } |
   gitleaks stdin --redact --no-banner || status=$?
 if [ -e "$tmp/failed" ]; then
   if [ "$status" != 0 ]; then

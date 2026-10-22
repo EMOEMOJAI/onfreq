@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { isolatedEnv } from './check-setup.mjs';
 
 const hook = fileURLToPath(new URL('./hooks/pre-push', import.meta.url));
@@ -26,6 +27,7 @@ const syntheticKey = () => ['AKIA', 'Q7RZ', 'LX2M', 'NB4K', 'TWPJ'].join('');
 // npm range checks run the real check-privacy.mjs too; gitleaks: 'real' uses the
 // installed Gitleaks, 'missing' none. The fake answers `gitleaks version` without
 // logging: 8.30.1, FAKE_GITLEAKS_VERSION, or a failure with FAKE_GITLEAKS_VERSION_FAIL.
+// With GITLEAKS_STDIN set, the fake also saves the stream it read to that file.
 // Global and system Git configuration are ignored so the scanned log format is
 // predictable.
 function fixture(t, { npmExit = 0, realRange = false, gitleaks = 'fake', gitleaksExit = 0 } = {}) {
@@ -56,7 +58,8 @@ fi
 printf '[%s]' "$@" >> "$GITLEAKS_LOG"
 printf '\\n' >> "$GITLEAKS_LOG"
 if [ -n "\${GITLEAKS_CONFIG+x}\${GITLEAKS_CONFIG_TOML+x}" ]; then printf 'config variable set\\n' >> "$GITLEAKS_LOG"; fi
-sed -n 's/^commit \\([0-9a-f]\\{40\\}\\).*/\\1/p' >> "$GITLEAKS_LOG"
+if [ -n "\${GITLEAKS_STDIN:-}" ]; then tee "$GITLEAKS_STDIN"; else cat; fi |
+  sed -n 's/^commit \\([0-9a-f]\\{40\\}\\).*/\\1/p' >> "$GITLEAKS_LOG"
 if [ "$GITLEAKS_EXIT" != 0 ]; then printf 'synthetic finding: REDACTED\\n' >&2; fi
 exit "$GITLEAKS_EXIT"
 `, { mode: 0o700 });
@@ -1179,7 +1182,7 @@ test('privacy checks reject private emails anywhere in commit messages, however 
   const f = fixture(t, { realRange: true });
   const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
   const check = (...args) => spawnSync(process.execPath, ['scripts/check-privacy.mjs', ...args], { cwd: f.repo, env, encoding: 'utf8' });
-  // Assembled at runtime, so this file never contains a synthetic address.
+  // Assembled at runtime, so this address never appears literally in this file.
   const person = ['person', 'example.invalid'].join('@');
   const leaked = /person|example\.invalid/;
   const commit = (message, config = []) => {
@@ -1386,8 +1389,8 @@ test('the repository Gitleaks rules pass synthetic IDs, empty values, references
 
 // NX-1c: multi-line private JSON literals and deployment settings in dotenv or
 // shell lines. Setting names are joined at runtime, so this file never holds a
-// line the rules would flag; real-looking prefixes appear only in temporary
-// repositories.
+// line the rules would flag. Prefixes that must be flagged start with J, which
+// no ICAO region uses, so no real region appears here.
 const firPrefixes = ['FIR', 'PREFIXES'].join('_');
 const coordinatorName = ['COORDINATOR', 'NAME'].join('_');
 
@@ -1396,23 +1399,26 @@ test('the repository Gitleaks rules block multi-line JSON literals and deploymen
     const f = fixture(t, { gitleaks: 'real' });
     commitRules(f, repoRules());
     // Each line sits between others, so the match is mid-stream in the scanned log.
+    // `secret` is text on the matched line that redacted output never shows.
     const blocked = (line, secret, label) => {
       const { hook, scan } = scanAssignment(f, `# synthetic settings\n${line}# end\n`);
       for (const result of [...hook, scan]) {
         assert.equal(result.status, 1, `${label}: ${result.stderr}`);
-        if (secret) assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret), label);
+        if (secret) assert.ok(!(result.stderr + result.stdout).includes(secret), label);
       }
     };
-    blocked(`${firPrefixes}="XD, LF"\n`, 'XD, LF', 'quoted list with one real-looking prefix');
-    blocked(`${firPrefixes}=LF\n`, '=LF', 'unquoted prefix');
-    blocked(`${firPrefixes}=XD, LF # note\n`, 'XD, LF', 'unquoted list read to the comment, as dotenv does');
+    blocked(`${firPrefixes}="XD, JD"\n`, 'XD, JD', 'quoted list with one real-looking prefix');
+    blocked(`${firPrefixes}=JD\n`, '=JD', 'unquoted prefix');
+    blocked(`${firPrefixes}=XD, JD # note\n`, 'XD, JD', 'unquoted list read to the comment, as dotenv does');
     blocked(`export ${coordinatorName}="synthetic realname"\n`, 'realname', 'quoted name with a space');
     blocked(`${coordinatorName}=prod-state\n`, 'prod-state', 'unquoted name');
     blocked(`${coordinatorName}='prod state'\n`, 'prod state', 'single-quoted name');
     const vid = ['73', '4125'].join('');
     for (const [name, open, close] of [['GCA_REGIONS', '{', '}'], ['GCA_APPROVALS', '{', '}'],
       ['GCA_HOME_OVERRIDES', '{', '}'], ['FIR_LABELS', '[', ']'], ['gca_regions', '{', '}']]) {
-      blocked(`${name}='${open}\n  "${vid}": "AC"\n${close}'\n`, vid, `multi-line ${name}`);
+      // The match is the opening line, so its text is checked; the VID on the next line is never printed either.
+      const opening = `${name}='${open}`;
+      blocked(`${opening}\n  "${vid}": "AC"\n${close}'\n`, opening, `multi-line ${name}`);
     }
   });
 
@@ -1426,7 +1432,7 @@ test('the repository Gitleaks rules pass synthetic deployment settings, empty va
       + `  ${firPrefixes}: 'XD',\nexport const ${coordinatorName} = 'onfreq';\n`
       + `npx wrangler secret put ${firPrefixes}\n`
       // Dotenv names are case-sensitive, so a lowercase name sets nothing.
-      + `${firPrefixes.toLowerCase()}=LF\n`
+      + `${firPrefixes.toLowerCase()}=JD\n`
       + "GCA_REGIONS: JSON.stringify({\n  AA: { name: 'Example', prefixes: ['XA'] },\n}),\n";
     const { hook, scan } = scanAssignment(f, text);
     for (const result of hook) assert.equal(result.status, 0, result.stderr);
@@ -1450,17 +1456,17 @@ test('the repository Gitleaks rules block the first line of a pretty-printed JSO
         assert.ok(!(result.stderr + result.stdout).includes(secret), line);
       }
     };
-    const key = ['LF', 'FF'].join('');
+    const key = ['JD', 'DD'].join('');
     for (const [line, secret, rest] of [
-      [`${jsonName('GCA', 'REGIONS')}='{"${key}": [\n`, `{"${key}": [`, '    "LF"\n  ]\n}\'\n'],
+      [`${jsonName('GCA', 'REGIONS')}='{"${key}": [\n`, `{"${key}": [`, '    "JD"\n  ]\n}\'\n'],
       [`export ${jsonName('GCA', 'APPROVALS')}={"a": {\n`, '{"a": {', '  "b": 1\n}}\n'],
       [`${jsonName('FIR', 'LABELS')} = [{"x": 1},\n`, '[{"x": 1},', '  {"y": 2}]\n'],
       // Shell-escaped quotes, a key whose value starts on the next line, nested
       // brackets, a lowercase name, a CRLF line and a TypeScript property.
       [`${jsonName('GCA', 'HOME', 'OVERRIDES')}="{\\"${key}\\": {\n`, `{\\"${key}\\": {`, '  \\"b\\": 1\n}}"\n'],
-      [`${jsonName('GCA', 'REGIONS')}='{"${key}":\n`, `{"${key}":`, '  ["LF"]\n}\'\n'],
-      [`${jsonName('gca', 'regions')}='[ {"${key}": [\n`, `[ {"${key}": [`, '  "LF"]}]\'\n'],
-      [`${jsonName('FIR', 'LABELS')}='{"${key}": "Synthetic",\r\n`, `{"${key}": "Synthetic",`, '  "LFXX": "Other"\r\n}\'\r\n'],
+      [`${jsonName('GCA', 'REGIONS')}='{"${key}":\n`, `{"${key}":`, '  ["JD"]\n}\'\n'],
+      [`${jsonName('gca', 'regions')}='[ {"${key}": [\n`, `[ {"${key}": [`, '  "JD"]}]\'\n'],
+      [`${jsonName('FIR', 'LABELS')}='{"${key}": "Synthetic",\r\n`, `{"${key}": "Synthetic",`, '  "JDXX": "Other"\r\n}\'\r\n'],
       [`  ${jsonName('GCA', 'APPROVALS')}: \`{"${key}": [\n`, `{"${key}": [`, '    "1"\n  ]}`,\n'],
     ]) blocked(line, secret, rest);
   });
@@ -1470,14 +1476,194 @@ test('the repository Gitleaks rules pass JSON expressions, empty and fixture val
     const f = fixture(t, { gitleaks: 'real' });
     commitRules(f, repoRules());
     // A quote or backtick ends the value, so later code on the line is not read as JSON.
-    const text = "  GCA_APPROVALS: '{}', GCA_HOME_OVERRIDES: JSON.stringify({\n    LFFF: ['LF'],\n  }),\n"
+    const text = "  GCA_APPROVALS: '{}', GCA_HOME_OVERRIDES: JSON.stringify({\n    JDDD: ['JD'],\n  }),\n"
       + "  GCA_REGIONS: JSON.stringify({\n    AA: { name: 'Example', prefixes: ['XA'] },\n  }),\n"
       + "GCA_REGIONS='{}'\n"
       // The single-line rule's published synthetic fixture.
       + `  GCA_HOME_OVERRIDES: '{"600001":"ZZ"}',\n`
       // TypeScript object literals without a quoted key.
-      + 'const GCA_REGIONS = { LFFF: [\n  \'LF\',\n] };\nconst FIR_LABELS = [{ x: 1 },\n  { y: 2 }];\n';
+      + 'const GCA_REGIONS = { JDDD: [\n  \'JD\',\n] };\nconst FIR_LABELS = [{ x: 1 },\n  { y: 2 }];\n';
     const { hook, scan } = scanAssignment(f, text);
     for (const result of hook) assert.equal(result.status, 0, result.stderr);
     assert.equal(scan.status, 0, scan.stderr);
   });
+
+// RA: Gitleaks skips its whole input when the first chunk looks like a binary
+// or archive format, and reads in 100 KB chunks that it extends by at most
+// 25 KB to a blank line, so a line could be cut in two. The scans feed it a
+// preamble first and a blank line after every line.
+const preamble = '# onfreq secret-scan preamble';
+function assertScanStream(stream, label) {
+  // Past the furthest bytes a file-type signature uses (ISO 9660's, 32 769-32 773).
+  const content = stream.search(new RegExp(`^(?!${preamble}$).+$`, 'm'));
+  assert.ok(content >= 33000, `${label}: content starts at ${content}`);
+  assert.ok(stream.split('\n').every((line, index) => index % 2 === 0 || line === ''), `${label}: lines without a blank line`);
+}
+
+test('both scans feed Gitleaks a preamble and a blank line after every line (RA)', (t) => {
+  const f = fixture(t);
+  const saved = join(f.repo, '..', 'stream.txt');
+  writeFileSync(join(f.repo, 'public.txt'), 'staged\nsecond line\n');
+  f.git('add', 'public.txt');
+  let result = f.commitHook({ extraEnv: { GITLEAKS_STDIN: saved } });
+  assert.equal(result.status, 0, result.stderr);
+  let stream = readFileSync(saved, 'utf8');
+  assertScanStream(stream, 'pre-commit');
+  assert.match(stream, /^\+staged\n\n\+second line\n\n/m);
+  rmSync(saved);
+  f.git('commit', '--quiet', '--no-verify', '-m', 'staged');
+  const head = f.git('rev-parse', 'HEAD');
+  result = f.push([ref(head)], undefined, { GITLEAKS_STDIN: saved });
+  assert.equal(result.status, 0, result.stderr);
+  stream = readFileSync(saved, 'utf8');
+  assertScanStream(stream, 'secret-scan');
+  assert.match(stream, new RegExp(`^commit ${head}\n\n`, 'm'));
+  assert.match(stream, /^\+staged\n\n\+second line\n\n/m);
+});
+
+const gitEnv = () => isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+// The stream the scans' Git and sed stages produce, before the preamble and
+// blank lines: removed lines are dropped and hunk headers end at the second @@.
+function filteredOutput(f, args) {
+  const result = spawnSync('git', args, { cwd: f.repo, env: gitEnv(), encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.split('\n').filter((line) => !line.startsWith('-'))
+    .map((line) => line.replace(/^(@@ -[0-9][0-9,]* \+[0-9][0-9,]* @@).*/, '$1')).join('\n');
+}
+const headStream = (f) => filteredOutput(f, ['log', '--pretty=medium', '--encoding=none', '-p', '-U0',
+  '--inter-hunk-context=0', '--root', '--no-ext-diff', '--no-textconv', '--text', '--no-color', '--diff-merges=separate',
+  '-1', 'HEAD', '--']);
+const stagedStream = (f) => filteredOutput(f, ['diff', '--cached', '-U0', '--inter-hunk-context=0', '--no-ext-diff',
+  '--no-textconv', '--no-color', '--text']);
+// Calls write(pad), adjusting the pad until `marker` starts at `offset` in
+// stream(); the text before the pad keeps its length, so one correction
+// normally suffices.
+function placeAt(offset, marker, write, stream) {
+  let pad = 0;
+  for (let step = 0; step < 4; step++) {
+    write(pad);
+    const at = stream().indexOf(marker);
+    if (at === offset) return;
+    pad += offset - at;
+    assert.ok(at >= 0 && pad >= 0, `${marker} is past ${offset}`);
+  }
+  assert.fail(`could not place ${marker} at ${offset}`);
+}
+const secretScan = (f, ...args) => spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args],
+  { cwd: f.repo, env: gitEnv(), encoding: 'utf8' });
+
+test('a tar signature at byte 257 of a commit message or staged change does not hide a secret (RA)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    const secret = new RegExp(token.slice(4));
+    const base = f.git('rev-parse', 'HEAD');
+    writeFileSync(join(f.repo, 'config.txt'), `aws_access_key_id = ${token}\n`);
+    f.git('add', 'config.txt');
+    placeAt(257, 'ustar', (pad) => {
+      f.git('reset', '--quiet', '--soft', base);
+      f.git('commit', '--quiet', '--no-verify', '-m', `${'a'.repeat(pad)}ustar`);
+    }, () => headStream(f));
+    let result = secretScan(f, 'HEAD', '--not', base);
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stderr + result.stdout, secret);
+    f.git('reset', '--quiet', '--hard', base);
+    const staged = join(f.repo, 'staged.txt');
+    placeAt(257, 'ustar', (pad) => {
+      writeFileSync(staged, `${'b'.repeat(pad)}ustar\naws_access_key_id = ${token}\n`);
+      f.git('add', 'staged.txt');
+    }, () => stagedStream(f));
+    for (const options of [{}, { commit: true }]) {
+      result = f.commitHook(options);
+      assert.equal(result.status, 1, `${JSON.stringify(options)}: ${result.stderr}`);
+      assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret/);
+      assert.doesNotMatch(result.stderr + result.stdout, secret);
+    }
+    assert.equal(f.git('rev-parse', 'HEAD'), base, 'no commit was made');
+  });
+
+test('a secret line across a Gitleaks chunk boundary is still found (RA)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    const base = f.git('rev-parse', 'HEAD');
+    const filler = Array.from({ length: 27000 }, (_, index) => `x${index}`);
+    // The 20-byte key starts at each offset of the stream before the preamble.
+    // 124 990 straddles 125 000, a 100 KB read plus the 25 KB look-ahead. When
+    // the first read takes a full 64 KiB pipe buffer, chunks end near 90 536
+    // and every 28 672 bytes after it (4 KiB buffered reads past the
+    // look-ahead); the other offsets straddle those ends, where a stream
+    // without blank lines was cut.
+    for (const offset of [124990, 90526, 119198, 147870, 176542]) {
+      // A line well before the offset carries the pad; the key's line keeps the line count.
+      let index = 0;
+      for (let sum = 400; sum < offset - 200; sum += filler[index].length + 2) index++;
+      placeAt(offset, token, (pad) => {
+        const lines = filler.with(index, `${filler[index]}${'p'.repeat(pad)}`).with(index + 2, `aws_access_key_id = ${token}`);
+        writeFileSync(join(f.repo, 'filler.txt'), `${lines.join('\n')}\n`);
+        f.git('add', 'filler.txt');
+        f.git('reset', '--quiet', '--soft', base);
+        f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic filler');
+      }, () => headStream(f));
+      const result = secretScan(f, 'HEAD', '--not', base);
+      assert.equal(result.status, 1, `${offset}: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)), String(offset));
+      f.git('reset', '--quiet', '--hard', base);
+    }
+  });
+
+test('a private key block is still flagged with blank lines between its lines (RA)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    // Random synthetic key material, assembled at runtime.
+    const kind = ['RSA', 'PRIVATE', 'KEY'].join(' ');
+    const body = randomBytes(1190).toString('base64').match(/.{1,64}/g).join('\n');
+    const { hook, scan } = scanAssignment(f, `-----BEGIN ${kind}-----\n${body}\n-----END ${kind}-----\n`);
+    for (const result of [...hook, scan]) {
+      assert.equal(result.status, 1, result.stderr);
+      assert.ok(!(result.stderr + result.stdout).includes(body.slice(0, 64)));
+    }
+  });
+
+test('the repository Gitleaks rules flag values after blanks inside the quotes (RA)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const vid = ['73', '4125'].join('');
+    const value = 'ab'.repeat(10);
+    for (const [line, label] of [
+      [assignment('POLL_SECRET', ` ${value}`), 'secret'],
+      [`${jsonName('POLL', 'SECRET')}=' \t${value}'\n`, 'secret after a tab'],
+      [assignment('GCA_MEMBER_ROLE_ID', ` ${realShaped}`), 'Discord ID'],
+      [`${jsonName('GCA', 'REGIONS')}=' {"${vid}":"AC"}'\n`, 'JSON literal'],
+      [`${jsonName('FIR', 'LABELS')}=" [\n  "JD"\n]"\n`, 'multi-line JSON literal'],
+      [`${jsonName('GCA', 'APPROVALS')}=' {"JDDD": [\n  "1"\n]}'\n`, 'pretty-printed JSON literal'],
+    ]) {
+      const { hook, scan } = scanAssignment(f, `# synthetic settings\n${line}# end\n`);
+      for (const result of [...hook, scan]) assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    }
+  });
+
+test('the deployment rules allow Q and X prefixes only for FIR prefixes (RA)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const line of [`${coordinatorName}=QXA\n`, `export ${coordinatorName}="QX, XD"\n`, `${firPrefixes}=synthetic-prefixes\n`]) {
+      const { hook, scan } = scanAssignment(f, `# synthetic settings\n${line}# end\n`);
+      for (const result of [...hook, scan]) assert.equal(result.status, 1, `${line}: ${result.stderr}`);
+    }
+    const { hook, scan } = scanAssignment(f, `${firPrefixes}="QX, XD"\n${firPrefixes}=xd\n${coordinatorName}=synthetic-state\n`);
+    for (const result of [...hook, scan]) assert.equal(result.status, 0, result.stderr);
+  });
+
+test('privacy checks fail closed without echoing Git output when the history cannot be read (RA)', (t) => {
+  const f = fixture(t, { realRange: true });
+  // The first commit is missing, so `git log` fails after HEAD.
+  f.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m', 'synthetic', '--author', `Person <${['person', 'example.invalid'].join('@')}>`);
+  rmSync(join(f.repo, '.git', 'objects', f.first.slice(0, 2), f.first.slice(2)));
+  const result = spawnSync(process.execPath, ['scripts/check-privacy.mjs'], { cwd: f.repo, env: gitEnv(), encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, 'Privacy checks: FAILED (indexed files and HEAD history)\n');
+  assert.equal(result.stderr, 'commit log could not be parsed\n');
+});

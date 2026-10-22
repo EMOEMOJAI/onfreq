@@ -41,9 +41,11 @@ wrangler.local.*
 *.log
 gitleaks-report.*
 
-# Private agent preferences and local tool permissions.
-CLAUDE.local.md
-.claude/settings.local.json
+# Private agent preferences, local tool permissions and other local-only
+# settings or notes, in any directory, as check:privacy rejects them.
+*.local.md
+*.local.json
+*.local.jsonc
 
 # Local audit notes and original image-generation downloads.
 .local/
