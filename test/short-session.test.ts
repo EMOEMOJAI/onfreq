@@ -686,6 +686,88 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await expectNothing();
   });
 
+  it('NX-4: a lower surviving connection returning alone after a long gap keeps its presence', async () => {
+    const other = entry('QCZZ_APP', 600002, 119.1, 7);
+    await at(0, [other]);
+    await at(1, [twr(5), app(9), other]);
+    await at(60, [twr(5), app(9), other]);
+    await at(61, [twr(5), other]);
+    await during(62, 76, 2, [other]);
+    await at(77, [twr(5), other]);
+    await at(92, [other]);
+    await at(93, [other]);
+    await at(110, [other]);
+    await expectNothing();
+    expect(await sql(`SELECT session_id, session_ids FROM ${ONLINE} WHERE user_id = ${VID}`))
+      .toEqual([{ session_id: 9, session_ids: '[5,9]' }]);
+  });
+
+  it.each(['not json', '{"a":1}', '[0,-3,1.5,"9",null]', '[]'])(
+    'NX-4: corrupt session_ids %s falls back to session_id, never throwing', async (bad) => {
+      const other = entry('QCZZ_APP', 600002, 119.1, 7);
+      await at(0, [other]);
+      await at(1, [twr(5), other]);
+      await sql(`UPDATE ${ONLINE} SET session_id = 5, session_ids = ? WHERE user_id = ${VID}`, bad);
+      await during(2, 20, 3, [other]);
+      await at(21, [twr(5), other]);
+      expect(await sql(`SELECT online_since, session_ids FROM ${ONLINE} WHERE user_id = ${VID}`))
+        .toEqual([{ online_since: ms(0), session_ids: '[5]' }]);
+      expect(pollFailures).toEqual([]);
+    });
+
+  it('NX-4: with corrupt session_ids, an id other than session_id after a long gap is a new presence', async () => {
+    const other = entry('QCZZ_APP', 600002, 119.1, 7);
+    await at(0, [other]);
+    await at(1, [twr(5), other]);
+    await sql(`UPDATE ${ONLINE} SET session_ids = 'not json' WHERE user_id = ${VID}`);
+    await during(2, 20, 3, [other]);
+    await at(21, [twr(6), other]);
+    expect(await sql(`SELECT online_since, session_ids FROM ${ONLINE} WHERE user_id = ${VID}`))
+      .toEqual([{ online_since: ms(20), session_ids: '[6]' }]);
+    expect(pollFailures).toEqual([]);
+  });
+
+  it('NX-4: keeps at most the 8 highest distinct session ids, with session_id the max', async () => {
+    await at(0, []);
+    await at(1, [twr(3)]);
+    await at(2, [3, 1, 2, 4, 5, 6, 7, 8, 9, 10].map((id) => entry(`QCTT_TWR`, VID, 118.1, id)));
+    expect(await sql(`SELECT session_id, session_ids FROM ${ONLINE}`))
+      .toEqual([{ session_id: 10, session_ids: '[3,4,5,6,7,8,9,10]' }]);
+    await at(3, [twr(1), twr(1), twr(20)]);
+    expect(await sql(`SELECT session_id, session_ids FROM ${ONLINE}`))
+      .toEqual([{ session_id: 20, session_ids: '[4,5,6,7,8,9,10,20]' }]);
+  });
+
+  it('NX-4: a new member is inserted with its present ids; invalid ids are not stored', async () => {
+    await at(0, []);
+    await at(1, [twr(5), app(9), entry('QCTT_DEL', VID, 121.7, 0), entry('QCTT_GND', VID, 121.9, -2)]);
+    expect(await sql(`SELECT session_id, session_ids FROM ${ONLINE}`)).toEqual([{ session_id: 9, session_ids: '[5,9]' }]);
+  });
+
+  it('NX-4: a row from before session_ids (session_id only) continues on its id and gains the set', async () => {
+    const other = entry('QCZZ_APP', 600002, 119.1, 7);
+    await at(0, [other]);
+    await at(1, [twr(5), other]);
+    await sql(`UPDATE ${ONLINE} SET session_ids = NULL WHERE user_id = ${VID}`);
+    await during(2, 20, 3, [other]);
+    await at(21, [twr(5), app(9), other]);
+    expect(await sql(`SELECT online_since, session_ids FROM ${ONLINE} WHERE user_id = ${VID}`))
+      .toEqual([{ online_since: ms(0), session_ids: '[5,9]' }]);
+  });
+
+  it('NX-4: adds session_ids in place to an online table without it, keeping its rows', async () => {
+    await at(0, []);
+    await at(1, [twr(4), app(6)]);
+    await sql(`ALTER TABLE ${ONLINE} DROP COLUMN session_ids`);
+    expect(await sql(`SELECT 1 FROM pragma_table_info('${ONLINE}') WHERE name = 'session_ids'`)).toEqual([]);
+    await at(2, [twr(4)]);
+    expect(await sql(`SELECT user_id, online_since, missing_since, session_id, session_ids FROM ${ONLINE}`))
+      .toEqual([{ user_id: VID, online_since: ms(0), missing_since: null, session_id: 6, session_ids: '[4,6]' }]);
+    await at(6, []);
+    await at(7, []);
+    expect(await rows()).toMatchObject([{ session_key: keyAt(0), duration_minutes: 6 }]);
+  });
+
   it('NX-1a: a failing schema upgrade fails the poll once, sends nothing, and the next poll baselines', async () => {
     await at(0, []);
     await at(1, [twr()]);
@@ -711,7 +793,7 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await at(0, [other]);
     await at(1, [twr(1), other]);
     await at(60, [twr(1), other]);
-    await sql(`UPDATE ${ONLINE} SET session_id = NULL`);
+    await sql(`UPDATE ${ONLINE} SET session_id = NULL, session_ids = NULL`);
     await during(61, 75, 2, [other]);
     await at(76, [twr(1), other]);
     await at(86, [other]);

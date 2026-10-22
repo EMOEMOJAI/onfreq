@@ -130,18 +130,46 @@ function ensureShortSessionSchema(sql: SqlStorage): void {
   // One record per member present in the division feed, at any position:
   // online_since is the last recorded poll before they appeared (NULL when
   // unknown), missing_since the first recorded poll that missed them, and
-  // session_id the newest valid IVAO session id seen during this record.
+  // session_id the newest valid IVAO session id seen during this record, and
+  // session_ids a JSON array of up to MAX_SESSION_IDS distinct valid ids seen
+  // during it (the highest kept), so a lower surviving connection still matches.
   sql.exec(`CREATE TABLE IF NOT EXISTS ${ONLINE} (
-    user_id INTEGER PRIMARY KEY, online_since INTEGER, missing_since INTEGER, session_id INTEGER
+    user_id INTEGER PRIMARY KEY, online_since INTEGER, missing_since INTEGER, session_id INTEGER, session_ids TEXT
   )`);
   // Tables created before session_id existed gain it in place; their rows keep a NULL that never matches.
   if (!sql.exec(`SELECT 1 FROM pragma_table_info('${ONLINE}') WHERE name = 'session_id'`).toArray().length) {
     sql.exec(`ALTER TABLE ${ONLINE} ADD COLUMN session_id INTEGER`);
   }
+  // Likewise session_ids: older rows fall back to their session_id.
+  if (!sql.exec(`SELECT 1 FROM pragma_table_info('${ONLINE}') WHERE name = 'session_ids'`).toArray().length) {
+    sql.exec(`ALTER TABLE ${ONLINE} ADD COLUMN session_ids TEXT`);
+  }
   sql.exec(`CREATE INDEX IF NOT EXISTS ${ONLINE}_missing_idx ON ${ONLINE} (missing_since)`);
 }
 
 const isVid = (id: number) => Number.isSafeInteger(id) && id > 0;
+
+/** Distinct session ids kept per record: the highest ones. */
+const MAX_SESSION_IDS = 8;
+
+/**
+ * A record's stored ids: the valid elements of session_ids, else [session_id]
+ * when that is valid. Unparsable or invalid text never throws; it falls back.
+ */
+function storedSessionIds(text: string | null, sessionId: number | null): Set<number> {
+  let ids: number[] = [];
+  if (typeof text === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (Array.isArray(parsed)) ids = parsed.filter((id): id is number => typeof id === 'number' && isVid(id));
+    } catch { /* fall back below */ }
+  }
+  if (!ids.length && typeof sessionId === 'number' && isVid(sessionId)) ids = [sessionId];
+  return new Set(ids);
+}
+
+/** The MAX_SESSION_IDS highest ids, ascending. */
+const capSessionIds = (ids: Iterable<number>): number[] => [...new Set(ids)].sort((a, b) => a - b).slice(-MAX_SESSION_IDS);
 
 /** Reminder retention: rows go after 7 days; finished or expired rows keep no callsign. */
 function reminderRetention(sql: SqlStorage, nowMs: number): void {
@@ -175,8 +203,9 @@ export interface ShortSessionPoll {
  * to the first recorded poll that missed them. A gap shorter than LINK_MS
  * between recorded polls (measured between those polls, so time without
  * recorded polls never splits a presence) continues it, and so does a member
- * who returns with an IVAO session id already seen in their current record:
- * that is the same connection, merely missing from the feed for a while.
+ * who returns with any IVAO session id (up to MAX_SESSION_IDS, the highest)
+ * already seen in their current record: that is the same connection, merely
+ * missing from the feed for a while.
  * Only the time rule counts towards the mass-reappearance guard, so a feed
  * that drops and restores many members is still caught. Unless the previous
  * recorded poll is this poll's trusted predecessor, every record starts over
@@ -202,7 +231,11 @@ export async function recordShortSessions(storage: DurableObjectStorage, poll: S
     if (!present.has(userId) || !isVid(sessionId)) continue;
     sessions.set(userId, (sessions.get(userId) ?? new Set()).add(sessionId));
   }
-  const newest = (id: number) => sessions.has(id) ? Math.max(...sessions.get(id)!) : null;
+  /** The (capped) ids to store, and the max for session_id; null when none are present. */
+  const idsOf = (id: number, stored: Iterable<number> = []) => {
+    const ids = capSessionIds([...stored, ...(sessions.get(id) ?? [])]);
+    return { json: ids.length ? JSON.stringify(ids) : null, max: ids.length ? ids[ids.length - 1] : null };
+  };
   const { ended, trackedBefore } = poll;
   const anomaly = ended.length > MAX_ENDED_PER_POLL || (trackedBefore >= 4 && ended.length > trackedBefore / 2);
   let fresh = 0;
@@ -211,16 +244,18 @@ export async function recordShortSessions(storage: DurableObjectStorage, poll: S
   storage.transactionSync(() => {
     reminderRetention(sql, nowMs);
     if (baseline) sql.exec(`DELETE FROM ${ONLINE}`);
-    const rows = new Map(sql.exec<{ user_id: number; missing_since: number | null; session_id: number | null }>(
-      `SELECT user_id, missing_since, session_id FROM ${ONLINE}`).toArray().map((row) => [row.user_id, row]));
+    const rows = new Map(sql.exec<{
+      user_id: number; missing_since: number | null; session_id: number | null; session_ids: string | null;
+    }>(`SELECT user_id, missing_since, session_id, session_ids FROM ${ONLINE}`).toArray()
+      .map((row) => [row.user_id, { ...row, ids: storedSessionIds(row.session_ids, row.session_id) }]));
     const withinLink = (id: number) => {
       const row = rows.get(id);
       return row !== undefined && (row.missing_since === null || previous! - row.missing_since < LINK_MS);
     };
     const continues = (id: number) => {
       if (withinLink(id)) return true;
-      const stored = rows.get(id)?.session_id;
-      return stored !== undefined && stored !== null && sessions.get(id)?.has(stored) === true;
+      const stored = rows.get(id)?.ids;
+      return stored !== undefined && [...stored].some((sid) => sessions.get(id)?.has(sid) === true);
     };
     // The mass guard counts the time rule only: a same-session return after a
     // long gap keeps its presence but still shows the feed dropped it.
@@ -228,16 +263,15 @@ export async function recordShortSessions(storage: DurableObjectStorage, poll: S
     mass = fresh > MAX_NEW_ONLINE_PER_POLL || (present.size >= 4 && fresh > present.size / 2);
     for (const id of present) {
       if (continues(id)) {
-        // The highest id seen keeps matching while any of the member's
-        // connections stays up; a lower surviving connection that returns
-        // after a long gap starts a new presence (accepted: storing only the
-        // ids present now would split a connection the feed dropped once).
-        const stored = rows.get(id)!.session_id;
-        sql.exec(`UPDATE ${ONLINE} SET missing_since = NULL, session_id = ? WHERE user_id = ?`,
-          Math.max(stored ?? 0, newest(id) ?? 0) || null, id);
+        // Every id seen during the record keeps matching, so a lower surviving
+        // connection returning alone after a long gap is the same presence.
+        const { json, max } = idsOf(id, rows.get(id)!.ids);
+        sql.exec(`UPDATE ${ONLINE} SET missing_since = NULL, session_id = ?, session_ids = ? WHERE user_id = ?`,
+          max, json, id);
       } else {
-        sql.exec(`INSERT OR REPLACE INTO ${ONLINE} (user_id, online_since, missing_since, session_id)
-          VALUES (?, ?, NULL, ?)`, id, baseline || mass ? null : previous!, newest(id));
+        const { json, max } = idsOf(id);
+        sql.exec(`INSERT OR REPLACE INTO ${ONLINE} (user_id, online_since, missing_since, session_id, session_ids)
+          VALUES (?, ?, NULL, ?, ?)`, id, baseline || mass ? null : previous!, max, json);
       }
     }
     for (const [id, row] of rows) {
