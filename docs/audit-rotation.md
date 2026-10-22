@@ -121,6 +121,10 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-22 | T3-1, T3-2 | P3 | Hook tests used a real ICAO prefix literally (now unassigned J prefixes); SECURITY.md names the stored IVAO session id; AGENTS.md and setup wording; a redaction check that could not fail | 07251c3 |
 | 2026-10-22 | T1-5 | P4 | Deferred: rules for other identifying settings (`IVAO_CLIENT_ID`, `EXCLUDED_CALLSIGNS`, `GCA_POLICY_URL`); deployment lines not at a line start; case-sensitive `.gitignore` for upper-case `.LOCAL.*`; lines over ~25 KB or multi-line keys across a scan chunk | 07251c3 |
 | 2026-10-22 | T2-2 | P4 | Deferred: no per-poll time budget for public delivery (T2-1 scope); continuation pages may follow a permanently rejected parent edit | 192d1db |
+| 2026-10-22 | T1-5 | P2 | Introduced by 07251c3: a blank line after every scan line made Gitleaks end chunks about every 4 KiB, so multi-line private keys were split more often (a 4096-bit key missed at 9 of 41 offsets, 4 with the earlier script); key blocks and continued commands now stay in one chunk, NUL bytes become spaces, and `.gitignore` matches private names in any case | 87a74db |
+| 2026-10-22 | T1-5 | P4 | Fixed deferred: Gitleaks rules for `IVAO_CLIENT_ID`, `EXCLUDED_CALLSIGNS` and `GCA_POLICY_URL`, with synthetic allowlists; published history passes. Deferred: a quote inside a policy link, an odd item early in a callsign list, Gitleaks' default true/false/null allowlist, lines over ~25 KB | 26a165c |
+| 2026-10-22 | T2-2 | P4 | Fixed deferred: public delivery stops starting Discord requests 45 s into a poll; the rest is deferred to the next poll without retry charges. A request already running can still finish after it | d86cc82 |
+| 2026-10-22 | T2-5 | P4 | markdownlint 0.42.0 and vitest 5.0.5 with no config or test changes; `katex` override still needed | 51db6c7 |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
