@@ -61,12 +61,24 @@ regexes = [
 ]
 
 # A multi-line JSON literal: the setting's value opens an object or array and
-# the line ends there. Known limit: a pretty-printed first line that continues
-# after the bracket, such as NAME='{"KEY": [, matches neither JSON rule.
+# the line ends there.
 [[rules]]
 id = "onfreq-json-setting-multiline"
 description = "onfreq private JSON setting opens a multi-line literal"
 regex = '''(?m)\b(?i:GCA_REGIONS|GCA_APPROVALS|GCA_HOME_OVERRIDES|FIR_LABELS)\b["']?\s*[=:]\s*["'`]?([\[{])\s*$'''
+secretGroup = 1
+keywords = ["gca_regions", "gca_approvals", "gca_home_overrides", "fir_labels"]
+
+# The first line of a pretty-printed JSON literal that continues after the
+# bracket, as in NAME='{"KEY": [ and NAME = [{"k": 1}, where the value opens an
+# object or array, then, after optional blanks and brackets, a JSON string
+# (its quotes may be shell-escaped), and the line ends in an opening bracket, a
+# comma or a colon. No quote or backtick may follow the string, so the match
+# cannot run past the end of a quoted value into later code on the line.
+[[rules]]
+id = "onfreq-json-setting-first-line"
+description = "onfreq private JSON setting opens a pretty-printed literal"
+regex = '''(?m)\b(?i:GCA_REGIONS|GCA_APPROVALS|GCA_HOME_OVERRIDES|FIR_LABELS)\b["']?\s*[=:]\s*["'`]?([\[{][ \t\[{]*\\?"[^"'`\n]*\\?"[^'`\n]*[\[{,:])[ \t\r]*$'''
 secretGroup = 1
 keywords = ["gca_regions", "gca_approvals", "gca_home_overrides", "fir_labels"]
 
@@ -93,5 +105,6 @@ regexes = [
 
 # Known limits: values held in constants or variables under other names, files
 # that never write these setting names next to their values, deployment
-# settings outside dotenv or shell lines, and the JSON first line above are not
-# covered; check:privacy and review still apply.
+# settings outside dotenv or shell lines, and a pretty-printed JSON first line
+# that ends in a value rather than a bracket, comma or colon are not covered;
+# check:privacy and review still apply.

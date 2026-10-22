@@ -1432,3 +1432,52 @@ test('the repository Gitleaks rules pass synthetic deployment settings, empty va
     for (const result of hook) assert.equal(result.status, 0, result.stderr);
     assert.equal(scan.status, 0, scan.stderr);
   });
+
+// NX-2c: the first line of a pretty-printed private JSON literal. Every flagged
+// line is assembled at runtime from a joined setting name, so this file never
+// holds one; the lines that must pass are written out.
+const jsonName = (...parts) => parts.join('_');
+
+test('the repository Gitleaks rules block the first line of a pretty-printed JSON literal, redacted (NX-2c)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    // Each literal continues on later lines, so neither single-line nor bare-bracket rule applies.
+    const blocked = (line, secret, rest) => {
+      const { hook, scan } = scanAssignment(f, `# synthetic settings\n${line}${rest}# end\n`);
+      for (const result of [...hook, scan]) {
+        assert.equal(result.status, 1, `${line}: ${result.stderr}`);
+        assert.ok(!(result.stderr + result.stdout).includes(secret), line);
+      }
+    };
+    const key = ['LF', 'FF'].join('');
+    for (const [line, secret, rest] of [
+      [`${jsonName('GCA', 'REGIONS')}='{"${key}": [\n`, `{"${key}": [`, '    "LF"\n  ]\n}\'\n'],
+      [`export ${jsonName('GCA', 'APPROVALS')}={"a": {\n`, '{"a": {', '  "b": 1\n}}\n'],
+      [`${jsonName('FIR', 'LABELS')} = [{"x": 1},\n`, '[{"x": 1},', '  {"y": 2}]\n'],
+      // Shell-escaped quotes, a key whose value starts on the next line, nested
+      // brackets, a lowercase name, a CRLF line and a TypeScript property.
+      [`${jsonName('GCA', 'HOME', 'OVERRIDES')}="{\\"${key}\\": {\n`, `{\\"${key}\\": {`, '  \\"b\\": 1\n}}"\n'],
+      [`${jsonName('GCA', 'REGIONS')}='{"${key}":\n`, `{"${key}":`, '  ["LF"]\n}\'\n'],
+      [`${jsonName('gca', 'regions')}='[ {"${key}": [\n`, `[ {"${key}": [`, '  "LF"]}]\'\n'],
+      [`${jsonName('FIR', 'LABELS')}='{"${key}": "Synthetic",\r\n`, `{"${key}": "Synthetic",`, '  "LFXX": "Other"\r\n}\'\r\n'],
+      [`  ${jsonName('GCA', 'APPROVALS')}: \`{"${key}": [\n`, `{"${key}": [`, '    "1"\n  ]}`,\n'],
+    ]) blocked(line, secret, rest);
+  });
+
+test('the repository Gitleaks rules pass JSON expressions, empty and fixture values and unquoted keys (NX-2c)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    // A quote or backtick ends the value, so later code on the line is not read as JSON.
+    const text = "  GCA_APPROVALS: '{}', GCA_HOME_OVERRIDES: JSON.stringify({\n    LFFF: ['LF'],\n  }),\n"
+      + "  GCA_REGIONS: JSON.stringify({\n    AA: { name: 'Example', prefixes: ['XA'] },\n  }),\n"
+      + "GCA_REGIONS='{}'\n"
+      // The single-line rule's published synthetic fixture.
+      + `  GCA_HOME_OVERRIDES: '{"600001":"ZZ"}',\n`
+      // TypeScript object literals without a quoted key.
+      + 'const GCA_REGIONS = { LFFF: [\n  \'LF\',\n] };\nconst FIR_LABELS = [{ x: 1 },\n  { y: 2 }];\n';
+    const { hook, scan } = scanAssignment(f, text);
+    for (const result of hook) assert.equal(result.status, 0, result.stderr);
+    assert.equal(scan.status, 0, scan.stderr);
+  });
