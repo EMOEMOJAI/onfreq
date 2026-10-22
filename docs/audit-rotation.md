@@ -110,6 +110,9 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-21 | T1-6 | P3 | Fixed deferred mass-reappearance edges: a member back on the same IVAO session after a feed gap keeps their presence; the mass guard is unchanged | 613e0d8 |
 | 2026-10-21 | T1-6 | P4 | Fixed deferred: expired rate-limit entries, including DM channel ids, are removed on the next load | 613e0d8 |
 | 2026-10-21 | T1-5 | P4 | Fixed deferred: pre-push names gitleaks:allow in author names and paths; rules for multi-line JSON settings and dotenv FIR_PREFIXES/COORDINATOR_NAME. Still deferred: whole-message email check | 1643863 |
+| 2026-10-22 | T1-5 | P4 | Fixed deferred: commit messages are checked for real email addresses anywhere, not only in trailers; published history passes without a rewrite. Deferred: Markdown-underscore-wrapped addresses, dotless trailer hosts after a record separator, crafted stateful encodings | 642a729 |
+| 2026-10-22 | T3-2 | P4 | Fixed deferred: the GCA send-detection wrapper is now `trackPosts` with direct tests | 0aa808a |
+| 2026-10-22 | T1-5 | P4 | Fixed known limit: a Gitleaks rule for the pretty-printed first line of a private JSON setting | 6b676cd |
 
 Deferred: test pool runtime older than deploy runtime (vitest-pool-workers 0.23.0 still bundles miniflare 5.20260815.0-alpha vs compatibility date 2026-08-16; bump when a matching release exists). Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
