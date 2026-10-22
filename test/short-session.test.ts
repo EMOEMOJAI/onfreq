@@ -75,6 +75,9 @@ let activeCtx: DurableObjectState | undefined;
 let onCardPost: (() => void) | undefined;
 let cardId: number;
 let logs: ReturnType<typeof vi.spyOn>[];
+/** Errors thrown out of `at()` polls; a scenario that injects a failure sets `injectsFailure`. */
+let pollFailures: unknown[];
+let injectsFailure: boolean;
 
 function entry(callsign: string, userId = VID, frequency = 118.1, id = 1): IvaoAtcSummaryEntry {
   return {
@@ -99,7 +102,7 @@ function settings(overrides: Partial<Env> = {}): Env {
   } as Env;
 }
 
-/** One poll `minutes` after START with the given monitored feed; a failing poll is tolerated. */
+/** One poll `minutes` after START with the given monitored feed; a thrown failure is collected, never swallowed. */
 function at(
   minutes: number, current: IvaoAtcSummaryEntry[], overrides: Partial<Env> = {},
   prepare?: (ctx: DurableObjectState) => void,
@@ -110,7 +113,7 @@ function at(
     activeCtx = ctx;
     prepare?.(ctx);
     return new PollCoordinator(ctx, settings(overrides)).poll();
-  }).catch(() => undefined);
+  }).catch((error: unknown) => { pollFailures.push(error); });
 }
 
 /** Polls at each minute in `[from, to]` with `step`, all with the same feed. */
@@ -120,6 +123,7 @@ async function during(from: number, to: number, step: number, current: IvaoAtcSu
 
 /** The next recording transaction fails, as an injected SQL error would. */
 const failRecording = (ctx: DurableObjectState) => {
+  injectsFailure = true;
   vi.spyOn(ctx.storage, 'transactionSync').mockImplementationOnce(() => { throw new Error('synthetic SQL failure'); });
 };
 
@@ -179,7 +183,10 @@ async function expectNothing({ allowPollFailure = false } = {}) {
   expect(await rows()).toEqual([]);
   expect(dms).toEqual([]);
   // A scenario that recorded nothing must not have done so by failing.
-  if (!allowPollFailure) expect(logged('short_session_poll_failed')).toEqual([]);
+  if (!allowPollFailure && !injectsFailure) {
+    expect(logged('short_session_poll_failed')).toEqual([]);
+    expect(pollFailures).toEqual([]);
+  }
   expect((await snapshot())?.error).toBeUndefined();
 }
 
@@ -210,6 +217,8 @@ beforeEach(() => {
   activeCtx = undefined;
   onCardPost = undefined;
   cardId = 0;
+  pollFailures = [];
+  injectsFailure = false;
   logs = (['log', 'warn', 'error'] as const).map((level) => vi.spyOn(console, level).mockImplementation(() => {}));
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input, init) => {
@@ -270,6 +279,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  if (!injectsFailure) expect(pollFailures).toEqual([]);
   // A test may leave a due alarm (a webhook hint), which must not fire in the next one.
   await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.deleteAlarm());
   vi.restoreAllMocks();
@@ -519,6 +529,7 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await during(-120, 0, 2, [earlier], EXCLUDED);
     if (kind === 'outage') {
       feedStatus = 503;
+      injectsFailure = true;
       await during(1, 14, 1, [], EXCLUDED);
       feedStatus = 200;
     }
@@ -582,6 +593,7 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await at(0, []);
     await during(1, 60, 5, [twr()]);
     feedStatus = 503;
+    injectsFailure = true;
     await during(61, 72, 1, []);
     feedStatus = 200;
     await at(73, [app()]);
@@ -597,6 +609,7 @@ describe('short-session reminders: presence regressions send nothing', () => {
     await during(-59, -1, 2, [twr()], grace);
     await at(0, [], grace);
     feedStatus = 503;
+    injectsFailure = true;
     await during(1, 11, 1, [], grace);
     feedStatus = 200;
     await at(12, [twr()], grace);
@@ -651,11 +664,63 @@ describe('short-session reminders: presence regressions send nothing', () => {
     expect(await rows()).toMatchObject([{ session_key: `${VID}:${ms(75)}`, status: 'sent', duration_minutes: 11 }]);
   });
 
-  it('NX-1a: stores the newest session id seen in the record, never a lower one later', async () => {
+  it('NX-1a: a continuing member stores the newest session id present in this poll, even a lower one', async () => {
     await at(0, []);
-    await at(1, [twr(5), entry('QCTT_APP', VID, 119.1, 9)]);
-    await at(2, [twr(3)]);
+    await at(1, [twr(5), app(9)]);
     expect(await sql(`SELECT user_id, session_id FROM ${ONLINE}`)).toEqual([{ user_id: VID, session_id: 9 }]);
+    await at(2, [twr(5)]);
+    expect(await sql(`SELECT user_id, session_id FROM ${ONLINE}`)).toEqual([{ user_id: VID, session_id: 5 }]);
+    // Nothing valid now: the stored id stays.
+    await at(3, [twr(0)]);
+    expect(await sql(`SELECT user_id, session_id FROM ${ONLINE}`)).toEqual([{ user_id: VID, session_id: 5 }]);
+  });
+
+  it('NX-1a: after the higher session ends, the surviving session id still matches a return after a long gap', async () => {
+    const other = entry('QCZZ_APP', 600002, 119.1, 7);
+    await at(0, [other]);
+    await at(1, [twr(5), app(9), other]);
+    await at(30, [twr(5), app(9), other]);
+    await at(31, [twr(5), other]);
+    await during(32, 46, 2, [other]);
+    await at(47, [twr(5), other]);
+    await at(62, [other]);
+    await at(63, [other]);
+    await at(80, [other]);
+    await expectNothing();
+  });
+
+  it('NX-1a: a failing schema upgrade fails the poll once, sends nothing, and the next poll baselines', async () => {
+    await at(0, []);
+    await at(1, [twr()]);
+    await at(5, [twr()], {}, (ctx) => {
+      injectsFailure = true;
+      const exec = ctx.storage.sql.exec.bind(ctx.storage.sql) as (query: string, ...bindings: unknown[]) => unknown;
+      let failed = false;
+      vi.spyOn(ctx.storage.sql, 'exec').mockImplementation(((query: string, ...bindings: unknown[]) => {
+        if (!failed && query.includes('pragma_table_info')) { failed = true; throw new Error('synthetic pragma failure'); }
+        return exec(query, ...bindings);
+      }) as never);
+    });
+    expect(logged('short_session_poll_failed')).toHaveLength(1);
+    await at(6, []);
+    await at(7, []);
+    await at(25, []);
+    await expectNothing({ allowPollFailure: true });
+    expect(logged('short_session_baseline')).toHaveLength(2);
+  });
+
+  it('NX-1a: a migrated row with a NULL session id after a gap over 10 minutes is a new presence', async () => {
+    const other = entry('QCZZ_APP', 600002, 119.1, 7);
+    await at(0, [other]);
+    await at(1, [twr(1), other]);
+    await at(60, [twr(1), other]);
+    await sql(`UPDATE ${ONLINE} SET session_id = NULL`);
+    await during(61, 75, 2, [other]);
+    await at(76, [twr(1), other]);
+    await at(86, [other]);
+    await at(87, [other]);
+    await at(100, [other]);
+    expect(await rows()).toMatchObject([{ session_key: `${VID}:${ms(75)}`, status: 'sent', duration_minutes: 11 }]);
   });
 
   it('NX-1a: adds session_id in place to an online table of the earlier shape, keeping its rows', async () => {
@@ -1120,6 +1185,7 @@ describe('ROT-1: the coordinator around the DM step', () => {
     const hold = deferred();
     feedGate = hold.promise;
     feedStatus = 503;
+    injectsFailure = true;
     const results = await withCoordinator(5, [], async (coordinator) => {
       const first = coordinator.poll().catch((err: Error) => err.message);
       await vi.waitFor(() => expect(held).toEqual(['feed']));
@@ -1425,6 +1491,7 @@ describe('short-session storage', () => {
   it('records stateAt on success and carries it through a failed poll', async () => {
     await at(0, []);
     expect((await snapshot())!.stateAt).toBe(iso(0));
+    injectsFailure = true;
     await at(1, [], { DISCORD_CHANNEL_IDS: '' });
     expect((await snapshot())).toMatchObject({ stateAt: iso(0), error: expect.any(String) });
     await at(2, [twr()]);
