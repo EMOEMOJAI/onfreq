@@ -14,6 +14,8 @@ const isString: Guard<string> = (value): value is string => typeof value === 'st
 const isNumber: Guard<number> = (value): value is number => typeof value === 'number';
 /** Whole numbers: a fractional or NaN epoch-ms window would make building a snowflake from it throw. */
 const isSafeInteger: Guard<number> = (value): value is number => Number.isSafeInteger(value);
+/** Counters and budgets: a NaN or string would make `attempts + 1` or a budget comparison silently wrong. */
+const isFiniteNumber: Guard<number> = (value): value is number => typeof value === 'number' && Number.isFinite(value);
 const arrayOf = <T>(guard: Guard<T>): Guard<T[]> => (value): value is T[] => Array.isArray(value) && value.every(guard);
 const recordOf = <T>(guard: Guard<T>): Guard<Record<string, T>> => (value): value is Record<string, T> =>
   isRecord(value) && Object.values(value).every(guard);
@@ -26,15 +28,17 @@ const isPostWindow: Guard<PostWindow> = (value): value is PostWindow =>
   isRecord(value) && isSafeInteger(value.from) && isSafeInteger(value.to);
 const isRosterMessage: Guard<RosterMessage> = (value): value is RosterMessage =>
   isPostedMessage(value) && isString((value as Partial<RosterMessage>).parentMessageId) &&
-  isSafeInteger((value as Partial<RosterMessage>).page);
+  isSafeInteger((value as Partial<RosterMessage>).page) &&
+  optional(isFiniteNumber)((value as Partial<RosterMessage>).deleteAttempts) &&
+  optional(isFiniteNumber)((value as Partial<RosterMessage>).pageAttempts);
 const isRosterPostAttempt: Guard<RosterPostAttempt> = (value): value is RosterPostAttempt =>
   isRecord(value) && isString(value.channelId) && isString(value.parentMessageId) && isSafeInteger(value.page) &&
-  optional(isSafeInteger)(value.maybePostedFrom) && optional(isSafeInteger)(value.maybePostedTo);
+  optional(isFiniteNumber)(value.attempts) && optional(isSafeInteger)(value.maybePostedFrom) && optional(isSafeInteger)(value.maybePostedTo);
 
 /** Whether a stored session has every field a poll reads, in the shape it reads it. */
 function isTrackedAtc(value: unknown): value is TrackedAtc {
   return isRecord(value) && isString(value.callsign) && isString(value.position) && isNumber(value.frequency) &&
-    isNumber(value.userId) && isString(value.since) && isNumber(value.missed) &&
+    isNumber(value.userId) && isString(value.since) && isSafeInteger(value.missed) && value.missed >= 0 &&
     (value.station == null || isString(value.station)) && (value.location == null || isString(value.location)) &&
     optional(arrayOf(isPostedMessage))(value.messages) && optional(arrayOf(isString))(value.pendingChannelIds) &&
     optional(recordOf(isPostWindow))(value.uncertainPosts);
@@ -46,7 +50,8 @@ function isPendingOffline(value: unknown): value is PendingOffline {
   return isTrackedAtc(event) && isString((event as Partial<OfflineEvent>).endedAt) &&
     isNumber((event as Partial<OfflineEvent>).durationSeconds) &&
     arrayOf(isPostedMessage)(value.messages) && arrayOf(isString)(value.channelIds) &&
-    optional(recordOf(isPostWindow))(value.recoverPosts) && optional(isRecord)(value.attemptsByChannel);
+    optional(recordOf(isPostWindow))(value.recoverPosts) && optional(recordOf(isFiniteNumber))(value.attemptsByChannel) &&
+    optional(isFiniteNumber)(value.attempts);
 }
 
 /**

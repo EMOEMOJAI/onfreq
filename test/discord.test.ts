@@ -1052,6 +1052,22 @@ describe('REST calls', () => {
       .rejects.toBeInstanceOf(DiscordUnconfirmedPostError);
   });
 
+  it.each([200, 201])('treats an oversized %i response to a PATCH or DELETE as the applied change', async (status) => {
+    const oversized = () => new Response('x', { status, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } });
+    const fetchMock = stubFetch(oversized(), oversized());
+    await expect(editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, new DiscordRateLimits()))
+      .resolves.toBeUndefined();
+    await expect(deleteMessage('token', '100000000000000123', '100000000000000999', new DiscordRateLimits()))
+      .resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('still reports an oversized 4xx PATCH response as a rejection', async () => {
+    stubFetch(new Response('x', { status: 400, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }));
+    await expect(editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, new DiscordRateLimits()))
+      .rejects.toBeInstanceOf(DiscordResponseTooLargeError);
+  });
+
   it.each(['../100000000000000999', '100000000000000999/reactions', 'posted-1', '123', '1'.repeat(21), ''])(
     'never places a stored message id %j that is not a snowflake in a request path', async (messageId) => {
       const fetchMock = stubFetch(Response.json({ id: '100000000000000999' }), new Response(null, { status: 204 }));

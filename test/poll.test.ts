@@ -1901,6 +1901,8 @@ describe('polling through the Durable Object', () => {
     feed = [entry(a), entry(b)];
     await poll();
     failures.add(mid(b));
+    // Not a permanent-for-this-embed rejection, so the edit is retried.
+    failureStatus = 401;
     feed = [entry(b)];
     await nextPoll();
     expect(roster(mid(b))).toContain(a);
@@ -1929,6 +1931,59 @@ describe('polling through the Durable Object', () => {
     const count = sent.length;
     await nextPoll();
     expect(sent).toHaveLength(count);
+  });
+
+  describe('an online card edit rejected with a definite 4xx', () => {
+    async function rejectEdits(status: number, code: number) {
+      await seed({ [a]: session(a) });
+      feed = [entry(a)];
+      await poll();
+      const original = network.getMockImplementation()!;
+      const patches: string[] = [];
+      let reject = true;
+      network.mockImplementation(async (input, init) => {
+        if (init?.method === 'PATCH' && String(input).endsWith(`/messages/${mid(a)}`) && reject) {
+          patches.push(String(init.body));
+          return Response.json({ code, message: 'synthetic' }, { status });
+        }
+        return original(input, init);
+      });
+      return { patches, accept: () => { reject = false; } };
+    }
+
+    it.each([[400, 50083], [413, 0]])('stops retrying the unchanged embed after a %i (code %i)', async (status, code) => {
+      const { patches, accept } = await rejectEdits(status, code);
+      feed = [entry(a, 121.7)];
+      expect((await nextPoll()).status).toBe(200);
+      expect(patches).toHaveLength(1);
+      expect((await nextPoll()).status).toBe(200);
+      expect(patches).toHaveLength(1);
+      expect((await snapshot())?.lastSuccessfulPollAt).toBe(now);
+      // A later content change tries again.
+      accept();
+      feed = [entry(a, 121.8)];
+      expect((await nextPoll()).status).toBe(200);
+      expect(cards.get(mid(a))?.fields?.[0]?.value).toContain('121.800');
+    });
+
+    it('sends one further PATCH for a later content change while edits are still rejected', async () => {
+      const { patches } = await rejectEdits(400, 50083);
+      feed = [entry(a, 121.7)];
+      await nextPoll();
+      await nextPoll();
+      feed = [entry(a, 121.8)];
+      expect((await nextPoll()).status).toBe(200);
+      expect(patches).toHaveLength(2);
+    });
+
+    it.each([[401, 0], [400, 30046]])('keeps retrying and reports a %i (code %i)', async (status, code) => {
+      const { patches } = await rejectEdits(status, code);
+      feed = [entry(a, 121.7)];
+      const results = [];
+      for (let i = 0; i < 2; i++) results.push((await nextPoll()).status);
+      expect(results).toEqual([500, 500]);
+      expect(patches).toHaveLength(2);
+    });
   });
 
   it('suppresses a fallback OFFLINE post once every card for a session is discovered gone', async () => {
@@ -2034,7 +2089,7 @@ describe('polling through the Durable Object', () => {
       if (url.endsWith(`/messages/${mid(b)}`) && init?.method === 'PATCH') return new Response(null, { status: 404 });
       if (url.endsWith(`/messages/${mid(a)}`) && init?.method === 'PATCH') {
         editsToA++;
-        return new Response('nope', { status: 400 });
+        return new Response('nope', { status: 401 });
       }
       return original(input, init);
     });
@@ -2329,6 +2384,7 @@ describe('polling through the Durable Object', () => {
       // A failed parent edit leaves this poll's pages unknown; the frozen
       // marker must survive it rather than grant a fresh budget.
       failures.add(lastPage.parentMessageId);
+      failureStatus = 401;
       feed.find((item) => item.callsign === a)!.atcSession.frequency = 121.7;
       expect((await nextPoll()).status).toBe(500);
       expect((await snapshot())?.rosterPostAttempts).toEqual([
@@ -2368,6 +2424,7 @@ describe('polling through the Durable Object', () => {
       await poll();
       const pages = (await snapshot())!.rosterMessages!;
       failures.add(mid(a));
+      failureStatus = 401;
       feed = [entry(a)];
       expect((await nextPoll()).status).toBe(500);
       expect(deleted).toEqual([]);

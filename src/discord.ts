@@ -535,7 +535,11 @@ async function discordRequest(
         // Discord responded, so this is neither an outage nor a POST failure.
         limits.noteDiscordResponded();
         // An accepted POST created its message even though its id is unreadable.
-        if (method === 'POST' && err.status >= 200 && err.status < 300) throw new DiscordUnconfirmedPostError();
+        if (err.status >= 200 && err.status < 300) {
+          if (method === 'POST') throw new DiscordUnconfirmedPostError();
+          // A PATCH or DELETE has no response the caller reads: the change was applied.
+          if (method !== 'GET') return new Response(null, { status: err.status });
+        }
         throw new DiscordResponseTooLargeError(err.status);
       }
       // A thrown fetch error (timeout, network failure, TypeError) never

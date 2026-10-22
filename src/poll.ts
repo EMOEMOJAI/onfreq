@@ -6,6 +6,8 @@ import {
   buildSessionEndedEmbed,
   countsAgainstBudget,
   DiscordApiError,
+  DiscordInvalidChannelIdError,
+  DiscordResponseTooLargeError,
   DiscordUnconfirmedPostError,
   editMessage,
   escapeMarkdown,
@@ -225,6 +227,14 @@ async function announceOnline(
   return { posted, failed, unconfirmed };
 }
 
+/** A 400/413 that Discord does not report as a 30xxx limit: the same embed will be refused again. */
+function rejectsEmbedPermanently(err: unknown): boolean {
+  if (err instanceof DiscordInvalidChannelIdError) return true;
+  // The synthetic 413 stands for an oversized response of any status.
+  return err instanceof DiscordApiError && !(err instanceof DiscordResponseTooLargeError) && (err.status === 400 || err.status === 413) &&
+    !(err.code !== undefined && err.code >= 30000 && err.code <= 30999);
+}
+
 /** Reconcile displayed cards, retrying only messages whose last edit failed. */
 async function syncOnlineCards(
   ctx: PollContext, next: StateMap, current: OnlineAtc[],
@@ -288,8 +298,16 @@ async function syncOnlineCards(
               removedMessage = true;
               continue;
             }
-            failed = true;
-            failedRefs.add(ref);
+            // A rejection that is permanent for this embed (not a limit such as
+            // Discord's 30046 old-message edit cap) is not retried every poll:
+            // treat it as shown, so health is not frozen; the next content
+            // change tries again.
+            if (rejectsEmbedPermanently(err)) {
+              ref.onlineEmbed = rendered;
+            } else {
+              failed = true;
+              failedRefs.add(ref);
+            }
           }
         }
         if (isHolder || !updated) {

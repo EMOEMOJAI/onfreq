@@ -251,6 +251,44 @@ describe('loading stored state', () => {
     vi.restoreAllMocks();
   });
 
+  it('drops stored entries whose counters are not usable numbers, by count only', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const valid = tracked('QCTT_TWR');
+    const stored = {
+      QCTT_TWR: valid,
+      QESS_APP: { ...tracked('QESS_APP'), missed: Number.NaN },
+      QFRA_TWR: { ...tracked('QFRA_TWR'), missed: -1 },
+      QGLL_TWR: { ...tracked('QGLL_TWR'), missed: 0.5 },
+      QLIM_TWR: { ...tracked('QLIM_TWR'), missed: '1' },
+    } as unknown as StateMap;
+    expect(loadSessions(stored)).toEqual({ QCTT_TWR: valid });
+
+    const job: PendingOffline = {
+      event: { ...valid, endedAt: NOW, durationSeconds: 60 }, messages: [], channelIds: [],
+      attemptsByChannel: { '900000000000000001': 2 }, attempts: 1,
+    };
+    const bad = [
+      { ...job, attemptsByChannel: { '900000000000000001': Number.NaN } },
+      { ...job, attemptsByChannel: { '900000000000000001': '2' } },
+      { ...job, attempts: '1' },
+      { ...job, attempts: Number.POSITIVE_INFINITY },
+    ];
+    expect(loadPendingOffline([job, ...bad])).toEqual([job]);
+
+    const page = { channelId: '900000000000000001', messageId: '700000000000000001', parentMessageId: '700000000000000002',
+      page: 0, deleteAttempts: 1, pageAttempts: 2 };
+    expect(loadRosterMessages([page, { ...page, deleteAttempts: '1' }, { ...page, pageAttempts: Number.NaN }])).toEqual([page]);
+    const attempt = { channelId: '900000000000000001', parentMessageId: '700000000000000002', page: 1, attempts: 0 };
+    expect(loadRosterPostAttempts([attempt, { ...attempt, attempts: Number.NaN }, { ...attempt, attempts: '0' }])).toEqual([attempt]);
+    expect(error.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      { event: 'sessions_dropped', reason: 'invalid', count: 4 },
+      { event: 'offline_jobs_dropped', reason: 'invalid', count: 4 },
+      { event: 'roster_messages_dropped', reason: 'invalid', count: 2 },
+      { event: 'roster_post_attempts_dropped', reason: 'invalid', count: 2 },
+    ]);
+    vi.restoreAllMocks();
+  });
+
   it('C58: strips a legacy roster field from a stored closeout event', () => {
     const event = { ...tracked('QCTT_TWR'), endedAt: NOW, durationSeconds: 60, roster: true };
     const [loaded] = loadPendingOffline([{ event, messages: [], channelIds: [] }]);

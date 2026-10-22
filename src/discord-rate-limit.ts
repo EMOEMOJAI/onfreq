@@ -11,6 +11,19 @@ export const MAX_RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000;
  */
 const DISCORD_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
+/**
+ * A request blocked only by a soft (2xx-header) cooldown waits it out when it
+ * is this short, and this instance has waited no more than the total below,
+ * instead of deferring to the next poll. Callers with their own deadlines (GCA
+ * 25 s, short-session 15 s) may therefore overrun them by at most 5 s.
+ */
+const MAX_SOFT_WAIT_MS = 5_000;
+const MAX_SOFT_WAIT_TOTAL_MS = 10_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /** Cooldown for a 429 whose body exceeded the cap, so its retry_after was never read. */
 const UNREADABLE_RATE_LIMIT_COOLDOWN_MS = 60_000;
 
@@ -56,6 +69,8 @@ export class DiscordRateLimits {
   private outageUntil = 0;
   /** In-memory only per-route soft cooldowns inferred from 2xx rate headers. */
   private readonly softDeadlines: Record<string, number> = {};
+  /** Time this instance has spent waiting out soft cooldowns. */
+  private softWaitedMs = 0;
   /** Consecutive POST 5xx/timeout failures since Discord last returned a non-5xx, non-429 response. */
   private postFailureStreak = 0;
 
@@ -117,12 +132,20 @@ export class DiscordRateLimits {
     const globalDeadline = this.deadlines[GLOBAL] ?? 0;
     const routeDeadline = this.deadlines[route] ?? 0;
     const softDeadline = this.softDeadlines[route] ?? 0;
-    const blockedUntil = Math.max(globalDeadline, routeDeadline, softDeadline, this.outageUntil);
+    const hardUntil = Math.max(globalDeadline, routeDeadline, this.outageUntil);
+    const blockedUntil = Math.max(hardUntil, softDeadline);
     if (blockedUntil > Date.now()) {
-      const reason: DiscordRateLimitReason =
-        blockedUntil === globalDeadline || blockedUntil === routeDeadline ? 'rate_limit' :
-        blockedUntil === this.outageUntil ? 'outage' : 'soft';
-      throw new DiscordRateLimitError(blockedUntil, false, blockedUntil === globalDeadline, reason);
+      const wait = blockedUntil - Date.now();
+      // Only the soft deadline blocks, and briefly: wait it out rather than defer.
+      if (hardUntil <= Date.now() && wait <= MAX_SOFT_WAIT_MS && this.softWaitedMs + wait <= MAX_SOFT_WAIT_TOTAL_MS) {
+        this.softWaitedMs += wait;
+        await sleep(wait);
+      } else {
+        const reason: DiscordRateLimitReason =
+          blockedUntil === globalDeadline || blockedUntil === routeDeadline ? 'rate_limit' :
+          blockedUntil === this.outageUntil ? 'outage' : 'soft';
+        throw new DiscordRateLimitError(blockedUntil, false, blockedUntil === globalDeadline, reason);
+      }
     }
 
     let response: Response;

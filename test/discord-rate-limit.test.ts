@@ -117,25 +117,110 @@ it('does not mask the rate-limit error when persisting the cooldown fails', asyn
   expect(storage.put).toHaveBeenCalledTimes(1);
 });
 
-it('sets a short in-memory-only cooldown when a 2xx reports an exhausted bucket, without persisting it', async () => {
+/** Soft waits (at most 5 s) run instantly and advance the mocked clock; other timers are untouched. */
+function instantSoftWaits() {
+  const waits: number[] = [];
+  const real = globalThis.setTimeout;
+  vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+    if (ms === undefined || ms > 5_000) return real(fn, ms);
+    waits.push(ms);
+    now += ms;
+    fn();
+    return 0 as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  return waits;
+}
+
+const exhausted = (resetAfter: string, id = 'first') => async () => Response.json({ id }, {
+  headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset-after': resetAfter },
+});
+
+it('waits out a short in-memory-only soft cooldown from a 2xx with an exhausted bucket, then sends the request', async () => {
+  const waits = instantSoftWaits();
   const network = vi.fn()
-    .mockImplementationOnce(async () => Response.json({ id: 'first' }, {
-      headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset-after': '2.5' },
-    }))
+    .mockImplementationOnce(exhausted('2.5'))
     .mockImplementation(async () => Response.json({ id: 'second' }));
   vi.stubGlobal('fetch', network);
   const storage = { put: vi.fn(), get: vi.fn().mockResolvedValue(undefined) } as unknown as DurableObjectStorage;
   const limits = new DiscordRateLimits(storage);
 
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+  expect(waits).toEqual([]);
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+  expect(waits).toEqual([2500]);
+  expect(now).toBe(START + 2500);
+  expect(network).toHaveBeenCalledTimes(2);
+  expect(storage.put).not.toHaveBeenCalled();
+});
+
+it('still defers a soft cooldown longer than 5 seconds, in memory only', async () => {
+  const waits = instantSoftWaits();
+  const network = vi.fn()
+    .mockImplementationOnce(exhausted('5.001'))
+    .mockImplementation(async () => Response.json({ id: 'second' }));
+  vi.stubGlobal('fetch', network);
+  const storage = { put: vi.fn(), get: vi.fn().mockResolvedValue(undefined) } as unknown as DurableObjectStorage;
+  const limits = new DiscordRateLimits(storage);
+
+  await limits.fetch('/channels/a/messages', { method: 'POST' });
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
-    .rejects.toMatchObject({ requestMade: false, retryAt: START + 2500 });
+    .rejects.toMatchObject({ requestMade: false, reason: 'soft', retryAt: START + 5001 });
+  expect(waits).toEqual([]);
   expect(network).toHaveBeenCalledTimes(1);
   expect(storage.put).not.toHaveBeenCalled();
 
-  now += 2500;
+  now += 5001;
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
   expect(network).toHaveBeenCalledTimes(2);
+});
+
+it('stops waiting out soft cooldowns once an instance has waited 10 seconds in total', async () => {
+  const waits = instantSoftWaits();
+  const network = vi.fn(exhausted('4'));
+  vi.stubGlobal('fetch', network);
+  const limits = new DiscordRateLimits();
+
+  await limits.fetch('/channels/a/messages', { method: 'POST' });
+  await limits.fetch('/channels/a/messages', { method: 'POST' });
+  await limits.fetch('/channels/a/messages', { method: 'POST' });
+  expect(waits).toEqual([4000, 4000]);
+  // A third 4 s wait would reach 12 s; a 2 s wait would still fit under the cap.
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+    .rejects.toMatchObject({ requestMade: false, reason: 'soft', retryAt: now + 4000 });
+  expect(waits).toEqual([4000, 4000]);
+  expect(network).toHaveBeenCalledTimes(3);
+});
+
+it('counts the soft waiting of a whole instance across routes towards the 10 second cap', async () => {
+  const waits = instantSoftWaits();
+  vi.stubGlobal('fetch', vi.fn(exhausted('4')));
+  const limits = new DiscordRateLimits();
+
+  for (const channel of ['a', 'b']) {
+    await limits.fetch(`/channels/${channel}/messages`, { method: 'POST' });
+    await limits.fetch(`/channels/${channel}/messages`, { method: 'POST' });
+  }
+  await limits.fetch('/channels/c/messages', { method: 'POST' });
+  await expect(limits.fetch('/channels/c/messages', { method: 'POST' })).rejects.toMatchObject({ reason: 'soft' });
+  expect(waits).toEqual([4000, 4000]);
+});
+
+it('does not wait when the soft cooldown is not the only blocker', async () => {
+  const waits = instantSoftWaits();
+  const network = vi.fn(exhausted('2'));
+  vi.stubGlobal('fetch', network);
+  const limits = new DiscordRateLimits();
+
+  await limits.fetch('/channels/a/messages', { method: 'POST' });
+  // An outage ending before the soft deadline still blocks: the request is deferred, not slept for.
+  limits.markOutage(1_000);
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+    .rejects.toMatchObject({ requestMade: false, reason: 'soft', retryAt: START + 2000 });
+  limits.markOutage(3_000);
+  await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+    .rejects.toMatchObject({ requestMade: false, reason: 'outage', retryAt: START + 3000 });
+  expect(waits).toEqual([]);
+  expect(network).toHaveBeenCalledTimes(1);
 });
 
 it('keeps a 2xx-derived soft cooldown scoped to its own route, leaving other channels usable', async () => {
