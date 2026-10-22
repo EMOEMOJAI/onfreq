@@ -477,6 +477,21 @@ describe('fetchDivisionAtc', () => {
     expect(failedSessions).toEqual([]);
   });
 
+  it('leaves presentVids and presentSessions empty when a 200 body is mostly malformed', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const entries = [
+      rawEntry({ id: 21, userId: 600, callsign: 'QCZZ_TWR' }),
+      { bogus: true },
+      { bogus: 'yes' },
+    ];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(entries)));
+    const vids: number[] = [];
+    const sessions: { userId: number; sessionId: number }[] = [];
+    await expect(fetchDivisionAtc(['QC'], undefined, vids, sessions)).rejects.toThrow('mostly failed validation');
+    expect(vids).toEqual([]);
+    expect(sessions).toEqual([]);
+  });
+
   it('caps runaway string lengths from the feed', async () => {
     const entries = [rawEntry({
       atcSession: { frequency: 118.1, position: `T${'W'.repeat(300)}R` },
