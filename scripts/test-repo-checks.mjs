@@ -185,6 +185,60 @@ test('checks both raw commit emails and redacts rejected identities', () => {
   }
 });
 
+test('checks every address in the commit message, allowing only noreply identities, and redacts them (NX-2a)', () => {
+  // Synthetic addresses are assembled at runtime, so this file never contains one.
+  const at = (local, domain) => [local, domain].join('@');
+  const person = at('person', 'example.invalid');
+  const hash = 'c'.repeat(40);
+  const row = (message, trailers = '', author = '1+example@users.noreply.github.com') =>
+    `${[hash, author, 'noreply@github.com', trailers].join('\t')}\x1e${message}`;
+  const messageError = `${'c'.repeat(12)}: commit message email must use a noreply address`;
+  const trailerError = `${'c'.repeat(12)}: commit trailer email must use a noreply address`;
+  const authorError = `${'c'.repeat(12)}: commit email must use GitHub noreply`;
+  const redacted = (failures, label) => assert.doesNotMatch(failures.join(' '), /person|example\.invalid|private/, label);
+  // 1. An address in the body, outside any trailer, is flagged.
+  let failures = privateCommitEmails(row(`synthetic subject\n\nContact ${person} for access\n`));
+  assert.deepEqual(failures, [messageError]);
+  redacted(failures);
+  // 2. Subject lines, other address shapes and addresses inside URLs are flagged too.
+  for (const message of [`${person} subject`, `subject\n\n${person.toUpperCase()}`, `subject\n\n<${person}>.`,
+    `subject\n\n${at('noreply', 'anthropic.com.example.invalid')}`, `subject\n\n${at('x.noreply', 'anthropic.com')}`,
+    `subject\n\nmailto:${person}`, `subject\n\nhttps://a.example/u/${person}`, `subject\n\nhttps://a.example/@${person}`,
+    `subject\n\n${at('first.last+tag', 'mail.private.example.org')}`]) {
+    failures = privateCommitEmails(row(message));
+    assert.deepEqual(failures, [messageError], message);
+    redacted(failures, message);
+  }
+  // URL handle paths, person/@domain text, versions and noreply identities are not flagged.
+  for (const message of ['subject\n\nSee https://x.example/@person', 'subject\n\nperson/@domain and `/@`',
+    'subject\n\nBump pkg@1.2.3 and actions/checkout@v4.2.2', 'Thanks noreply@anthropic.com',
+    'subject\n\nCo-authored-by: Example <123+name@users.noreply.github.com>',
+    'subject\n\nCo-Authored-By: Synthetic Model <noreply@anthropic.com>\nMerged-by: noreply@github.com\n', '']) {
+    assert.deepEqual(privateCommitEmails(row(message)), [], message);
+  }
+  // A private trailer is part of the message, so it is reported by both checks.
+  const trailer = `Co-authored-by: Person <${person}>`;
+  failures = privateCommitEmails(row(`subject\n\n${trailer}\n`, trailer));
+  assert.deepEqual(failures, [trailerError, messageError]);
+  redacted(failures);
+  // 3. Tabs, \x1f and \x1e in the message do not break parsing; author and trailer checks still apply.
+  const odd = `subject\t\x1f\x1e\n\nbody\twith\x1fseparators\x1e and more\n`;
+  assert.deepEqual(privateCommitEmails(row(odd)), []);
+  assert.deepEqual(privateCommitEmails([row(odd), row(`${odd}${person}`)].join('\0')), [messageError]);
+  assert.deepEqual(privateCommitEmails(row(odd, '', at('person', 'users.noreply.github.com.example.invalid'))), [authorError]);
+  assert.deepEqual(privateCommitEmails(row(odd, trailer)), [trailerError]);
+  // A trailer value holding \x1e: the trailer check covers the part before it, the message check the rest.
+  assert.deepEqual(privateCommitEmails(row('subject', `Link: x\x1e${person}`)), [messageError]);
+  assert.deepEqual(privateCommitEmails(row('subject', `Signed-off-by: ${person}\x1ex`)), [trailerError]);
+  // Rows without a commit hash fail closed without echoing the log text.
+  for (const bad of [`${person}\tx\ty`, `${'c'.repeat(39)}\t${person}`, `${'C'.repeat(40)}\tx`, `${'c'.repeat(41)}\x1e${person}`]) {
+    failures = privateCommitEmails(bad);
+    assert.deepEqual(failures, ['commit log could not be parsed'], JSON.stringify(bad));
+    redacted(failures);
+  }
+  assert.deepEqual(privateCommitEmails(row('subject').replace(hash, 'd'.repeat(64))), []);
+});
+
 function pngChunk(type, payload = Buffer.alloc(0)) {
   const chunk = Buffer.alloc(12 + payload.length);
   chunk.writeUInt32BE(payload.length); chunk.write(type, 4); payload.copy(chunk, 8);

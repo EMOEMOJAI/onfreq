@@ -114,31 +114,60 @@ export function imagePrivacy(file, data) {
 
 /**
  * `git log -z` with COMMIT_EMAIL_FORMAT: hash, author email, committer email
- * and the message trailers, unfolded and separated by \x1f.
+ * and the message trailers, unfolded and separated by \x1f, then \x1e and the
+ * whole message. Git forbids NUL in messages, so -z keeps rows
+ * apart; a message (or trailer) may itself contain \x1e, so each row is split on
+ * its first \x1e only and everything after it is message text.
  */
-export const COMMIT_EMAIL_FORMAT = '--format=%H%x09%ae%x09%ce%x09%(trailers:only,unfold,separator=%x1f)';
+export const COMMIT_EMAIL_FORMAT = '--format=%H%x09%ae%x09%ce%x09%(trailers:only,unfold,separator=%x1f)%x1e%B';
+// `git log` arguments before the revisions: log.showSignature would add signature
+// lines that parse as commits, and --encoding=none stops i18n.logOutputEncoding
+// from re-encoding (and so breaking) the rows. --format placeholders are
+// still converted from a commit's encoding header to UTF-8: ASCII addresses
+// survive an ASCII-compatible encoding, and an ASCII-incompatible one (UTF-16)
+// garbles the author and committer too, so that commit fails closed.
+export const COMMIT_EMAIL_LOG = ['log', '-z', '--no-show-signature', '--encoding=none', COMMIT_EMAIL_FORMAT];
 
 // GitHub creates merge commits with noreply@github.com as the committer; it is
 // a public service identity, unlike a maintainer's private address.
 const noreply = /^(?:[^\s@]+@users\.noreply\.github\.com|noreply@github\.com)$/i;
 // Co-author trailers may also name a public service identity.
 const trailerNoreply = /^(?:[^\s@]+@users\.noreply\.github\.com|noreply@github\.com|noreply@anthropic\.com)$/i;
+const commitHash = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+// Only `/@` inside a scheme:// URL, a handle path such as
+// https://social.example/@person, is ignored.
+const urlHandles = (text) => text.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s<>()"',;\x1f]*/gi, (url) => url.replaceAll('/@', '/'));
+// An address-shaped token with an alphabetic top-level domain, so versions such
+// as pkg@1.2.3 or checkout@v4.2.2 are not addresses. Known limits: non-ASCII,
+// quoted or obfuscated addresses, dotless hosts, addresses in author or
+// committer names, and, in a crafted commit object, text after a NUL or text
+// hidden by shift sequences of a stateful encoding header such as ISO-2022-JP.
+const messageAddress = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/gi;
 
 export function privateCommitEmails(log) {
   return log.split('\0').filter(Boolean).flatMap((row) => {
-    const [hash = '', author, committer, ...rest] = row.split('\t');
+    const split = row.indexOf('\x1e');
+    const fields = split < 0 ? row : row.slice(0, split);
+    const message = split < 0 ? '' : row.slice(split + 1);
+    const [hash = '', author, committer, ...rest] = fields.split('\t');
+    // Never echo unparseable log text; it may hold the address being checked.
+    if (!commitHash.test(hash)) return ['commit log could not be parsed'];
     const errors = [];
     if (![author, committer].every((email) => noreply.test(email ?? ''))) {
       errors.push(`${hash.slice(0, 12)}: commit email must use GitHub noreply`);
     }
     // Any address in a trailer (Co-authored-by, Signed-off-by...) is published too.
-    // Only `/@` inside a scheme:// URL, a handle path such as
-    // https://social.example/@person, is ignored; an address elsewhere, including
-    // person/@domain outside a URL, is flagged.
-    const trailers = rest.join('\t').replace(/[a-z][a-z0-9+.-]*:\/\/[^\s<>()"',;\x1f]*/gi, (url) => url.replaceAll('/@', '/'));
+    // An address outside a URL handle path, including person/@domain, is flagged.
+    const trailers = urlHandles(rest.join('\t'));
     const emails = [...trailers.matchAll(/[^\s<>()"',;\x1f]+@[^\s<>()"',;\x1f]+/g)].map(([email]) => email);
     if (!emails.every((email) => trailerNoreply.test(email))) {
       errors.push(`${hash.slice(0, 12)}: commit trailer email must use a noreply address`);
+    }
+    // The whole message, subject and body, is published as well. Trailers are
+    // part of it, so a private trailer address is reported twice.
+    const addresses = [...urlHandles(message).matchAll(messageAddress)].map(([email]) => email);
+    if (!addresses.every((email) => trailerNoreply.test(email))) {
+      errors.push(`${hash.slice(0, 12)}: commit message email must use a noreply address`);
     }
     return errors;
   });
@@ -162,7 +191,7 @@ export function checkPrivacy() {
   if (git('rev-parse', '--is-shallow-repository').toString().trim() === 'true') {
     errors.push('Full reachable history is required; fetch with depth 0');
   } else {
-    errors.push(...privateCommitEmails(git('log', '-z', '--no-show-signature', COMMIT_EMAIL_FORMAT, 'HEAD').toString()));
+    errors.push(...privateCommitEmails(git(...COMMIT_EMAIL_LOG, 'HEAD').toString()));
   }
   return errors;
 }
@@ -225,8 +254,7 @@ export function checkRange(local, excludes) {
       }
     }
   }
-  // log.showSignature would add signature lines that parse as commits.
-  errors.push(...privateCommitEmails(git('log', '-z', '--no-show-signature', COMMIT_EMAIL_FORMAT, ...range).toString()));
+  errors.push(...privateCommitEmails(git(...COMMIT_EMAIL_LOG, ...range).toString()));
   return [...new Set(errors)];
 }
 

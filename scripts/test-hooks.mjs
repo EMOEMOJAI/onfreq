@@ -1175,6 +1175,52 @@ test('privacy checks reject private emails in commit trailers, allowing noreply 
   }
 });
 
+test('privacy checks reject private emails anywhere in commit messages, however encoded (NX-2a)', (t) => {
+  const f = fixture(t, { realRange: true });
+  const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+  const check = (...args) => spawnSync(process.execPath, ['scripts/check-privacy.mjs', ...args], { cwd: f.repo, env, encoding: 'utf8' });
+  // Assembled at runtime, so this file never contains a synthetic address.
+  const person = ['person', 'example.invalid'].join('@');
+  const leaked = /person|example\.invalid/;
+  const commit = (message, config = []) => {
+    f.git(...config, 'commit', '--quiet', '--no-verify', '--allow-empty', '-m', message);
+    return f.git('rev-parse', 'HEAD');
+  };
+  // Separator characters, URL handles and noreply identities in a message pass.
+  const clean = commit('synthetic\x1e\x1f\tsubject\n\nSee https://social.example/@person and pkg@1.2.3\x1e'
+    + '\n\nCo-Authored-By: Synthetic Model <noreply@anthropic.com>');
+  assert.equal(check().status, 0, check().stderr);
+  assert.equal(f.push([ref(clean)]).status, 0);
+  const head = commit(`synthetic\n\nContact ${person}\x1e\tfor access\x1f`);
+  for (const result of [check(), check('--range', head, zero, 'origin'), f.push([ref(head, 'refs/heads/main', clean)])]) {
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /^[0-9a-f]{12}: commit message email must use a noreply address$/m);
+    assert.doesNotMatch(result.stderr, /commit trailer email|commit email must use/);
+    assert.doesNotMatch(result.stderr + result.stdout, leaked);
+  }
+  // A log output encoding cannot hide the address; --encoding=none keeps rows parseable.
+  f.git('config', 'i18n.logOutputEncoding', 'UTF-16');
+  let base = head;
+  for (const config of [[], ['-c', 'i18n.commitEncoding=ISO-8859-1']]) {
+    const oid = commit(`synthetic encoded\n\nContact ${person}`, config);
+    assert.doesNotMatch(f.git('log', '-1', '--format=%B', oid), leaked);
+    for (const result of [check('--range', oid, base), f.push([ref(oid, 'refs/heads/main', base)])]) {
+      assert.equal(result.status, 1, config.join(' '));
+      assert.match(result.stderr, /^[0-9a-f]{12}: commit message email must use a noreply address$/m, config.join(' '));
+      assert.doesNotMatch(result.stderr + result.stdout, leaked);
+    }
+    base = oid;
+  }
+  // --format converts an ASCII-incompatible message encoding, headers included,
+  // to UTF-8, so the identities vanish and the commit still fails closed.
+  const utf16 = commit(`synthetic encoded\n\nContact ${person}`, ['-c', 'i18n.commitEncoding=UTF-16']);
+  for (const result of [check('--range', utf16, base), f.push([ref(utf16, 'refs/heads/main', base)])]) {
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /^[0-9a-f]{12}: commit (?:message )?email must use /m);
+    assert.doesNotMatch(result.stderr + result.stdout, leaked);
+  }
+});
+
 test('pre-push names commits whose message carries gitleaks:allow, however encoded (ROT-1)', (t) => {
   const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
   const f = fixture(t);
