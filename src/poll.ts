@@ -37,7 +37,7 @@ import {
   type ShortSessionHandoff,
 } from './short-session';
 import { channelIndex, mayHavePosted, nextBudget, syncRosterMessages, type RosterTarget } from './roster';
-import { DiscordRateLimitError, DiscordRateLimits } from './discord-rate-limit';
+import { DiscordRateLimitError, DiscordRateLimits, trackPosts } from './discord-rate-limit';
 import type {
   OfflineEvent, PendingOffline, OnlineAtc, PostedMessage, PostWindow, RosterMessage, RosterPostAttempt, StateMap,
   TrackedAtc,
@@ -755,18 +755,7 @@ export async function runPoll(
   // GCA gets the same requests either way; a POST (a member DM or staff copy)
   // is only noted, so short-session reminders skip this poll.
   let gcaAttempted = false;
-  const gcaLimits = new Proxy(limits, {
-    get(target, property) {
-      if (property === 'fetch') {
-        return (path: string, init?: RequestInit) => {
-          if (init?.method === 'POST') gcaAttempted = true;
-          return target.fetch(path, init ?? {});
-        };
-      }
-      const value: unknown = Reflect.get(target, property);
-      return typeof value === 'function' ? value.bind(target) : value;
-    },
-  });
+  const gcaLimits = trackPosts(limits, () => { gcaAttempted = true; });
   if (storage) {
     try {
       await sendGcaReminders(env, current, storage, Date.parse(nowIso), gcaPolicy, labels, gcaLimits,

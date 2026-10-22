@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { DiscordRateLimits, MAX_RATE_LIMIT_COOLDOWN_MS } from '../src/discord-rate-limit';
+import { DiscordRateLimitError, DiscordRateLimits, MAX_RATE_LIMIT_COOLDOWN_MS, trackPosts } from '../src/discord-rate-limit';
 import { postMessage } from '../src/discord';
 
 const START = 1_800_000_000_000;
@@ -297,4 +297,70 @@ it('a new 429 persists without an entry that expired in the meantime', async () 
     await expect(limits.fetch('/channels/b/messages', { method: 'POST' })).rejects.toMatchObject({ requestMade: true });
   });
   expect(await stored()).toEqual({ '/channels/b/messages': now + 30_000 });
+});
+
+// trackPosts (T3-2): the wrapper poll.ts hands to GCA reminders.
+function fakeTarget() {
+  const target = new DiscordRateLimits();
+  const order: string[] = [];
+  const fetch = vi.spyOn(target, 'fetch').mockImplementation(async () => { order.push('fetch'); return new Response('ok'); });
+  const onPost = vi.fn(() => { order.push('onPost'); });
+  return { target, fetch, onPost, order, tracked: trackPosts(target, onPost) };
+}
+
+it('trackPosts notes a POST before forwarding its path and init unchanged', async () => {
+  const { fetch, onPost, order, tracked } = fakeTarget();
+  const init: RequestInit = { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } };
+  await expect(tracked.fetch('/channels/a/messages', init)).resolves.toBeInstanceOf(Response);
+  expect(onPost).toHaveBeenCalledTimes(1);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(fetch.mock.calls[0]![0]).toBe('/channels/a/messages');
+  expect(fetch.mock.calls[0]![1]).toBe(init);
+  expect(order).toEqual(['onPost', 'fetch']);
+  // A POST that fails still counts.
+  fetch.mockRejectedValueOnce(new Error('synthetic failure'));
+  await expect(tracked.fetch('/channels/a/messages', { method: 'POST' })).rejects.toThrow('synthetic failure');
+  expect(onPost).toHaveBeenCalledTimes(2);
+});
+
+it('trackPosts ignores other methods and forwards {} when init is missing', async () => {
+  const { fetch, onPost, tracked } = fakeTarget();
+  const get: RequestInit = { method: 'GET' };
+  await tracked.fetch('/guilds/example/members?limit=1000&after=0', get);
+  await tracked.fetch('/users/@me/channels', {});
+  await (tracked.fetch as (path: string, init?: RequestInit) => Promise<Response>)('/channels/a/messages');
+  expect(onPost).not.toHaveBeenCalled();
+  expect(fetch.mock.calls).toEqual([['/guilds/example/members?limit=1000&after=0', get], ['/users/@me/channels', {}],
+    ['/channels/a/messages', {}]]);
+  expect(fetch.mock.calls[0]![1]).toBe(get);
+});
+
+it('trackPosts binds the other methods to the wrapped limits', async () => {
+  const network = vi.fn(async () => Response.json({ id: 'synthetic' }));
+  vi.stubGlobal('fetch', network);
+  const target = new DiscordRateLimits();
+  const onPost = vi.fn();
+  const tracked = trackPosts(target, onPost);
+  // The failure streak lives on the target, whichever side records it.
+  expect(tracked.notePostFailure()).toBe(false);
+  expect(target.notePostFailure()).toBe(true);
+  tracked.noteDiscordResponded();
+  expect(target.notePostFailure()).toBe(false);
+  // An outage marked through the wrapper blocks the real target without a network call,
+  // and a POST it defers still counts as attempted.
+  tracked.markOutage(5_000);
+  const outage = { reason: 'outage', requestMade: false, retryAt: START + 5_000 };
+  await expect(target.fetch('/channels/a/messages', { method: 'GET' })).rejects.toMatchObject(outage);
+  const deferred = tracked.fetch('/channels/a/messages', { method: 'POST' });
+  await expect(deferred).rejects.toBeInstanceOf(DiscordRateLimitError);
+  await expect(deferred).rejects.toMatchObject(outage);
+  expect(onPost).toHaveBeenCalledTimes(1);
+  expect(network).not.toHaveBeenCalled();
+  // Called through the wrapper, each method runs with the target itself as `this`.
+  for (const name of ['markOutage', 'notePostFailure', 'noteDiscordResponded'] as const) {
+    const method = vi.spyOn(target, name);
+    (tracked[name] as (ms: number) => unknown)(1);
+    expect(method.mock.contexts, name).toHaveLength(1);
+    expect(method.mock.contexts[0], name).toBe(target);
+  }
 });

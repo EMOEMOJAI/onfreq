@@ -185,3 +185,23 @@ export class DiscordRateLimits {
     return effective;
   }
 }
+
+/**
+ * The same limits, noting each POST (a DM or a staff copy) before it is sent,
+ * so a POST that then fails or is rate-limited still counts. Every other
+ * property acts on `limits` itself; a call without `init` forwards `{}`.
+ */
+export function trackPosts(limits: DiscordRateLimits, onPost: () => void): DiscordRateLimits {
+  return new Proxy(limits, {
+    get(target, property) {
+      if (property === 'fetch') {
+        return (path: string, init?: RequestInit) => {
+          if (init?.method === 'POST') onPost();
+          return target.fetch(path, init ?? {});
+        };
+      }
+      const value: unknown = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
