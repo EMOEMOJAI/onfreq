@@ -19,33 +19,35 @@ worker-configuration.d.ts
 !.envrc.example
 .envrc.example/
 
-# Key material and ad-hoc secret dumps
-*.pem
-*.key
-*.p12
-*.pfx
+# Key material and ad-hoc secret dumps. Bracket classes match these and the
+# other endings check:privacy treats case-insensitively in any case, even with
+# core.ignorecase off.
+*.[pP][eE][mM]
+*.[kK][eE][yY]
+*.[pP]12
+*.[pP][fF][xX]
 secrets.json
-*-secret
-*-secret.txt
+*-[sS][eE][cC][rR][eE][tT]
+*-[sS][eE][cC][rR][eE][tT].[tT][xX][tT]
 poll-secret
 poll-endpoint
 
 # Local, operator-specific helper scripts (may contain real IDs)
-*.local.sh
+*.[lL][oO][cC][aA][lL].[sS][hH]
 wrangler.local.*
 
 # npm registry credentials
 .npmrc
 
 # Local logs and privacy/secret scan reports can contain sensitive matches.
-*.log
+*.[lL][oO][gG]
 gitleaks-report.*
 
 # Private agent preferences, local tool permissions and other local-only
 # settings or notes, in any directory, as check:privacy rejects them.
-*.local.md
-*.local.json
-*.local.jsonc
+*.[lL][oO][cC][aA][lL].[mM][dD]
+*.[lL][oO][cC][aA][lL].[jJ][sS][oO][nN]
+*.[lL][oO][cC][aA][lL].[jJ][sS][oO][nN][cC]
 
 # Local audit notes and original image-generation downloads.
 .local/

@@ -5,14 +5,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import { isolatedEnv } from './check-setup.mjs';
 
 const hook = fileURLToPath(new URL('./hooks/pre-push', import.meta.url));
 const hooksDir = fileURLToPath(new URL('./hooks', import.meta.url));
 const preCommit = fileURLToPath(new URL('./hooks/pre-commit', import.meta.url));
 const zero = '0'.repeat(40);
-const hookHelpers = ['check-privacy.mjs', 'repo-files.mjs', 'secret-scan.sh', 'hooks/lib/gitleaks-settings.sh'];
+const hookHelpers = ['check-privacy.mjs', 'repo-files.mjs', 'secret-scan.sh', 'hooks/lib/gitleaks-settings.sh',
+  'hooks/lib/scan-stream.awk'];
 const hasGitleaks = spawnSync('gitleaks', ['version'], { stdio: 'ignore' }).status === 0;
 // Locally a missing Gitleaks skips the real-scan tests; in CI they run and fail.
 const gitleaksSkip = !hasGitleaks && !process.env.CI && 'gitleaks is not installed';
@@ -105,6 +106,12 @@ exit "$GITLEAKS_EXIT"
           '-c', `core.hooksPath=${hooksDir}`, 'commit', '--quiet', '-m', 'hooked commit'], options)
         : spawnSync('/bin/sh', [path], options);
       return { ...result, gitleaks: existsSync(env.GITLEAKS_LOG) ? readFileSync(env.GITLEAKS_LOG, 'utf8') : '' };
+    },
+    // Runs scripts/secret-scan.sh with `git log` arguments, as CI and pre-push do.
+    scan(args, extraEnv = {}) {
+      rmSync(env.GITLEAKS_LOG, { force: true });
+      return spawnSync('/bin/sh', ['scripts/secret-scan.sh', ...args],
+        { cwd: repo, env: { ...hookEnv, ...extraEnv }, encoding: 'utf8' });
     },
   };
 }
@@ -1489,18 +1496,55 @@ test('the repository Gitleaks rules pass JSON expressions, empty and fixture val
   });
 
 // RA: Gitleaks skips its whole input when the first chunk looks like a binary
-// or archive format, and reads in 100 KB chunks that it extends by at most
-// 25 KB to a blank line, so a line could be cut in two. The scans feed it a
-// preamble first and a blank line after every line.
+// or archive format, and reads in chunks that it extends by at most 25 KB to a
+// blank line, so a line could be cut in two. The scans feed it a preamble first
+// and, through scripts/hooks/lib/scan-stream.awk, a blank line after every line
+// outside private key and curl continuation runs (NX3-S1).
 const preamble = '# onfreq secret-scan preamble';
-function assertScanStream(stream, label) {
+const preambleStream = `${preamble}\n\n`.repeat(1200);
+// A model of scripts/hooks/lib/scan-stream.awk for ASCII input, after NUL bytes
+// become spaces; see that file.
+function scanFilter(text) {
+  assert.ok(text === '' || text.endsWith('\n'), 'input ends with a newline');
+  const startsKey = (upper) => {
+    const begin = upper.indexOf('-----BEGIN');
+    return begin >= 0 && upper.includes('PRIVATE KEY', begin) && !upper.includes('-----END');
+  };
+  const endsKey = (upper) => ['-----END', 'KEY-----', 'KEY BLOCK-----'].some((end) => upper.includes(end));
+  const continues = (line) => /\\\r?$/.test(line);
+  const out = [];
+  let run = false, key = false, bytes = 0;
+  const stop = () => { out.push(''); run = false; };
+  for (const line of text.replaceAll('\0', ' ').split('\n').slice(0, -1)) {
+    const upper = line.toUpperCase();
+    if (run && (line.length > 1024 || /^diff --git /.test(line) || /^commit [0-9a-f]+( |$)/.test(line) || startsKey(upper))) stop();
+    if (run) {
+      out.push(line);
+      bytes += line.length + 1;
+      if (key && endsKey(upper)) key = false;
+      if (bytes >= 16384 || (!key && !continues(line))) stop();
+    } else if (line.length <= 1024 && (startsKey(upper) || continues(line))) {
+      run = true;
+      key = startsKey(upper);
+      bytes = line.length + 1;
+      out.push(line);
+    } else {
+      out.push(line, '');
+    }
+  }
+  if (run) out.push('');
+  return out.map((line) => `${line}\n`).join('');
+}
+// `input` is the stream the scans' Git and sed stages produce; Gitleaks must
+// read exactly the preamble and the model's output for it.
+function assertScanStream(stream, label, input) {
   // Past the furthest bytes a file-type signature uses (ISO 9660's, 32 769-32 773).
   const content = stream.search(new RegExp(`^(?!${preamble}$).+$`, 'm'));
   assert.ok(content >= 33000, `${label}: content starts at ${content}`);
-  assert.ok(stream.split('\n').every((line, index) => index % 2 === 0 || line === ''), `${label}: lines without a blank line`);
+  assert.ok(stream === preambleStream + scanFilter(input), `${label}: stream differs from the filter model`);
 }
 
-test('both scans feed Gitleaks a preamble and a blank line after every line (RA)', (t) => {
+test('both scans feed Gitleaks a preamble and a blank line after every line outside runs (RA)', (t) => {
   const f = fixture(t);
   const saved = join(f.repo, '..', 'stream.txt');
   writeFileSync(join(f.repo, 'public.txt'), 'staged\nsecond line\n');
@@ -1508,7 +1552,7 @@ test('both scans feed Gitleaks a preamble and a blank line after every line (RA)
   let result = f.commitHook({ extraEnv: { GITLEAKS_STDIN: saved } });
   assert.equal(result.status, 0, result.stderr);
   let stream = readFileSync(saved, 'utf8');
-  assertScanStream(stream, 'pre-commit');
+  assertScanStream(stream, 'pre-commit', stagedStream(f));
   assert.match(stream, /^\+staged\n\n\+second line\n\n/m);
   rmSync(saved);
   f.git('commit', '--quiet', '--no-verify', '-m', 'staged');
@@ -1516,7 +1560,8 @@ test('both scans feed Gitleaks a preamble and a blank line after every line (RA)
   result = f.push([ref(head)], undefined, { GITLEAKS_STDIN: saved });
   assert.equal(result.status, 0, result.stderr);
   stream = readFileSync(saved, 'utf8');
-  assertScanStream(stream, 'secret-scan');
+  // The pushed range is all of HEAD's history, including the scripts' continuation lines.
+  assertScanStream(stream, 'secret-scan', filteredOutput(f, [...scanLogArgs, 'HEAD', '--']));
   assert.match(stream, new RegExp(`^commit ${head}\n\n`, 'm'));
   assert.match(stream, /^\+staged\n\n\+second line\n\n/m);
 });
@@ -1530,9 +1575,9 @@ function filteredOutput(f, args) {
   return result.stdout.split('\n').filter((line) => !line.startsWith('-'))
     .map((line) => line.replace(/^(@@ -[0-9][0-9,]* \+[0-9][0-9,]* @@).*/, '$1')).join('\n');
 }
-const headStream = (f) => filteredOutput(f, ['log', '--pretty=medium', '--encoding=none', '-p', '-U0',
-  '--inter-hunk-context=0', '--root', '--no-ext-diff', '--no-textconv', '--text', '--no-color', '--diff-merges=separate',
-  '-1', 'HEAD', '--']);
+const scanLogArgs = ['log', '--pretty=medium', '--encoding=none', '-p', '-U0', '--inter-hunk-context=0', '--root',
+  '--no-ext-diff', '--no-textconv', '--text', '--no-color', '--diff-merges=separate'];
+const headStream = (f) => filteredOutput(f, [...scanLogArgs, '-1', 'HEAD', '--']);
 const stagedStream = (f) => filteredOutput(f, ['diff', '--cached', '-U0', '--inter-hunk-context=0', '--no-ext-diff',
   '--no-textconv', '--no-color', '--text']);
 // Calls write(pad), adjusting the pad until `marker` starts at `offset` in
@@ -1612,7 +1657,7 @@ test('a secret line across a Gitleaks chunk boundary is still found (RA)',
     }
   });
 
-test('a private key block is still flagged with blank lines between its lines (RA)',
+test('a private key block is flagged as one run without blank lines between its lines (RA, NX3-S1)',
   { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     commitRules(f, repoRules());
@@ -1666,4 +1711,259 @@ test('privacy checks fail closed without echoing Git output when the history can
   assert.equal(result.status, 1);
   assert.equal(result.stdout, 'Privacy checks: FAILED (indexed files and HEAD history)\n');
   assert.equal(result.stderr, 'commit log could not be parsed\n');
+});
+
+// NX3-S1 (F1): Gitleaks ends each chunk at the first blank line after a read,
+// and reads from a pipe often return a few KiB, so with a blank line after every
+// line a multi-line private key was split between chunks and missed at some
+// offsets. Keys are generated at test time and never stored.
+let generatedKey;
+const privateKeyPem = () => (generatedKey ??= generateKeyPairSync('rsa', { modulusLength: 4096,
+  publicKeyEncoding: { type: 'spki', format: 'pem' }, privateKeyEncoding: { type: 'pkcs8', format: 'pem' } }).privateKey);
+// `x<n>` lines of at least `bytes` bytes in total.
+function fillerLines(bytes) {
+  const lines = [];
+  for (let size = 0; size < bytes; size += lines.at(-1).length + 1) lines.push(`x${lines.length}`);
+  return `${lines.join('\n')}\n`;
+}
+// Offsets where v2.2.5 missed the key, as its chunks ended inside it, then
+// 256-byte steps over 4 KiB past 100 KB.
+const keyOffsets = [18838, 26757, 42595, 50514, 58433, 66352, 121785, 185137, 296003,
+  ...Array.from({ length: 16 }, (_, index) => 100000 + 256 * index)];
+
+test('a 4096-bit private key after filler is flagged at every offset, as CI and pre-push scan it (NX3-S1 F1)',
+  { skip: gitleaksSkip }, (t) => {
+    const key = privateKeyPem();
+    const body = key.split('\n')[1];
+    const missed = [];
+    for (const offset of keyOffsets) {
+      const f = fixture(t, { gitleaks: 'real' });
+      commitRules(f, repoRules());
+      writeFileSync(join(f.repo, 'filler.txt'), fillerLines(offset) + key);
+      f.git('add', 'filler.txt');
+      f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic filler');
+      const result = secretScan(f, 'HEAD');
+      if (result.status !== 1) missed.push(`${offset} (status ${result.status})`);
+      assert.ok(!(result.stderr + result.stdout).includes(body), `${offset}: redacted`);
+    }
+    assert.deepEqual(missed, [], `missed at ${missed.join(', ')}`);
+  });
+
+test('a staged 4096-bit private key after filler blocks the commit at several offsets (NX3-S1 F1)',
+  { skip: gitleaksSkip }, (t) => {
+    const key = privateKeyPem();
+    const missed = [];
+    for (const offset of [18838, 121785, 185137, 296003]) {
+      const f = fixture(t, { gitleaks: 'real' });
+      commitRules(f, repoRules());
+      writeFileSync(join(f.repo, 'filler.txt'), fillerLines(offset) + key);
+      f.git('add', 'filler.txt');
+      const result = f.commitHook();
+      if (result.status !== 1) missed.push(`${offset} (status ${result.status})`);
+      assert.ok(!(result.stderr + result.stdout).includes(key.split('\n')[1]), `${offset}: redacted`);
+    }
+    assert.deepEqual(missed, [], `missed at ${missed.join(', ')}`);
+  });
+
+// Synthetic key material for the stream-shape checks, assembled at runtime.
+const keyKind = ['RSA', 'PRIVATE', 'KEY'].join(' ');
+const syntheticKeyLines = (count) => Array.from({ length: count }, () => randomBytes(48).toString('base64'));
+
+test('both scans keep a private key block together and add blank lines everywhere else (NX3-S1 F1)', (t) => {
+  const f = fixture(t);
+  const saved = join(f.repo, '..', 'stream.txt');
+  const body = syntheticKeyLines(20);
+  const block = [`-----BEGIN ${keyKind}-----`, ...body, `-----END ${keyKind}-----`];
+  const unterminated = [`-----BEGIN ${keyKind}-----`, ...Array.from({ length: 300 }, (_, index) => `u${index}`.padEnd(100, 'u'))];
+  writeFileSync(join(f.repo, 'shape.txt'), [
+    'before', ...block, 'between',
+    `-----BEGIN ${keyKind}-----${body[0]}-----END ${keyKind}-----`,
+    'after one-line key', ...unterminated, 'last',
+  ].join('\n') + '\n');
+  writeFileSync(join(f.repo, 'crlf.txt'), `${block.join('\r\n')}\r\nafter\r\n`);
+  f.git('add', 'shape.txt', 'crlf.txt');
+  const plus = (lines, eol = '\n') => lines.map((line) => `+${line}${eol}`).join('');
+  const check = (stream, label) => {
+    // No blank line inside the key; one after its END line.
+    assert.ok(stream.includes(`+before\n\n${plus(block)}\n+between\n\n`), `${label}: LF key run`);
+    assert.ok(stream.includes(`${plus(block, '\r\n')}\n+after\r\n\n`), `${label}: CRLF key run`);
+    // BEGIN and END on one line start no run.
+    assert.ok(/-----\n\n\+after one-line key\n\n/.test(stream), `${label}: one-line key`);
+    // A BEGIN without END regains blank lines once its run holds 16 384 bytes.
+    const start = stream.indexOf(`+${unterminated[0]}\n+${unterminated[1]}\n`);
+    const end = stream.indexOf('\n\n', start) + 1;
+    assert.ok(end - start >= 16384 && end - start < 17500, `${label}: unterminated run of ${end - start} bytes`);
+    assert.ok(/^(?:\+u\d+u+\n\n)+\+last\n\n/.test(stream.slice(end + 1)), `${label}: blank lines after the run`);
+  };
+  let result = f.commitHook({ extraEnv: { GITLEAKS_STDIN: saved } });
+  assert.equal(result.status, 0, result.stderr);
+  let stream = readFileSync(saved, 'utf8');
+  assertScanStream(stream, 'pre-commit', stagedStream(f));
+  check(stream, 'pre-commit');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic shapes');
+  result = f.scan(['-1', 'HEAD'], { GITLEAKS_STDIN: saved });
+  assert.equal(result.status, 0, result.stderr);
+  stream = readFileSync(saved, 'utf8');
+  assertScanStream(stream, 'secret-scan', headStream(f));
+  check(stream, 'secret-scan');
+});
+
+test('runs end before a long line, a diff or commit line, and a new key, and stay below 17 500 bytes (NX3-S1 c3)', (t) => {
+  const f = fixture(t);
+  const saved = join(f.repo, '..', 'stream.txt');
+  const long = (char) => char.repeat(24000);
+  // Adversarial input: 24 000-byte lines, keys without END and long continued commands.
+  writeFileSync(join(f.repo, 'a.txt'), [
+    long('a'), `-----BEGIN ${keyKind}-----`, 'k1', long('b'), 'plain',
+    `-----BEGIN ${keyKind}-----`, ...Array.from({ length: 40 }, () => 'm'.repeat(1000)),
+    `-----BEGIN ${keyKind}-----`, 'n'.repeat(1000), `-----BEGIN ${keyKind}-----`, 'second key', `-----END ${keyKind}-----`,
+    ...Array.from({ length: 100 }, () => `curl ${'c'.repeat(400)} \\`), 'final', long('d'),
+    `-----BEGIN ${keyKind}-----`,
+  ].join('\n') + '\n');
+  writeFileSync(join(f.repo, 'b.txt'), 'next file\n');
+  f.git('add', 'a.txt', 'b.txt');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic runs');
+  writeFileSync(join(f.repo, 'c.txt'), `next commit\n-----BEGIN ${keyKind}-----\n`);
+  f.git('add', 'c.txt');
+  f.git('commit', '--quiet', '--no-verify', '-m', 'next');
+  const checkStretches = (stream, label) => {
+    const content = stream.slice(preambleStream.length);
+    let todayMax = 0;
+    for (const line of content.split('\n')) todayMax = Math.max(todayMax, line.length + 1);
+    let multiMax = 0, singleMax = 0;
+    for (const stretch of content.split('\n\n')) {
+      if (stretch.includes('\n')) multiMax = Math.max(multiMax, stretch.length + 1);
+      else singleMax = Math.max(singleMax, stretch.length + 1);
+    }
+    assert.equal(singleMax, todayMax, `${label}: single lines`);
+    assert.ok(multiMax >= 16384 && multiMax <= 17500, `${label}: runs reach ${multiMax} bytes`);
+    // A run ends before a long line, a new key's BEGIN line, a diff line and a commit line.
+    assert.ok(content.includes(`+k1\n\n+${long('b')}\n\n`), `${label}: long line`);
+    assert.ok(content.includes(`-----\n+${'n'.repeat(1000)}\n\n+-----BEGIN ${keyKind}-----\n+second key\n+-----END ${keyKind}-----\n\n`),
+      `${label}: new key`);
+    assert.ok(/\n\+-----BEGIN [^\n]*-----\n\ndiff --git a\/b\.txt b\/b\.txt\n\n/.test(content), `${label}: diff line`);
+  };
+  f.git('reset', '--quiet', '--soft', 'HEAD~2');
+  let result = f.commitHook({ extraEnv: { GITLEAKS_STDIN: saved } });
+  assert.equal(result.status, 0, result.stderr);
+  let stream = readFileSync(saved, 'utf8');
+  assertScanStream(stream, 'pre-commit', stagedStream(f));
+  checkStretches(stream, 'pre-commit');
+  f.git('reset', '--quiet', '--soft', 'ORIG_HEAD');
+  result = f.scan(['-2', 'HEAD'], { GITLEAKS_STDIN: saved });
+  assert.equal(result.status, 0, result.stderr);
+  stream = readFileSync(saved, 'utf8');
+  assertScanStream(stream, 'secret-scan', filteredOutput(f, [...scanLogArgs, '-2', 'HEAD', '--']));
+  checkStretches(stream, 'secret-scan');
+  // Git prints an empty line before the next commit line; the run ends at the commit line.
+  assert.ok(/\n\+-----BEGIN [^\n]*-----\n\n\ncommit [0-9a-f]{40}\n\n/.test(stream), 'commit line');
+});
+
+test('a curl authorization header after a line continuation and a CRLF private key are flagged (NX3-S1 F2)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const token = randomBytes(16).toString('hex');
+    for (const eol of ['\n', '\r\n']) {
+      const text = ['# synthetic', 'curl https://api.example.test/v1/items \\', `  --header "Authorization: Bearer ${token}"`, '# end', '']
+        .join(eol);
+      const { hook, scan } = scanAssignment(f, text);
+      for (const result of [...hook, scan]) {
+        assert.equal(result.status, 1, `${JSON.stringify(eol)}: ${result.stderr}`);
+        assert.ok(!(result.stderr + result.stdout).includes(token), JSON.stringify(eol));
+      }
+    }
+    const key = privateKeyPem();
+    const { hook, scan } = scanAssignment(f, `${fillerLines(20000)}${key}`.replaceAll('\n', '\r\n'));
+    for (const result of [...hook, scan]) {
+      assert.equal(result.status, 1, `CRLF key: ${result.stderr}`);
+      assert.ok(!(result.stderr + result.stdout).includes(key.split('\n')[1]), 'CRLF key');
+    }
+  });
+
+// F2: a curl command continued over several KB was split between chunks like
+// a key, in LF and CRLF files; v2.2.5 missed it at most of these offsets. (Go's
+// `.` matches CR, so a short CRLF continuation in one chunk already matched.)
+test('a curl command continued over long lines is flagged at every offset, in LF and CRLF files (NX3-S1 F2)',
+  { skip: gitleaksSkip }, (t) => {
+    const token = randomBytes(16).toString('hex');
+    const missed = [];
+    for (const eol of ['\n', '\r\n']) {
+      const command = ['curl https://api.example.test/v1/items \\',
+        ...Array.from({ length: 4 }, (_, index) => `  --data-urlencode "q${index}=${'v'.repeat(900)}" \\`),
+        `  --header "Authorization: Bearer ${token}"`, ''].join('\n');
+      for (const offset of keyOffsets.slice(0, 9)) {
+        const f = fixture(t, { gitleaks: 'real' });
+        writeFileSync(join(f.repo, 'filler.txt'), (fillerLines(offset) + command).replaceAll('\n', eol));
+        f.git('add', 'filler.txt');
+        f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic filler');
+        const result = secretScan(f, 'HEAD');
+        if (result.status !== 1) missed.push(`${JSON.stringify(eol)} ${offset} (status ${result.status})`);
+        assert.ok(!(result.stderr + result.stdout).includes(token), `${offset}: redacted`);
+      }
+    }
+    assert.deepEqual(missed, [], `missed at ${missed.join(', ')}`);
+  });
+
+test('a secret after a NUL byte, on its line or the next, is flagged through both scans (NX3-S1 F4)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const token = syntheticKey();
+    for (const text of [`binary\0 aws_access_key_id = ${token}\n`, `binary\0data\naws_access_key_id = ${token}\n`]) {
+      const { hook, scan } = scanAssignment(f, text);
+      for (const result of [...hook, scan]) {
+        assert.equal(result.status, 1, `${JSON.stringify(text)}: ${result.stderr}`);
+        assert.doesNotMatch(result.stderr + result.stdout, new RegExp(token.slice(4)));
+      }
+    }
+  });
+
+test('a real-shaped Discord ID near the end of a 22 000-byte ID list is flagged, as before (NX3-S1 c2)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const ids = Array.from({ length: 1160 }, (_, index) => String(900000000000000001n + BigInt(index)));
+    ids.splice(-3, 0, realShaped);
+    const line = assignment('DISCORD_CHANNEL_IDS', ids.join(','));
+    assert.ok(line.length > 22000 && line.length < 22100, String(line.length));
+    const { hook, scan } = scanAssignment(f, `# synthetic\n${line}# end\n`);
+    for (const result of [...hook, scan]) {
+      assert.equal(result.status, 1, result.stderr);
+      assert.doesNotMatch(result.stderr + result.stdout, new RegExp(realShaped));
+    }
+  });
+
+test('both scans run the shared stream filter after NUL replacement, each stage with a failure marker (NX3-S1)', (t) => {
+  for (const file of ['./secret-scan.sh', './hooks/pre-commit']) {
+    const source = readFileSync(new URL(file, import.meta.url), 'utf8');
+    assert.match(source, /^filter=(?:\$\(dirname -- "\$0"\)\/|scripts\/)hooks\/lib\/scan-stream\.awk$/m, file);
+    assert.match(source, /^ +\{ LC_ALL=C sed -e '\/\^-\/d' -e '[^']*' \|\| : >"\$tmp\/failed"; \} \|\n +\{ LC_ALL=C tr '\\000' ' ' \|\| : >"\$tmp\/failed"; \} \|\n +\{ LC_ALL=C awk -f "\$filter" \|\| : >"\$tmp\/failed"; \} \|\n +gitleaks stdin /m, file);
+    assert.doesNotMatch(source, / -e G\b/, file);
+  }
+  const f = fixture(t);
+  writeFileSync(join(f.repo, 'public.txt'), 'staged\n');
+  f.git('add', 'public.txt');
+  const bin = join(f.repo, '..', 'bin');
+  const realAwk = spawnSync('/bin/sh', ['-c', 'command -v awk'], { encoding: 'utf8' }).stdout.trim();
+  for (const [name, wrapper] of [
+    ['awk', `#!/bin/sh\nif [ "$1" = -f ]; then cat >/dev/null; exit 2; fi\nexec "${realAwk}" "$@"\n`],
+    ['tr', '#!/bin/sh\ncat >/dev/null\nexit 1\n'],
+  ]) {
+    writeFileSync(join(bin, name), wrapper, { mode: 0o700 });
+    let result = f.scan(['HEAD']);
+    assert.equal(result.status, 2, `${name}: ${result.stderr}`);
+    assert.match(result.stderr, /secret-scan: could not read the commits to scan/, name);
+    result = f.commitHook();
+    assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+    assert.match(result.stderr, /pre-commit: BLOCKED — could not read the staged changes for the secret scan\./, name);
+    rmSync(join(bin, name));
+  }
+  rmSync(join(f.repo, 'scripts', 'hooks', 'lib', 'scan-stream.awk'));
+  let result = f.scan(['HEAD']);
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /^secret-scan: missing the stream filter scripts\/hooks\/lib\/scan-stream\.awk\.$/m);
+  result = f.commitHook();
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /^pre-commit: BLOCKED — missing the stream filter scripts\/hooks\/lib\/scan-stream\.awk\.$/m);
+  assert.equal(result.gitleaks, '');
 });

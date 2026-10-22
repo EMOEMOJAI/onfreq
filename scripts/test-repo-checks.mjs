@@ -28,7 +28,7 @@ test('rejects private paths independently of gitignore, allowing public template
   }
 });
 
-test('.gitignore ignores the config/ and local-settings paths exactly as privatePath treats them', (t) => {
+test('.gitignore ignores the config/, local-settings and key paths exactly as privatePath treats them, in any case', (t) => {
   const repo = realpathSync(mkdtempSync(join(tmpdir(), 'onfreq-ignore-')));
   t.after(() => rmSync(repo, { recursive: true, force: true }));
   const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
@@ -41,9 +41,21 @@ test('.gitignore ignores the config/ and local-settings paths exactly as private
     ['.envrc.example/x', true], ['CLAUDE.local.md', true], ['notes.local.md', true], ['nested/x.local.md', true],
     ['settings.local.json', true], ['.claude/settings.local.json', true], ['nested/settings.local.json', true],
     ['x.local.json', true], ['x.local.jsonc', true], ['nested/x.local.jsonc', true],
-    ['x.local.json.bak', false], ['local.json', false], ['x.local.txt', false]]) {
-    const status = spawnSync('git', ['check-ignore', '--no-index', '-q', file], { cwd: repo, env }).status;
-    assert.equal(status, ignored ? 0 : 1, file);
+    ['x.local.json.bak', false], ['local.json', false], ['x.local.txt', false],
+    // privatePath matches these endings in any case (NX3-S1 F12).
+    ['KEY.PEM', true], ['nested/Cert.Pem', true], ['id.KEY', true], ['store.P12', true], ['store.PfX', true],
+    ['TRACE.LOG', true], ['nested/run.Log', true], ['set.LOCAL.SH', true], ['set.Local.Sh', true],
+    ['NOTES.LOCAL.MD', true], ['settings.Local.Json', true], ['x.LOCAL.JSONC', true], ['db-SECRET', true],
+    ['nested/db-Secret.TXT', true], ['POLL-SECRET', true],
+    ['x.pem.bak', false], ['x.PEMS', false], ['xpem', false], ['x.keys', false], ['x.KEY.txt', false],
+    ['x.p12x', false], ['x.P13', false], ['trace.LOGS', false], ['x.LOCAL.SHX', false], ['x.LOCAL.TXT', false],
+    ['LOCAL.MD', false], ['x.local.MDX', false], ['xSECRET', false], ['x-SECRETS', false], ['x-Secret.md', false],
+    ['x-secret.TXT.bak', false]]) {
+    for (const ignorecase of ['false', 'true']) {
+      const status = spawnSync('git', ['-c', `core.ignorecase=${ignorecase}`, 'check-ignore', '--no-index', '-q', file],
+        { cwd: repo, env }).status;
+      assert.equal(status, ignored ? 0 : 1, `${file} (core.ignorecase=${ignorecase})`);
+    }
     assert.equal(privatePath(file), ignored, file);
   }
 });

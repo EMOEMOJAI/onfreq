@@ -38,14 +38,23 @@ trap 'exit 1' HUP INT TERM
 # hunks and adding existing lines back as context, and GIT_DIFF_OPTS is unset
 # because it would override -U0 in the same way. A failed Git or filter stage
 # leaves a marker, so unreadable staged changes block the commit. As there, a
-# 36 000-byte preamble and a blank line after every line keep Gitleaks from
-# skipping the input as a binary file or cutting a line between chunks.
+# 36 000-byte preamble keeps Gitleaks from skipping the input as a binary file,
+# and NUL bytes become spaces before the shared filter
+# scripts/hooks/lib/scan-stream.awk adds the blank lines that keep a line, a
+# private key or a continued curl command from being cut between chunks.
 unset GIT_DIFF_OPTS
+filter=scripts/hooks/lib/scan-stream.awk
+if [ ! -r "$filter" ]; then
+  printf 'pre-commit: BLOCKED — missing the stream filter %s.\n' "$filter" >&2
+  exit 1
+fi
 preamble() { LC_ALL=C awk 'BEGIN { for (i = 0; i < 1200; i++) print "# onfreq secret-scan preamble" }' </dev/null; }
 status=0
 output=$({ { preamble && git diff --cached -U0 --inter-hunk-context=0 --no-ext-diff --no-textconv --no-color --text </dev/null; } ||
     : >"$tmp/failed"; } |
-  { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' -e G || : >"$tmp/failed"; } |
+  { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
+  { LC_ALL=C tr '\000' ' ' || : >"$tmp/failed"; } |
+  { LC_ALL=C awk -f "$filter" || : >"$tmp/failed"; } |
   gitleaks stdin --no-banner --redact 2>&1) || status=$?
 if [ -e "$tmp/failed" ] || [ "$status" != 0 ]; then printf '\n%s\n' "$output" >&2; fi
 # A Gitleaks that exits before reading all its input, for example on a bad

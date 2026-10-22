@@ -19,21 +19,24 @@
 # Git refuses NUL in messages, so the stored bytes are ASCII-compatible for the
 # scanner. Gitleaks redacts findings.
 #
-# Gitleaks reads its input in 100 KB chunks, extending each by at most 25 KB to
-# a blank line, and skips the whole input when the first chunk looks like a
-# binary or archive file. A fixed plain preamble of 36 000 bytes that matches no
-# rule comes first, so no file-type signature (the furthest, ISO 9660's, ends
-# at byte 32 773) can fall on commit content, and sed adds a blank line after
-# every line, so each chunk ends at the end of a line. scripts/hooks/pre-commit
-# does the same. Known limits: a line longer than about 25 KB can still be cut,
-# and a multi-line secret such as a private key can be split between chunks.
+# Gitleaks reads its input in chunks of up to 100 KB, extending each by at most
+# 25 KB to a blank line, and skips the whole input when the first chunk looks
+# like a binary or archive file. A fixed plain preamble of 36 000 bytes that
+# matches no rule comes first, so no file-type signature (the furthest, ISO
+# 9660's, ends at byte 32 773) can fall on commit content. NUL bytes become
+# spaces, and the shared filter scripts/hooks/lib/scan-stream.awk adds a blank
+# line after every line except inside a multi-line private key or a curl
+# command continued with backslashes, so each chunk ends at the end of a line
+# and such runs stay in one chunk. scripts/hooks/pre-commit runs the same
+# stages; the filter lists the known limits, such as lines longer than about
+# 25 KB.
 #
 # Exit status: 0 clean; 1 Gitleaks found a secret or failed; 2 the commits
-# could not be read. POSIX sh has no pipefail, so a failed Git or filter stage
-# leaves a marker file instead. A Gitleaks that exits before reading all its
-# input, for example on a bad configuration, can make those stages fail on the
-# closed pipe, so when both fail the message names both causes; the status is
-# still 2.
+# could not be read. POSIX sh has no pipefail, so each failed Git or filter
+# stage leaves a marker file instead. A Gitleaks that exits before reading all
+# its input, for example on a bad configuration, can make those stages fail on
+# the closed pipe, so when both fail the message names both causes; the status
+# is still 2.
 set -eu
 # The GITLEAKS_CONFIG* variables would replace the repository's Gitleaks rules,
 # for example with an empty rule set; the scan uses only the reviewed
@@ -51,13 +54,20 @@ if ! tmp=$(mktemp -d); then
 fi
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 2' HUP INT TERM
+filter=$(dirname -- "$0")/hooks/lib/scan-stream.awk
+if [ ! -r "$filter" ]; then
+  printf 'secret-scan: missing the stream filter %s.\n' "$filter" >&2
+  exit 2
+fi
 
 preamble() { LC_ALL=C awk 'BEGIN { for (i = 0; i < 1200; i++) print "# onfreq secret-scan preamble" }' </dev/null; }
 status=0
 { { preamble &&
     git log --pretty=medium --encoding=none -p -U0 --inter-hunk-context=0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null; } ||
     : >"$tmp/failed"; } |
-  { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' -e G || : >"$tmp/failed"; } |
+  { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
+  { LC_ALL=C tr '\000' ' ' || : >"$tmp/failed"; } |
+  { LC_ALL=C awk -f "$filter" || : >"$tmp/failed"; } |
   gitleaks stdin --redact --no-banner || status=$?
 if [ -e "$tmp/failed" ]; then
   if [ "$status" != 0 ]; then
