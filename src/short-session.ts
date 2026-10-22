@@ -228,8 +228,13 @@ export async function recordShortSessions(storage: DurableObjectStorage, poll: S
     mass = fresh > MAX_NEW_ONLINE_PER_POLL || (present.size >= 4 && fresh > present.size / 2);
     for (const id of present) {
       if (continues(id)) {
+        // The highest id seen keeps matching while any of the member's
+        // connections stays up; a lower surviving connection that returns
+        // after a long gap starts a new presence (accepted: storing only the
+        // ids present now would split a connection the feed dropped once).
+        const stored = rows.get(id)!.session_id;
         sql.exec(`UPDATE ${ONLINE} SET missing_since = NULL, session_id = ? WHERE user_id = ?`,
-          newest(id) ?? rows.get(id)!.session_id, id);
+          Math.max(stored ?? 0, newest(id) ?? 0) || null, id);
       } else {
         sql.exec(`INSERT OR REPLACE INTO ${ONLINE} (user_id, online_since, missing_since, session_id)
           VALUES (?, ?, NULL, ?)`, id, baseline || mass ? null : previous!, newest(id));

@@ -664,28 +664,24 @@ describe('short-session reminders: presence regressions send nothing', () => {
     expect(await rows()).toMatchObject([{ session_key: `${VID}:${ms(75)}`, status: 'sent', duration_minutes: 11 }]);
   });
 
-  it('NX-1a: a continuing member stores the newest session id present in this poll, even a lower one', async () => {
+  it('NX-1a: stores the newest session id seen in the record, never a lower one later', async () => {
     await at(0, []);
     await at(1, [twr(5), app(9)]);
+    await at(2, [twr(3)]);
     expect(await sql(`SELECT user_id, session_id FROM ${ONLINE}`)).toEqual([{ user_id: VID, session_id: 9 }]);
-    await at(2, [twr(5)]);
-    expect(await sql(`SELECT user_id, session_id FROM ${ONLINE}`)).toEqual([{ user_id: VID, session_id: 5 }]);
-    // Nothing valid now: the stored id stays.
-    await at(3, [twr(0)]);
-    expect(await sql(`SELECT user_id, session_id FROM ${ONLINE}`)).toEqual([{ user_id: VID, session_id: 5 }]);
   });
 
-  it('NX-1a: after the higher session ends, the surviving session id still matches a return after a long gap', async () => {
+  it('NX-1a: a connection the feed dropped once still matches when it returns alone after a long gap', async () => {
     const other = entry('QCZZ_APP', 600002, 119.1, 7);
     await at(0, [other]);
     await at(1, [twr(5), app(9), other]);
-    await at(30, [twr(5), app(9), other]);
-    await at(31, [twr(5), other]);
-    await during(32, 46, 2, [other]);
-    await at(47, [twr(5), other]);
-    await at(62, [other]);
-    await at(63, [other]);
-    await at(80, [other]);
+    await at(60, [twr(5), app(9), other]);
+    await at(61, [twr(5), other]);
+    await during(62, 76, 2, [other]);
+    await at(77, [app(9), other]);
+    await at(87, [other]);
+    await at(88, [other]);
+    await at(100, [other]);
     await expectNothing();
   });
 
