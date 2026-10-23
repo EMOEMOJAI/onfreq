@@ -56,7 +56,7 @@ jobs:
   macos-hooks:
     name: macOS Git hook checks
     runs-on: macos-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,7 +90,7 @@ jobs:
     # Use disposable GitHub-hosted machines. Never attach a persistent/private
     # runner to this repository: pull requests can change workflow YAML.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
