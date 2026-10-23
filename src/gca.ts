@@ -1,5 +1,5 @@
 import { EMBED_FOOTER, firOf, type FirLabel } from './config';
-import { escapeMarkdown, isSnowflake, type DiscordEmbed } from './discord';
+import { escapeMarkdown, isSnowflake, parseChannelIds, type DiscordEmbed } from './discord';
 import { DiscordRateLimitError, DiscordRateLimits, type DiscordRateLimitReason } from './discord-rate-limit';
 import { ResponseTooLargeError } from './http';
 import { hasFrequency } from './ivao';
@@ -750,7 +750,8 @@ async function recordDeliveryFailure(
   }));
   // Only a genuinely global limit should widen the shared backoff: one
   // recipient's DM-channel cooldown must not block unrelated members'
-  // reminders.
+  // reminders. That cooldown stays per DM channel, persisted under a keyed
+  // hash of the channel id rather than the id itself.
   if (outcome.rateLimited && (err as DiscordRateLimitError).global) {
     await storage.put(BACKOFF_KEY, outcome.retryAt);
   }
@@ -881,7 +882,8 @@ export async function sendGcaReminders(
   deadline = Date.now() + DM_BUDGET_MS, memberCache?: MemberListCache,
 ): Promise<void> {
   if (env.GCA_DM_ENABLED !== 'true') return;
-  const limits = rateLimits ?? await DiscordRateLimits.load(storage);
+  const limits = rateLimits ??
+    await DiscordRateLimits.load(storage, new Set(parseChannelIds(env.DISCORD_CHANNEL_IDS)), env.DISCORD_BOT_TOKEN);
   try {
     await sendMemberReminders(env, current, storage, now, limits, policy, labels, deadline, memberCache);
   } finally {

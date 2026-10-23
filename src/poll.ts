@@ -233,6 +233,14 @@ async function announceOnline(
   return { posted, failed, unconfirmed };
 }
 
+/**
+ * Stored as a card's `onlineEmbed` (never valid JSON, so never equal to a
+ * rendered embed) when Discord permanently rejected that exact embed: the card
+ * is neither edited again nor its continuation pages changed until the content
+ * changes. A version without this prefix reads it as stale and retries once.
+ */
+const REJECTED_PREFIX = 'rejected:';
+
 /** A 400/413 that Discord does not report as a 30xxx limit: the same embed will be refused again. */
 function rejectsEmbedPermanently(err: unknown): boolean {
   if (err instanceof DiscordInvalidChannelIdError) return true;
@@ -272,6 +280,13 @@ async function syncOnlineCards(
           session, others, coverage, labels, highlightMismatch(session, highlightPolicy),
         );
         const rendered = JSON.stringify(embed);
+        if (ref.onlineEmbed === REJECTED_PREFIX + rendered) {
+          // Rejected as is: not shown, not retried, not a failure. The holder
+          // keeps its existing continuations (no page edit, post or delete);
+          // a non-holder's are removed, as for any non-holder.
+          if (isHolder) targets.push({ channelId: ref.channelId, parentMessageId: ref.messageId });
+          continue;
+        }
         let updated = ref.onlineEmbed === rendered;
         if (!updated && !failedRefs.has(ref)) {
           try {
@@ -305,11 +320,12 @@ async function syncOnlineCards(
               continue;
             }
             // A rejection that is permanent for this embed (not a limit such as
-            // Discord's 30046 old-message edit cap) is not retried every poll:
-            // treat it as shown, so health is not frozen; the next content
-            // change tries again.
+            // Discord's 30046 old-message edit cap) is not retried every poll
+            // and does not freeze health; the embed is recorded as rejected,
+            // never as shown, so its continuations are not updated either.
+            // The next content change tries again.
             if (rejectsEmbedPermanently(err)) {
-              ref.onlineEmbed = rendered;
+              ref.onlineEmbed = REJECTED_PREFIX + rendered;
             } else {
               failed = true;
               failedRefs.add(ref);
@@ -728,7 +744,8 @@ export async function runPoll(
   const prefixes = parsePrefixes(env.FIR_PREFIXES);
   const labels = parseFirLabels(env.FIR_LABELS);
   const gracePolls = parseGracePolls(env.OFFLINE_GRACE_POLLS);
-  const limits = await DiscordRateLimits.load(storage);
+  // Routes for any other channel (reminder DMs) are stored only as a keyed hash.
+  const limits = await DiscordRateLimits.load(storage, new Set(channelIds), env.DISCORD_BOT_TOKEN);
 
   const auth = ivaoAuthFromEnv(env);
   // Every division VID, before duplicate callsigns are merged (short-session presence).

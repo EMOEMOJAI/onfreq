@@ -59,11 +59,21 @@ export class DiscordRateLimitError extends Error {
   get retryMs(): number { return Math.max(0, this.retryAt - Date.now()); }
 }
 
-/** Conservatively share message-route cooldowns within a channel, never across channels. */
+/**
+ * Conservatively share message-route cooldowns within a channel, never across
+ * channels. With a public channel set, non-public channels keep the same
+ * per-channel cooldowns under a keyed hash instead (see `publicChannels`).
+ */
 function routeKey(path: string): string {
   const channel = /^\/channels\/([^/]+)\/messages(?:\/|$)/.exec(path);
   return channel ? `/channels/${channel[1]}/messages` : path.split('?')[0]!;
 }
+
+/** The channel id of any `/channels/<id>…` path, query paths included. */
+const CHANNEL_PATH = /^\/channels\/([^/?]+)(?=[/?]|$)/;
+/** A channel id already replaced by its keyed hash (as stored): never hashed again. */
+const HASHED_CHANNEL = /^@h:[0-9a-f]{32}$/;
+const HASH_LABEL = 'onfreq-rate-limit:v1:';
 
 /** One instance per serialized poll, shared by public cards and private reminders. */
 export class DiscordRateLimits {
@@ -77,29 +87,98 @@ export class DiscordRateLimits {
   private postFailureStreak = 0;
   /** In-memory only: epoch ms after which no request is sent, or undefined for no bound. */
   private deliveryDeadline: number | undefined;
+  /**
+   * Configured public channels. With a set (and a hash key), every
+   * `/channels/<id>…` route for another id (a DM channel, say) is keyed, in
+   * memory and in storage, by `/channels/@h:<hex>/messages`: the first 32 hex
+   * characters of HMAC-SHA-256(hash key, HASH_LABEL + id). Cooldowns stay per
+   * channel exactly as with plain keys; only the stored name changes, so the
+   * persisted map never holds a non-public channel id. All sub-routes of such a
+   * channel share that one key (only its /messages routes are used). Without
+   * a set, or with an empty hash key, routes are keyed by plain ids as before.
+   * The hash key is the bot token, so only a holder of the token (which can
+   * reach the channel anyway) can link a candidate id to its stored key; a new
+   * token only orphans keys, which leave storage when they expire (<= 1 h).
+   */
+  private readonly publicChannels: ReadonlySet<string> | undefined;
+  /** The HMAC key material until the key is first imported (lazily, on the first non-public route). */
+  #hashSecret: string | undefined;
+  #hashKey: Promise<CryptoKey> | undefined;
+  readonly #hashed = new Map<string, string>();
 
+  /**
+   * Only `load` normalises stored keys: deadlines passed here are used as
+   * given, so a plain non-public channel key in them is kept as is.
+   */
   constructor(
     private readonly storage?: DurableObjectStorage,
     private readonly deadlines: Record<string, number> = {},
-  ) {}
+    publicChannels?: ReadonlySet<string>,
+    hashKey?: string,
+  ) {
+    this.publicChannels = publicChannels && hashKey ? publicChannels : undefined;
+    this.#hashSecret = this.publicChannels ? hashKey : undefined;
+  }
 
-  static async load(storage?: DurableObjectStorage): Promise<DiscordRateLimits> {
+  static async load(
+    storage?: DurableObjectStorage, publicChannels?: ReadonlySet<string>, hashKey?: string,
+  ): Promise<DiscordRateLimits> {
     const stored = await storage?.get<Record<string, number>>(KEY) ?? {};
     // A deadline beyond the cap can only come from an older, unclamped write
     // or corrupt storage; dropping it lets delivery resume.
     const now = Date.now();
     const kept = Object.entries(stored)
       .filter(([, until]) => Number.isFinite(until) && until > now && until <= now + MAX_RATE_LIMIT_COOLDOWN_MS);
-    if (storage && kept.length < Object.keys(stored).length) {
-      // Route keys can hold channel IDs (DM channels included): do not leave
-      // them in storage after their cooldown ends. Best effort, as in `record`.
+    const deadlines: Record<string, number> = {};
+    const limits = new DiscordRateLimits(storage, deadlines, publicChannels, hashKey);
+    // Only after that filter, so an expired or over-cap plain key never
+    // overrides a valid hashed one: a plain non-public channel key (written
+    // before keys were hashed) is renamed to its hashed key (the later
+    // deadline wins). Already hashed keys are kept as they are.
+    let renamed = false;
+    for (const [route, until] of kept) {
+      const id = limits.privateChannel(route);
+      const key = id === undefined ? route : await limits.hashedRoute(id);
+      if (key !== route) renamed = true;
+      deadlines[key] = Math.max(deadlines[key] ?? 0, until);
+    }
+    if (storage && (renamed || kept.length < Object.keys(stored).length)) {
+      // Expired cooldowns and plain non-public channel ids (DM channels) are
+      // not left in storage. Best effort, as in `record`.
       try {
-        await (kept.length ? storage.put(KEY, Object.fromEntries(kept)) : storage.delete(KEY));
+        await (kept.length ? storage.put(KEY, deadlines) : storage.delete(KEY));
       } catch (err) {
         console.warn(JSON.stringify({ event: 'discord_rate_limit_persist_failed', error: String(err) }));
       }
     }
-    return new DiscordRateLimits(storage, Object.fromEntries(kept));
+    return limits;
+  }
+
+  /** The non-public channel id a path addresses, or undefined when its route keeps a plain key. */
+  private privateChannel(path: string): string | undefined {
+    if (!this.publicChannels) return undefined;
+    const id = CHANNEL_PATH.exec(path)?.[1];
+    if (id === undefined || this.publicChannels.has(id) || HASHED_CHANNEL.test(id)) return undefined;
+    return id;
+  }
+
+  /** The one route key, in memory and in storage, for every path of a non-public channel. */
+  private async hashedRoute(id: string): Promise<string> {
+    return `/channels/@h:${await this.channelHash(id)}/messages`;
+  }
+
+  private async channelHash(id: string): Promise<string> {
+    const cached = this.#hashed.get(id);
+    if (cached !== undefined) return cached;
+    if (!this.#hashKey) {
+      this.#hashKey = crypto.subtle.importKey('raw', new TextEncoder().encode(this.#hashSecret ?? ''),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      this.#hashSecret = undefined;
+    }
+    const mac = await crypto.subtle.sign('HMAC', await this.#hashKey, new TextEncoder().encode(HASH_LABEL + id));
+    const hex = [...new Uint8Array(mac, 0, 16)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    this.#hashed.set(id, hex);
+    return hex;
   }
 
   /**
@@ -158,7 +237,10 @@ export class DiscordRateLimits {
 
   async fetch(path: string, init: RequestInit): Promise<Response> {
     if (!this.canStartBy(0)) throw this.deadlineDeferral();
-    const route = routeKey(path);
+    // Public, global and guild routes are keyed synchronously; only a
+    // non-public channel waits for its hash, computed once for every use below.
+    const hidden = this.privateChannel(path);
+    const route = hidden === undefined ? routeKey(path) : await this.hashedRoute(hidden);
     const globalDeadline = this.deadlines[GLOBAL] ?? 0;
     const routeDeadline = this.deadlines[route] ?? 0;
     const softDeadline = this.softDeadlines[route] ?? 0;
@@ -227,7 +309,8 @@ export class DiscordRateLimits {
   private async record(key: string, retryAt: number): Promise<number> {
     const effective = Math.max(this.deadlines[key] ?? 0, retryAt);
     this.deadlines[key] = effective;
-    // Expired entries (possibly DM channel IDs) are not persisted again.
+    // Expired entries are not persisted again (nor, without a public channel
+    // set, the plain DM channel ids they may hold).
     const now = Date.now();
     for (const [route, until] of Object.entries(this.deadlines)) if (until <= now) delete this.deadlines[route];
     // Persist before returning to callers. A storage failure here must not

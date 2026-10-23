@@ -1110,6 +1110,32 @@ describe('polling through the Durable Object', () => {
     expect(sent.some((m) => m.embed.title?.includes('OFFLINE'))).toBe(true);
   });
 
+  it('stores a rate-limited reminder DM only under a hashed key, never its channel id', async () => {
+    await gcaPoll();
+    profileCountry = 'US';
+    feed = [{ ...entry('XDAA_ARR_APP'), userId: 600001, id: 999 }];
+    const original = network.getMockImplementation()!;
+    let limited = 0;
+    network.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/channels/300000000000000001/messages')) {
+        limited += 1;
+        return Response.json({ retry_after: 30 }, { status: 429 });
+      }
+      return original(input, init);
+    });
+    now += 60_000;
+    await gcaPoll();
+    expect(limited).toBe(1);
+    expect(sent.some((m) => m.method === 'POST' && m.embed.title?.includes('ONLINE'))).toBe(true);
+    const stored = await runInDurableObject(stub(), (_instance, ctx) =>
+      ctx.storage.get<Record<string, number>>('discord-rate-limits-v1'));
+    const text = JSON.stringify(stored ?? {});
+    expect(text).not.toContain('300000000000000001');
+    expect(Object.keys(stored ?? {}).some((key) => /^\/channels\/@h:[0-9a-f]{32}\/messages$/.test(key))).toBe(true);
+    const plainChannels = Object.keys(stored ?? {}).flatMap((key) => /^\/channels\/(\d+)/.exec(key)?.[1] ?? []);
+    expect(plainChannels.every((id) => id === '900000000000000001')).toBe(true);
+  });
+
   it('does not repeat a successful DM when public channel delivery remains pending', async () => {
     await gcaPoll();
     profileCountry = 'US';
@@ -2480,6 +2506,90 @@ describe('polling through the Durable Object', () => {
       expect((await nextPoll()).status).toBe(200);
       expect((await snapshot())?.rosterMessages).toBeUndefined();
       expect(deleted).toContain(pages[0]!.messageId);
+    });
+
+    // NX-7 item 12: a parent card edit Discord rejects permanently.
+    function rejectParentEdits(): string[] {
+      const original = network.getMockImplementation()!;
+      const patches: string[] = [];
+      network.mockImplementation(async (input, init) => {
+        if (init?.method === 'PATCH' && String(input).endsWith(`/messages/${mid(a)}`)) {
+          patches.push(String(init.body));
+          return Response.json({ code: 50035, message: 'synthetic' }, { status: 400 });
+        }
+        return original(input, init);
+      });
+      return patches;
+    }
+    /** Writes to continuation pages since `from`: PATCHes of known pages, replies posted, pages deleted. */
+    function continuationWrites(pages: { messageId: string }[], from: { sent: number; deleted: number }) {
+      const ids = new Set(pages.map((page) => page.messageId));
+      return [
+        ...sent.slice(from.sent).filter((message) => message.method === 'POST' || ids.has(message.id ?? '')),
+        ...deleted.slice(from.deleted),
+      ];
+    }
+    const moveCoverage = () => {
+      for (const atc of feed) if (atc.callsign !== a) atc.atcSession.frequency = 121.7;
+    };
+
+    it('leaves continuations alone while the parent edit is rejected permanently, until the content changes', async () => {
+      await prepare();
+      expect((await poll()).status).toBe(200);
+      const pages = (await snapshot())!.rosterMessages!;
+      expect(pages.length).toBeGreaterThan(0);
+      const patches = rejectParentEdits();
+      // A coverage change alters the parent and its continuation pages.
+      moveCoverage();
+      expect((await nextPoll()).status).toBe(200);
+      expect(patches).toHaveLength(1);
+      expect((await snapshot())?.rosterMessages).toEqual(pages);
+      const from = { sent: sent.length, deleted: deleted.length };
+      expect((await nextPoll()).status).toBe(200);
+      expect(patches).toHaveLength(1);
+      expect(continuationWrites(pages, from)).toEqual([]);
+      expect(sent).toHaveLength(from.sent);
+      expect((await snapshot())?.rosterMessages).toEqual(pages);
+      expect((await snapshot())?.lastSuccessfulPollAt).toBe(now);
+      // A content change tries the parent once more.
+      feed.find((atc) => atc.callsign === a)!.atcSession.frequency = 121.8;
+      expect((await nextPoll()).status).toBe(200);
+      expect(patches).toHaveLength(2);
+    });
+
+    it('sends no continuations for a rejected parent in the same poll\'s second reconcile pass', async () => {
+      await prepare();
+      await poll();
+      const pages = (await snapshot())!.rosterMessages!;
+      const patches = rejectParentEdits();
+      // The other card is gone: its 404 triggers a second reconcile pass.
+      failures.add(mid(b));
+      failureStatus = 404;
+      cards.delete(mid(b));
+      moveCoverage();
+      const from = { sent: sent.length, deleted: deleted.length };
+      expect((await nextPoll()).status).toBe(200);
+      expect((await snapshot())?.state?.[b]?.messages).toEqual([]);
+      expect(patches).toHaveLength(1);
+      expect(continuationWrites(pages, from)).toEqual([]);
+      expect((await snapshot())?.rosterMessages).toEqual(pages);
+    });
+
+    it('removes the continuation pages of a rejected parent that no longer holds the roster', async () => {
+      await prepare();
+      await poll();
+      const pages = (await snapshot())!.rosterMessages!;
+      expect(pages.every((page) => page.parentMessageId === mid(a))).toBe(true);
+      const patches = rejectParentEdits();
+      // A newly carded session takes over the roster; the old host's edit is rejected.
+      feed.push(entry('QGLL_TWR'));
+      expect((await nextPoll()).status).toBe(200);
+      expect(patches).toHaveLength(1);
+      expect(deleted).toEqual([]);
+      expect((await nextPoll()).status).toBe(200);
+      expect(patches).toHaveLength(1);
+      expect(deleted.sort()).toEqual(pages.map((page) => page.messageId).sort());
+      expect((await snapshot())?.rosterMessages?.some((page) => page.parentMessageId === mid(a))).toBe(false);
     });
 
     it('abandons a roster continuation that can never be deleted', async () => {

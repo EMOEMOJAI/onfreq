@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runInDurableObject } from 'cloudflare:test';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordRateLimitError, DiscordRateLimits, MAX_RATE_LIMIT_COOLDOWN_MS, trackPosts } from '../src/discord-rate-limit';
 import { postMessage } from '../src/discord';
 
@@ -502,4 +502,164 @@ it('never sleeps a soft wait that would leave less than a request timeout before
   limits.setDeadline(START + 12_000);
   await expect(limits.fetch('/channels/a/messages', { method: 'POST' })).resolves.toMatchObject({ status: 200 });
   expect(waits).toEqual([2000]);
+});
+
+// NX-7 item 13: with the configured public channels and a hash key, a route
+// for any other channel (a reminder DM) is stored only under a keyed hash.
+// Synthetic ids and a synthetic key; the hash is recomputed independently here.
+describe('non-public channel routes with a public channel set', () => {
+  const PUBLIC_ID = '900000000000000001';
+  const PUBLIC_SET: ReadonlySet<string> = new Set([PUBLIC_ID]);
+  const DM_ID = '300000000000000007';
+  const OTHER_DM_ID = '300000000000000008';
+  const HASH_KEY = 'synthetic-hash-key-for-rate-limit-tests';
+  const dm = (id = DM_ID) => `/channels/${id}/messages`;
+
+  async function hashedRoute(id: string, key = HASH_KEY): Promise<string> {
+    const encoder = new TextEncoder();
+    const cryptoKey = await crypto.subtle.importKey('raw', encoder.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const mac = new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(`onfreq-rate-limit:v1:${id}`)));
+    return `/channels/@h:${[...mac].map((byte) => byte.toString(16).padStart(2, '0')).join('').slice(0, 32)}/messages`;
+  }
+
+  function send(path: string, method = 'POST', key = HASH_KEY) {
+    return runInDurableObject(stub(), async (_, ctx) => {
+      const limits = await DiscordRateLimits.load(ctx.storage, PUBLIC_SET, key);
+      return (await limits.fetch(path, { method })).status;
+    });
+  }
+
+  const routeLimited = () => vi.fn()
+    .mockImplementationOnce(async () => Response.json({ retry_after: 30 }, { status: 429 }))
+    .mockImplementation(async () => Response.json({ id: 'synthetic' }));
+
+  it('persists a DM 429 only under an HMAC-keyed route that holds no channel id', async () => {
+    vi.stubGlobal('fetch', routeLimited());
+    await expect(send(dm())).rejects.toMatchObject({ requestMade: true, retryAt: START + 30_000, reason: 'rate_limit' });
+    const record = await stored();
+    expect(Object.keys(record ?? {})).toEqual([await hashedRoute(DM_ID)]);
+    expect(Object.keys(record ?? {})[0]).toMatch(/^\/channels\/@h:[0-9a-f]{32}\/messages$/);
+    expect(JSON.stringify(record)).not.toContain(DM_ID);
+    expect(record).toEqual({ [await hashedRoute(DM_ID)]: START + 30_000 });
+  });
+
+  it('keeps a hashed DM cooldown per channel, in the same poll and after a reload', async () => {
+    const network = routeLimited();
+    vi.stubGlobal('fetch', network);
+    await runInDurableObject(stub(), async (_, ctx) => {
+      const limits = await DiscordRateLimits.load(ctx.storage, PUBLIC_SET, HASH_KEY);
+      await expect(limits.fetch(dm(), { method: 'POST' })).rejects.toMatchObject({ requestMade: true });
+      await expect(limits.fetch(dm(OTHER_DM_ID), { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+    });
+    await evictDurableObject(stub());
+    await expect(send(dm())).rejects.toMatchObject({ requestMade: false, reason: 'rate_limit', global: false });
+    await expect(send(`${dm()}/old`, 'PATCH')).rejects.toMatchObject({ requestMade: false, reason: 'rate_limit' });
+    await expect(send(dm(OTHER_DM_ID))).resolves.toBe(200);
+    expect(network).toHaveBeenCalledTimes(3);
+    now += 30_000;
+    await expect(send(dm())).resolves.toBe(200);
+    expect(network).toHaveBeenCalledTimes(4);
+  });
+
+  it('keeps the plain key of a configured public channel', async () => {
+    vi.stubGlobal('fetch', routeLimited());
+    await expect(send(`/channels/${PUBLIC_ID}/messages`)).rejects.toMatchObject({ requestMade: true });
+    expect(await stored()).toEqual({ [`/channels/${PUBLIC_ID}/messages`]: START + 30_000 });
+  });
+
+  it('hashes a query path on a non-public channel id', async () => {
+    vi.stubGlobal('fetch', routeLimited());
+    await expect(send(`/channels/${DM_ID}?synthetic=1`, 'GET')).rejects.toMatchObject({ requestMade: true });
+    expect(await stored()).toEqual({ [await hashedRoute(DM_ID)]: START + 30_000 });
+  });
+
+  it('renames a stored plain DM key on load and removes the raw id, even when the entry count is unchanged', async () => {
+    await runInDurableObject(stub(), (_, ctx) => ctx.storage.put('discord-rate-limits-v1', { [dm()]: START + 5_000 }));
+    const network = vi.fn(async () => Response.json({ id: 'synthetic' }));
+    vi.stubGlobal('fetch', network);
+    await expect(send(dm())).rejects.toMatchObject({ requestMade: false, reason: 'rate_limit', retryAt: START + 5_000 });
+    expect(await stored()).toEqual({ [await hashedRoute(DM_ID)]: START + 5_000 });
+    expect(JSON.stringify(await stored())).not.toContain(DM_ID);
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it('folds stored plain keys of one DM channel, query routes included, into its hashed key with the later deadline', async () => {
+    await runInDurableObject(stub(), (_, ctx) => ctx.storage.put('discord-rate-limits-v1', {
+      [dm()]: START + 5_000, [`/channels/${DM_ID}`]: START + 9_000, '*': START + 1_000,
+      [`/channels/${PUBLIC_ID}/messages`]: START + 2_000,
+    }));
+    await runInDurableObject(stub(), (_, ctx) => DiscordRateLimits.load(ctx.storage, PUBLIC_SET, HASH_KEY));
+    expect(await stored()).toEqual({
+      [await hashedRoute(DM_ID)]: START + 9_000, '*': START + 1_000, [`/channels/${PUBLIC_ID}/messages`]: START + 2_000,
+    });
+  });
+
+  it('loads an already hashed record without rewriting or re-hashing it', async () => {
+    const record = { [await hashedRoute(DM_ID)]: START + 5_000, [`/channels/${PUBLIC_ID}/messages`]: START + 5_000 };
+    await runInDurableObject(stub(), async (_, ctx) => {
+      await ctx.storage.put('discord-rate-limits-v1', record);
+      const put = vi.spyOn(ctx.storage, 'put');
+      const del = vi.spyOn(ctx.storage, 'delete');
+      await DiscordRateLimits.load(ctx.storage, PUBLIC_SET, HASH_KEY);
+      await DiscordRateLimits.load(ctx.storage, PUBLIC_SET, HASH_KEY);
+      expect(put).not.toHaveBeenCalled();
+      expect(del).not.toHaveBeenCalled();
+    });
+    expect(await stored()).toEqual(record);
+  });
+
+  it('does not let an expired or over-cap plain DM key override a valid hashed one', async () => {
+    const hashed = await hashedRoute(DM_ID);
+    await runInDurableObject(stub(), (_, ctx) => ctx.storage.put('discord-rate-limits-v1', {
+      [hashed]: START + 5_000, [dm()]: START + MAX_RATE_LIMIT_COOLDOWN_MS + 1, [`${dm()}/old`]: START - 1,
+      [`/channels/${DM_ID}`]: START + 2_000,
+    }));
+    const network = vi.fn(async () => Response.json({ id: 'synthetic' }));
+    vi.stubGlobal('fetch', network);
+    await expect(send(dm())).rejects.toMatchObject({ requestMade: false, reason: 'rate_limit', retryAt: START + 5_000 });
+    expect(await stored()).toEqual({ [hashed]: START + 5_000 });
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it('uses a different key under a different hash key, so that cooldown is not applied', async () => {
+    const network = routeLimited();
+    vi.stubGlobal('fetch', network);
+    await expect(send(dm())).rejects.toMatchObject({ requestMade: true });
+    const otherKey = 'synthetic-rotated-hash-key-for-tests';
+    expect(await hashedRoute(DM_ID, otherKey)).not.toBe(await hashedRoute(DM_ID));
+    await expect(send(dm(), 'POST', otherKey)).resolves.toBe(200);
+    expect(network).toHaveBeenCalledTimes(2);
+    expect(Object.keys(await stored() ?? {})).toEqual([await hashedRoute(DM_ID)]);
+  });
+
+  it('stores only the hashed key for an oversized DM 429', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementationOnce(async () => new Response('x', {
+      status: 429, headers: { 'content-length': String(4 * 1024 * 1024 + 1) },
+    })));
+    await expect(send(dm())).rejects.toMatchObject({ requestMade: true, retryAt: START + 60_000, reason: 'rate_limit' });
+    expect(await stored()).toEqual({ [await hashedRoute(DM_ID)]: START + 60_000 });
+  });
+
+  it('defers a DM past the delivery deadline before hashing or any network call', async () => {
+    const network = vi.fn(async () => Response.json({ id: 'synthetic' }));
+    vi.stubGlobal('fetch', network);
+    const importKey = vi.spyOn(crypto.subtle, 'importKey');
+    const limits = new DiscordRateLimits(undefined, {}, PUBLIC_SET, HASH_KEY);
+    limits.setDeadline(START + 9_999);
+    await expect(limits.fetch(dm(), { method: 'POST' })).rejects.toMatchObject({ requestMade: false, reason: 'deadline' });
+    expect(importKey).not.toHaveBeenCalled();
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it('still stores a global 429 from a DM route under the global key only', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ retry_after: 30, global: true }, { status: 429 })));
+    await expect(send(dm())).rejects.toMatchObject({ requestMade: true, global: true });
+    expect(await stored()).toEqual({ '*': START + 30_000 });
+  });
+
+  it('falls back to plain keys without throwing when the hash key is empty', async () => {
+    vi.stubGlobal('fetch', routeLimited());
+    await expect(send(dm(), 'POST', '')).rejects.toMatchObject({ requestMade: true, reason: 'rate_limit' });
+    expect(await stored()).toEqual({ [dm()]: START + 30_000 });
+  });
 });
