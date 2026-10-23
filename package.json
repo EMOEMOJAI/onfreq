@@ -1,6 +1,6 @@
 {
   "name": "onfreq",
-  "version": "2.2.9",
+  "version": "2.2.10",
   "private": true,
   "license": "MIT",
   "description": "Self-hosted IVAO air traffic control Discord bot with live ATC session cards and FIR coverage, built with TypeScript on Cloudflare Workers.",
@@ -23,14 +23,14 @@
     "check:repo": "npm run check:privacy && npm run check:setup && npm run check:links"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.4.6",
+    "@cloudflare/vitest-plugin": "1.4.7",
     "github-slugger": "2.0.0",
     "jsonc-parser": "3.3.1",
     "markdown-it": "15.0.3",
     "markdownlint": "0.42.0",
     "typescript": "7.0.2",
     "vitest": "5.0.5",
-    "wrangler": "4.151.3"
+    "wrangler": "4.152.0"
   },
   "overrides": {
     "katex": "^0.18.2"

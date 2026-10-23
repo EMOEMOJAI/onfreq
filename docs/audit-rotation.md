@@ -135,6 +135,7 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-23 | T1-6 | P4 | Fixed deferred: a record's stored session id always joins its id set, so ids left by a rollback to 2.2.6 still match; reaches production with the next deploy | 4d4eff0 |
 | 2026-10-23 | T1-5 | P3 | Fixed: the coordinator-name colon form (as in `wrangler --var`) now flags quoted and backtick-quoted values, and a non-breaking or other Unicode blank around a comma no longer hides a FIR prefix list in the colon form. Accepted: string concatenation and Markdown with a later backtick can be flagged (fails safe) | c054bc9 |
 | 2026-10-23 | T1-5 | P4 | Deferred: a plain space inside a callsign item, quote-joined later items or values (also a synthetic quoted coordinator name joined to more text), escaped blanks, a dotted first callsign item, and an unclosed quote | c054bc9 |
+| 2026-10-23 | T2-5 | P4 | wrangler 4.152.0 and `@cloudflare/vitest-plugin` 1.4.7 (miniflare follows) with no config or test changes; `npm audit` clean, `katex` override still needed | - |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
