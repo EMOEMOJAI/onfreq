@@ -82,9 +82,10 @@ jobs:
         uses: ./.github/actions/install-gitleaks
 
       # Synthetic repositories with fake npm and, except for the real-Gitleaks
-      # cases, fake Gitleaks; runs the hooks with macOS /bin/sh.
+      # cases, fake Gitleaks; runs the hooks with macOS /bin/sh. The hook tests
+      # are split over several files, which run in parallel processes.
       - name: Test Git hooks
-        run: node --test scripts/test-hooks.mjs
+        run: node --test --test-concurrency=3 scripts/test-hooks*.mjs
 
   checks:
     # Use disposable GitHub-hosted machines. Never attach a persistent/private
