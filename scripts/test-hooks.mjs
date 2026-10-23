@@ -2232,7 +2232,6 @@ function g1Cases() {
     'onfreq-excluded-callsigns-assignment': [
       [`${callsignsName}=QCXX_CTR,QCXX-APP,${tower}\n`, tower, 'dashed item early in the list'],
       [`  ${callsignsName}: 'QCXX_CTR, QC.X, ${tower}',\n`, tower, 'dotted item early in the list'],
-      [`${callsignsName}=QCXX_CTR,QC.X\n`, '', 'dotted item'],
       [`"${callsignsName}": "QCXX_CTR,\u00a0${tower}"\n`, tower, 'no-break space before an item'],
       [`${callsignsName}=QCXX_CTR,QCXX\u00a0${tower}\n`, tower, 'no-break space inside an item'],
       [`${callsignsName}='\u00a0${centre}'\n`, centre, 'leading no-break space'],
@@ -2255,6 +2254,187 @@ function g1Cases() {
     ],
   };
 }
+// NX5-L2: the callsign allowlist takes any synthetic item up to a comma or
+// blank, the first callsign item may hold a dash, the blank class B covers VT,
+// FF, CR and the line and paragraph separators, the quoted-userinfo rule has
+// one branch per opener, and the NAME:value forms of FIR prefixes and the
+// coordinator name are flagged. Flagged lines are assembled at runtime from joined names, J
+// prefixes, random hosts and values, so this file never holds one. Each rule's
+// texts before NX5-L2 are pinned here, so the necessity test can restore them.
+const tick = '`';
+const blankClass = String.raw`[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]`;
+const itemClass = String.raw`[^\s,"'${tick};)}\]]*`;
+const callsignHead = String.raw`regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*["'${tick}]?`;
+const callsignRegex = String.raw`${callsignHead}${blankClass}*([A-Za-z0-9-]+_${itemClass}(?:${blankClass}*,${blankClass}*${itemClass})*)'''`;
+const callsignItem = String.raw`[^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*`;
+const firBlank = String.raw`[\t \p{Zs}\x{FEFF}]`;
+const firBeforeL2 = String.raw`regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(?:["'${tick}](${firBlank}*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:${firBlank}*,${firBlank}*[A-Za-z]{0,4})*${firBlank}*)["'${tick}]|([A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)[ \t\r]*(?:#[^\n]*)?$)|\bFIR_PREFIXES=([A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[ \t\r;&|)]|$)'''`;
+const l2Texts = {
+  'onfreq-excluded-callsigns-assignment': [
+    ['regex', callsignRegex,
+      String.raw`${callsignHead}[ \t\p{Zs}\x{FEFF}]*([A-Za-z0-9]+_${itemClass}(?:[ \t]*,[ \t]*${itemClass})*)'''`],
+    ['regexes', String.raw`regexes = ['''(?i)^[QX]${callsignItem}(?:${blankClass}*,${blankClass}*(?:[QX]${callsignItem})?)*${blankClass}*$''']`,
+      String.raw`regexes = ['''(?i)^[QX][A-Z0-9_]*(?:[ \t]*,[ \t]*(?:[QX][A-Z0-9_]*)?)*$''']`],
+  ],
+  'onfreq-fir-prefixes-property': [
+    ['regex', firBeforeL2.replaceAll(firBlank, blankClass).slice(0, -3)
+      + String.raw`|\bFIR_PREFIXES:([A-Za-z]{1,4}(?:[ \t]*,[ \t]*[A-Za-z]{0,4})*)(?:[\s"'${tick};&|)]|$)'''`, firBeforeL2],
+  ],
+  'onfreq-gca-policy-url-quoted-userinfo': [
+    ['regex', String.raw`regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*["'${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*@[^\s"'${tick}]*|"[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:"(?:[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)?|['${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*|'[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:'(?:[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)?|["${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*|${tick}[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:${tick}[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*|["'\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*)'''`,
+      String.raw`regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*["'${tick}]?[ \t]*([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*["'${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*@[^\s"'${tick}]*)'''`],
+  ],
+};
+// The configuration with each `key = ` line of rule `id` (its allowlist
+// included) changed from the expected current text to another.
+function editRule(rules, id, edits) {
+  const lines = rules.toString().split('\n');
+  const start = lines.indexOf(`id = "${id}"`);
+  assert.ok(start > 0, id);
+  const end = lines.indexOf('[[rules]]', start);
+  for (const [key, from, to] of edits) {
+    const at = lines.findIndex((line, index) => index > start && line.startsWith(`${key} = `));
+    assert.ok(at > start && (end < 0 || at < end), `${id} ${key}`);
+    assert.equal(lines[at], from, `${id} ${key} is the NX5-L2 text`);
+    lines[at] = to;
+  }
+  return lines.join('\n');
+}
+// The configuration with rule `id` as before NX5-L2.
+const beforeL2 = (rules, id) => editRule(rules, id, l2Texts[id]);
+// rule id -> { block: [line, text the redacted output must not show, label, needs the change][],
+//              pass: [line, label, needs the change][] }; "needs the change" marks
+// cases whose outcome differs with the rule's text before NX5-L2 (pass instead
+// of block, or block instead of pass); the others guard against regressions.
+function l2Cases() {
+  const host = `jddd-${randomBytes(3).toString('hex')}.org`;
+  const tower = jsonName('JDDD', 'TWR');
+  const [jd, je] = [jPrefix('D'), jPrefix('E')];
+  const name = ['jd', randomBytes(3).toString('hex')].join('-');
+  const mail = ['a', 'b.test'].join('@');
+  const cs = (rest) => `${callsignsName}${rest}\n`;
+  return {
+    'onfreq-excluded-callsigns-assignment': {
+      block: [
+        [`<code>${cs(`=${tower}</code>`)}`, tower, 'code element', false],
+        [cs(`=QCXX_CTR</b>,${tower}`), tower, 'markup after a synthetic item', false],
+        [cs(`=QCXX_CTR,QCXX ${tower}`), tower, 'no-break space inside an item (NX4-G1)', false],
+        [cs(`=QC-X_CTR,${tower}`), tower, 'dashed first item', true],
+        [cs(`=-X_CTR,${tower}`), tower, 'first item starting with a dash', true],
+        [cs(`=QCXX_CTR\f,${tower}`), tower, 'FF before a comma', true],
+        [cs(`=QCXX_CTR\t\f,${tower}`), tower, 'tab and FF before a comma', true],
+        [cs(`=QCXX_CTR,\f${tower}`), tower, 'FF after a comma', true],
+        [cs(`=QCXX_CTR,\r${tower}`), tower, 'CR after a comma', true],
+        [cs(`="\f${tower}"`), tower, 'leading FF', true],
+        [cs(`=\v${tower}`), tower, 'leading VT', true],
+        [cs(`= ${tower}`), tower, 'leading line separator', true],
+        [cs(`=" ${tower}"`), tower, 'leading paragraph separator', true],
+      ],
+      pass: [
+        [`Set ${cs('=QCXX_CTR.')}`, 'full stop after a synthetic item', true],
+        [`<code>${cs('=QCXX_CTR,xd_syn_twr</code>')}`, 'code element around synthetic items', true],
+        [cs("='QCXX_CTR '"), 'blank before the closing quote', false],
+        [cs('=QCXX_CTR,QC.X'), 'dotted synthetic item (NX4-G1 case)', true],
+        [cs('=QC-X_CTR,QD_TWR'), 'dashed synthetic first item', false],
+        [cs(`: env.${callsignsName},`), 'reference', false],
+        [cs(': config.excluded_callsigns'), 'lowercase reference', false],
+        [cs('=QCXX_CTR\f,QDXX_TWR'), 'FF before a synthetic item', false],
+        [cs('=\vQCXX_CTR'), 'leading VT before a synthetic item', false],
+        [cs('=" QCXX_CTR, \fXD_SYN"'), 'line separator and FF before synthetic items', false],
+        [`${callsignsName}=QCXX_CTR\r\n`, 'CRLF line', false],
+      ],
+    },
+    'onfreq-gca-policy-url-quoted-userinfo': {
+      block: [
+        [`${policyUrlName}="https://x.test"+"@${host}"\n`, host, 'quoted @ joined by +', false],
+        [`${policyUrlName}='https://x.test"@${host}'\n`, host, 'double quote inside single quotes', false],
+        [`${policyUrlName}="https://x.test"";x"@${host}\n`, host, 'empty quoted word before ;', false],
+        [`${policyUrlName}: ${tick}https://x.test${tick}+'@${host}'\n`, host, 'backtick-closed link joined by +', false],
+        [`${policyUrlName}=https://x.test";x@${host}\n`, host, 'unquoted link with a quote and ;', false],
+      ],
+      pass: [
+        [`${policyUrlName}="https://example.test";MAIL=${mail}\n`, 'double-quoted link, then ; and an address', true],
+        [`${policyUrlName}='https://example.test';MAIL=${mail}\n`, 'single-quoted link, then ; and an address', true],
+        [`${policyUrlName}="https://example.test"&&MAIL=${mail}\n`, 'double-quoted link, then && and an address', true],
+        [`${policyUrlName}=${tick}https://example.test${tick}@owner\n`, 'backtick-closed link, then @', true],
+      ],
+    },
+    'onfreq-fir-prefixes-property': {
+      block: [
+        [`  ${firPrefixes}: '${jd},\f${je}'\n`, '', 'FF after a comma', true],
+        [`${firPrefixes}: "\v${jd}"\n`, '', 'leading VT', true],
+        [`{"${firPrefixes}":" ${jd}"}\n`, '', 'leading line separator in JSON', true],
+        [`wrangler dev --var ${firPrefixes}:${jd},${je} --port 1\n`, `${jd},${je}`, 'wrangler --var NAME:list', true],
+        [`wrangler dev --var=${firPrefixes}:${jd.toLowerCase()}\n`, '', 'wrangler --var=NAME:list, lowercase', true],
+        // The uppercase list at the end of the line was already flagged before NX5-L2.
+        [`wrangler dev --var A:1 ${firPrefixes}:${jd}\n`, '', 'second --var item ending the line', false],
+        [`wrangler dev --var A:1 ${firPrefixes}:${jd} --port 1\n`, '', 'second --var item before more options', true],
+        [`wrangler dev --var "${firPrefixes}:${jd}, ${je}"\n`, `${jd}, ${je}`, 'quoted --var with a blank', true],
+      ],
+      pass: [
+        [`wrangler dev --var ${firPrefixes}:QC,XA --port 1\n`, 'synthetic NAME:list', false],
+      ],
+    },
+    'onfreq-coordinator-name-colon': {
+      block: [
+        [`wrangler dev --var ${coordinatorName}:${name}\n`, name, 'wrangler --var NAME:value', true],
+      ],
+      pass: [
+        [`wrangler dev --var ${coordinatorName}:synthetic-x\n`, 'synthetic NAME:value', false],
+      ],
+    },
+  };
+}
+const settingsText = (line) => `# synthetic settings\n${line}# end\n`;
+
+test('each NX5-L2 rule and change is needed: its cases pass without the rule or flip with its earlier text (NX5-L2)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    for (const [id, { block, pass }] of Object.entries(l2Cases())) {
+      commitRules(f, withoutRule(repoRules(), id));
+      let scan = scanCommit(f, block.map(([line]) => settingsText(line)).join(''));
+      assert.equal(scan.status, 0, `${id} removed: ${scan.stderr}`);
+      if (!l2Texts[id]) continue;
+      commitRules(f, beforeL2(repoRules(), id));
+      const needed = block.filter((item) => item[3]);
+      if (needed.length) {
+        scan = scanCommit(f, needed.map(([line]) => settingsText(line)).join(''));
+        assert.equal(scan.status, 0, `${id} before NX5-L2: ${scan.stderr}`);
+      }
+      for (const [line, label] of pass.filter((item) => item[2])) {
+        scan = scanCommit(f, settingsText(line));
+        assert.equal(scan.status, 1, `${id} before NX5-L2 blocks ${label}: ${scan.stderr}`);
+      }
+    }
+  });
+
+test('the repository Gitleaks rules block NX5-L2 callsign, policy link, FIR prefix and coordinator forms, redacted (NX5-L2)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const { block } of Object.values(l2Cases())) {
+      for (const [line, secret, label] of block) {
+        const { hook, scan } = scanAssignment(f, settingsText(line));
+        for (const result of [...hook, scan]) {
+          assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+          if (secret) assert.ok(!(result.stderr + result.stdout).includes(secret), label);
+        }
+      }
+    }
+  });
+
+test('the repository Gitleaks rules pass NX5-L2 synthetic, reference and shell-separated forms (NX5-L2)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const { pass } of Object.values(l2Cases())) {
+      for (const [line, label] of pass) {
+        const { hook, scan } = scanAssignment(f, settingsText(line));
+        for (const result of [...hook, scan]) assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+      }
+    }
+  });
+
 // The configuration without one rule and its allowlist.
 function withoutRule(rules, id) {
   const text = rules.toString();
@@ -2264,15 +2444,12 @@ function withoutRule(rules, id) {
   return text.slice(0, start) + (next < 0 ? '' : text.slice(next + 1));
 }
 // The configuration with the callsign rule's regex as before NX4-G1: ASCII
-// blanks before the list and items of letters, digits and underscores.
+// blanks before the list and around commas, and items of letters, digits and
+// underscores. Its allowlist is the current one (NX5-L2), which every NX4-G1
+// case's previous match passes.
 function previousCallsignRule(rules) {
-  const item = String.raw`[^\s,"'` + '`' + String.raw`;)}\]]*`;
-  const lines = rules.toString().split('\n');
-  const at = lines.findIndex((line) => line.startsWith(String.raw`regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b`));
-  assert.equal(lines[at].split(item).length, 3);
-  lines[at] = lines[at].replace(String.raw`[ \t\p{Zs}\x{FEFF}]*(`, String.raw`[ \t]*(`).replaceAll(item, '[A-Za-z0-9_]*');
-  assert.ok(!lines[at].includes('p{Zs}') && !lines[at].includes(item), 'previous callsign regex');
-  return lines.join('\n');
+  return editRule(rules, 'onfreq-excluded-callsigns-assignment', [['regex', callsignRegex,
+    String.raw`${callsignHead}[ \t]*([A-Za-z0-9]+_[A-Za-z0-9_]*(?:[ \t]*,[ \t]*[A-Za-z0-9_]*)*)'''`]]);
 }
 // Commits `text` without the hook and returns secret-scan.sh over that commit alone.
 function scanCommit(f, text) {
@@ -2323,11 +2500,11 @@ test('the repository Gitleaks rules pass every tracked line naming these setting
     // The rules file itself, as committed.
     assert.equal(secretScan(f, 'HEAD^!').status, 0);
     const root = fileURLToPath(new URL('..', import.meta.url));
-    const grep = spawnSync('git', ['grep', '-h', '-I', '-i', '-E', 'GCA_POLICY_URL|EXCLUDED_CALLSIGNS|FIR_PREFIXES'],
+    const grep = spawnSync('git', ['grep', '-h', '-I', '-i', '-E', 'GCA_POLICY_URL|EXCLUDED_CALLSIGNS|FIR_PREFIXES|COORDINATOR_NAME'],
       { cwd: root, env: gitEnv(), encoding: 'utf8' });
     assert.equal(grep.status, 0, grep.stderr);
     const tracked = grep.stdout;
-    for (const name of [firPrefixes, callsignsName, policyUrlName]) assert.ok(tracked.includes(`${name}: '`), name);
+    for (const name of [firPrefixes, callsignsName, policyUrlName, coordinatorName]) assert.ok(tracked.includes(`${name}: '`), name);
     const address = ['owner', 'example.test'].join('@');
     const jd = jPrefix('D');
     const text = tracked

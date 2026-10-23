@@ -101,18 +101,20 @@ regexTarget = "secret"
 regexes = ['''(?i)^\s*[QX][A-Z]{0,3}(?:\s*,\s*[QX][A-Z]{0,3})*\s*,?\s*$''']
 
 # FIR prefixes anywhere else on a line, with the exact uppercase name: a quoted
-# list of one to four letter items (blanks, including Unicode spaces, allowed
-# inside the quotes) whose first item does not start with Q or X, as in
-# TypeScript, JSON, YAML or PowerShell (real lists have no Q or X item); an
-# unquoted uppercase list that ends the line, as in YAML or a compose list
-# item; or NAME=list without blanks, as after env or A=1. So code
-# (`NAME: prefixes`), names in prose and `wrangler secret put` pass, and so do
-# values that are not prefix lists. Lists of Q and X items, with empty items,
-# are synthetic.
+# list of one to four letter items (blanks allowed inside the quotes: tab, VT,
+# FF, CR, space, Unicode spaces, a byte order mark and the line and paragraph
+# separators) whose first item does not start with Q or X, as in TypeScript,
+# JSON, YAML or PowerShell (real lists have no Q or X item); an unquoted
+# uppercase list that ends the line, as in YAML or a compose list item;
+# NAME=list without blanks, as after env or A=1; or NAME:list, as in
+# `wrangler dev --var NAME:list`, with items in either case, up to a blank,
+# quote, ;, &, | or ). So code (`NAME: prefixes`), names in prose and
+# `wrangler secret put` pass, and so do values that are not prefix lists. Lists
+# of Q and X items, with empty items, are synthetic.
 [[rules]]
 id = "onfreq-fir-prefixes-property"
 description = "onfreq FIR_PREFIXES assigned a prefix list"
-regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(?:["'`]([\t \p{Zs}\x{FEFF}]*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:[\t \p{Zs}\x{FEFF}]*,[\t \p{Zs}\x{FEFF}]*[A-Za-z]{0,4})*[\t \p{Zs}\x{FEFF}]*)["'`]|([A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)[ \t\r]*(?:#[^\n]*)?$)|\bFIR_PREFIXES=([A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[ \t\r;&|)]|$)'''
+regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(?:["'`]([\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*[A-Za-z]{0,4})*[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*)["'`]|([A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)[ \t\r]*(?:#[^\n]*)?$)|\bFIR_PREFIXES=([A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[ \t\r;&|)]|$)|\bFIR_PREFIXES:([A-Za-z]{1,4}(?:[ \t]*,[ \t]*[A-Za-z]{0,4})*)(?:[\s"'`;&|)]|$)'''
 keywords = ["fir_prefixes"]
 
 [[rules.allowlists]]
@@ -125,6 +127,20 @@ regexes = ['''(?i)^\s*[QX][A-Z]{0,3}(?:\s*,\s*(?:[QX][A-Z]{0,3})?)*\s*$''']
 id = "onfreq-coordinator-name-assignment"
 description = "onfreq COORDINATOR_NAME assigned a value"
 regex = '''(?m)^[+]?\s*(?:export\s+)?COORDINATOR_NAME\s*=[ \t]*(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([^\s"'`#](?:[^#\n]*[^\s#])?))'''
+keywords = ["coordinator_name"]
+
+[[rules.allowlists]]
+description = "Synthetic coordinator names"
+regexTarget = "secret"
+regexes = ['''^synthetic[-A-Za-z0-9]*$''']
+
+# The coordinator name as NAME:value, as in `wrangler dev --var NAME:value`,
+# anywhere on a line, with the exact uppercase name, up to a blank, quote, #, ;,
+# &, | or ). Code and JSON (`NAME: value`, `"NAME":`) have no such form.
+[[rules]]
+id = "onfreq-coordinator-name-colon"
+description = "onfreq COORDINATOR_NAME passed as NAME:value"
+regex = '''\bCOORDINATOR_NAME:([^\s"'`#;&|)]+)'''
 keywords = ["coordinator_name"]
 
 [[rules.allowlists]]
@@ -151,23 +167,28 @@ regexes = [
   '''^0+(?:-0+)*$''',
 ]
 
-# Excluded callsigns: a comma list on one line whose first item contains an
-# underscore, as callsigns do, so a variable (`EXCLUDED_CALLSIGNS: a,`) passes.
-# Leading blanks may include Unicode spaces and a byte order mark; an item runs
-# to a blank, comma, quote, semicolon or closing bracket, so a dash, dot or
-# Unicode space inside an item cannot end the list early.
-# Synthetic callsigns start with Q or X, which no ICAO region uses.
+# Excluded callsigns: a comma list on one line whose first item has letters,
+# digits or dashes before an underscore, as callsigns do, so a variable
+# (`EXCLUDED_CALLSIGNS: a,`) or reference (`env.EXCLUDED_CALLSIGNS`) passes.
+# Blanks before the list and around commas are tab, VT, FF, CR, space, Unicode
+# spaces, a byte order mark and the line and paragraph separators; an item runs
+# to an ASCII blank, comma, quote, semicolon or closing bracket, so a dash, dot,
+# < or Unicode space inside an item cannot end the list early.
+# Synthetic callsigns start with Q or X, which no ICAO region uses: every item
+# does, and runs to a comma or any of those blanks, so trailing text such as a
+# full stop or </code> after a synthetic item passes while a blank inside one
+# does not.
 [[rules]]
 id = "onfreq-excluded-callsigns-assignment"
 description = "onfreq EXCLUDED_CALLSIGNS assigned a callsign list"
-regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*["'`]?[ \t\p{Zs}\x{FEFF}]*([A-Za-z0-9]+_[^\s,"'`;)}\]]*(?:[ \t]*,[ \t]*[^\s,"'`;)}\]]*)*)'''
+regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*["'`]?[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*([A-Za-z0-9-]+_[^\s,"'`;)}\]]*(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*[^\s,"'`;)}\]]*)*)'''
 secretGroup = 1
 keywords = ["excluded_callsigns"]
 
 [[rules.allowlists]]
 description = "Synthetic callsigns only, across the whole list"
 regexTarget = "secret"
-regexes = ['''(?i)^[QX][A-Z0-9_]*(?:[ \t]*,[ \t]*(?:[QX][A-Z0-9_]*)?)*$''']
+regexes = ['''(?i)^[QX][^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*(?:[QX][^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*)?)*[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*$''']
 
 # The GCA policy link: any scheme://URL. Only hosts under the reserved .test,
 # .example and .invalid domains pass, ending the URL or followed by a path,
@@ -188,12 +209,15 @@ regexes = ['''(?i)^https?://(?:[a-z0-9-]+\.)*(?:test|example|invalid)(?:[/?#]\S*
 # A quote, backtick or backslash inside the userinfo ends the rule above's
 # match early, so a reserved host before it could pass: x.test"@host, as shell
 # quoting joins it. This rule flags a link whose userinfo holds one of them
-# before an @, with no allowlist. A quote followed by a blank or comma ends the
-# link, so a later JSON field or comment holding an address passes.
+# before an @, with no allowlist, with one branch per opener: none, ", ' or a
+# backtick. A blank or comma ends the link, so a later JSON field or comment
+# holding an address passes; so does a ; or & right after the opener's closing
+# quote, which ends the shell word (`"<link>";NEXT=1`, `"<link>"&&next`), and
+# an @ right after a closing backtick, as after command substitution.
 [[rules]]
 id = "onfreq-gca-policy-url-quoted-userinfo"
 description = "onfreq GCA_POLICY_URL with quoted userinfo"
-regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*["'`]?[ \t]*([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*["'`\\][A-Za-z0-9._~%!$&*+;=:"'`\\-]*@[^\s"'`]*)'''
+regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*["'`\\][A-Za-z0-9._~%!$&*+;=:"'`\\-]*@[^\s"'`]*|"[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:"(?:[A-Za-z0-9._~%!$*+=:"'`\\-][A-Za-z0-9._~%!$&*+;=:"'`\\-]*)?|['`\\][A-Za-z0-9._~%!$&*+;=:"'`\\-]*)@[^\s"'`]*|'[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:'(?:[A-Za-z0-9._~%!$*+=:"'`\\-][A-Za-z0-9._~%!$&*+;=:"'`\\-]*)?|["`\\][A-Za-z0-9._~%!$&*+;=:"'`\\-]*)@[^\s"'`]*|`[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:`[A-Za-z0-9._~%!$*+=:"'`\\-][A-Za-z0-9._~%!$&*+;=:"'`\\-]*|["'\\][A-Za-z0-9._~%!$&*+;=:"'`\\-]*)@[^\s"'`]*)'''
 secretGroup = 1
 keywords = ["gca_policy_url"]
 
@@ -202,14 +226,18 @@ keywords = ["gca_policy_url"]
 # pretty-printed JSON first line that ends in a value rather than a bracket,
 # comma or colon are not covered. Neither are values that start on a later line
 # (a bracket on the next line or a YAML block scalar), escaped or encoded
-# setting names, a coordinator name anywhere but at the start of a dotenv or
-# shell line (env NAME=, A=1 NAME=, PowerShell, compose list items), or FIR
-# prefixes there unquoted, unless as NAME=list or an uppercase list that ends
-# the line.
+# setting names, a coordinator name as NAME=value anywhere but at the start of a
+# dotenv or shell line (env NAME=, A=1 NAME=, PowerShell, compose list items;
+# NAME:value is covered), or FIR prefixes there unquoted, unless as NAME=list,
+# NAME:list or an uppercase list that ends the line.
 # Neither is a quoted FIR prefix list whose first item starts with Q or X.
 # Identifying settings are missed as a quoted IVAO client ID shorter than eight
 # characters or an unquoted one without a digit, a callsign list whose first
-# item has no underscore, and a policy link without a scheme. Gitleaks' default
+# item has no underscore or a dot before it (so env.NAME references pass), and
+# a policy link without a scheme. Shell quoting that joins a synthetic quoted
+# first item to the rest (NAME="QCXX_CTR",<item> or FIR_PREFIXES="QX",<item>),
+# blanks written as escapes ("\t<item>", $'\f<item>') and Unicode letters
+# that uppercase to Latin ones are not covered either. Gitleaks' default
 # global allowlist passes values that start with "true", contain "false" or
 # end with "null" (any case), $VAR-style templates, one repeated character and
 # system paths; it cannot be removed while the default rules are extended.
