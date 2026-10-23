@@ -17,7 +17,10 @@
 # header, so commit messages are emitted as their stored bytes; re-encoding, for
 # example from a UTF-16 header, could turn an ASCII key into other characters.
 # Git refuses NUL in messages, so the stored bytes are ASCII-compatible for the
-# scanner. Gitleaks redacts findings.
+# scanner. --no-show-signature keeps log.showSignature from adding signature
+# check output to the commit headers. The filter neutralizes the Gitleaks
+# inline allow marker in commit and diff headers (author names, paths), so only
+# an added line or the message can allow a finding. Gitleaks redacts findings.
 #
 # Gitleaks reads its input in chunks of up to 100 KB, extending each by at most
 # 25 KB to a blank line, and skips the whole input when the first chunk looks
@@ -65,7 +68,7 @@ fi
 preamble() { LC_ALL=C awk 'BEGIN { for (i = 0; i < 1200; i++) print "# onfreq secret-scan preamble" }' </dev/null; }
 status=0
 { { preamble &&
-    git log --pretty=medium --encoding=none -p -U0 --inter-hunk-context=0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null; } ||
+    git log --pretty=medium --no-show-signature --encoding=none -p -U0 --inter-hunk-context=0 --root --no-ext-diff --no-textconv --text --no-color --diff-merges=separate "$@" -- </dev/null; } ||
     : >"$tmp/failed"; } |
   { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
   { LC_ALL=C tr '\000' ' ' || : >"$tmp/failed"; } |

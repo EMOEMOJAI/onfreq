@@ -89,14 +89,16 @@ EOF
 # change the Gitleaks settings, add or remove a gitleaks:allow line, or carry
 # gitleaks:allow in their message, author name or email (as stored, %an/%ae,
 # and mailmapped, %aN/%aE) or a changed path (--name-status prints both paths
-# of a rename or copy). The scan reads all of these and honours the marker on
-# any line, so a push can relax its own scan; they are named for review. The
-# committer is not printed by the scan, so it is not checked. Messages use the
-# stored bytes (--encoding=none), as the scan does, so an encoding header or
-# i18n.logOutputEncoding cannot hide the marker there; the match ignores case.
-# Git still re-encodes %an/%ae/%aN/%aE from the commit's encoding header to
-# UTF-8, so an ASCII-incompatible header such as UTF-16 can hide the marker in
-# a name or email (an accepted limit). As in the scan, a merge's own diff
+# of a rename or copy). The scan honours the marker in an added line or a
+# message, so a push can relax its own scan; its stream filter neutralizes the
+# marker in commit and diff headers (author names, paths), and those commits
+# are still named for review. The committer is not printed by the scan, so it
+# is not checked. Messages use the stored bytes (--encoding=none), as the scan
+# does, so an encoding header or i18n.logOutputEncoding cannot hide the marker
+# there; the match ignores case. Git still re-encodes %an/%ae/%aN/%aE from the
+# commit's encoding header to UTF-8, so a header such as UTF-16 could hide the
+# marker in a name or email; the range privacy check below blocks every pushed
+# commit whose encoding header is not UTF-8. As in the scan, a merge's own diff
 # against each parent is included, whatever log.diffMerges says, so a change
 # only a merge resolution makes is named too; --no-patch keeps those diffs out
 # of the -G output.

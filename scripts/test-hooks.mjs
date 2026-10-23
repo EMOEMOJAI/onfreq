@@ -19,6 +19,8 @@ const hasGitleaks = spawnSync('gitleaks', ['version'], { stdio: 'ignore' }).stat
 const gitleaksSkip = !hasGitleaks && !process.env.CI && 'gitleaks is not installed';
 // A synthetic AWS-format key assembled at runtime, so this file never contains it.
 const syntheticKey = () => ['AKIA', 'Q7RZ', 'LX2M', 'NB4K', 'TWPJ'].join('');
+// Gitleaks' inline allow marker, assembled at runtime so this file's lines do not carry it.
+const allowMarker = ['gitleaks', 'allow'].join(':');
 
 // A synthetic repository with fake npm and gitleaks commands that record their
 // arguments (and, for gitleaks, the commits in the scanned log), so the hook's ref
@@ -1196,12 +1198,12 @@ test('privacy checks reject private emails anywhere in commit messages, however 
     f.git(...config, 'commit', '--quiet', '--no-verify', '--allow-empty', '-m', message);
     return f.git('rev-parse', 'HEAD');
   };
-  // Separator characters, URL handles and noreply identities in a message pass.
-  const clean = commit('synthetic\x1e\x1f\tsubject\n\nSee https://social.example/@person and pkg@1.2.3\x1e'
+  // Tabs, URL handles and noreply identities in a message pass.
+  const clean = commit('synthetic\tsubject\n\nSee https://social.example/@person and pkg@1.2.3'
     + '\n\nCo-Authored-By: Synthetic Model <noreply@anthropic.com>');
   assert.equal(check().status, 0, check().stderr);
   assert.equal(f.push([ref(clean)]).status, 0);
-  const head = commit(`synthetic\n\nContact ${person}\x1e\tfor access\x1f`);
+  const head = commit(`synthetic\n\nContact ${person}\tfor access`);
   for (const result of [check(), check('--range', head, zero, 'origin'), f.push([ref(head, 'refs/heads/main', clean)])]) {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /^[0-9a-f]{12}: commit message email must use a noreply address$/m);
@@ -1217,6 +1219,8 @@ test('privacy checks reject private emails anywhere in commit messages, however 
     for (const result of [check('--range', oid, base), f.push([ref(oid, 'refs/heads/main', base)])]) {
       assert.equal(result.status, 1, config.join(' '));
       assert.match(result.stderr, /^[0-9a-f]{12}: commit message email must use a noreply address$/m, config.join(' '));
+      // A non-UTF-8 encoding header now fails closed by itself too (NX-7 #10).
+      if (config.length) assert.match(result.stderr, /^[0-9a-f]{12}: commit encoding must be UTF-8$/m);
       assert.doesNotMatch(result.stderr + result.stdout, leaked);
     }
     base = oid;
@@ -1513,9 +1517,13 @@ function scanFilter(text) {
   const endsKey = (upper) => ['-----END', 'KEY-----', 'KEY BLOCK-----'].some((end) => upper.includes(end));
   const continues = (line) => /\\\r?$/.test(line);
   const out = [];
-  let run = false, key = false, bytes = 0;
+  let run = false, key = false, bytes = 0, header = false;
   const stop = () => { out.push(''); run = false; };
-  for (const line of text.replaceAll('\0', ' ').split('\n').slice(0, -1)) {
+  for (let line of text.replaceAll('\0', ' ').split('\n').slice(0, -1)) {
+    // Commit and diff header lines lose the allow marker (NX-7 #11).
+    if (/^commit [0-9a-f]+( |$)/.test(line) || /^diff --git /.test(line)) header = true;
+    else if (line === '' || /^@@ /.test(line)) header = false;
+    if (header) line = line.replaceAll(allowMarker, 'gitleaks-allow');
     const upper = line.toUpperCase();
     if (run && (line.length > 1024 || /^diff --git /.test(line) || /^commit [0-9a-f]+( |$)/.test(line) || startsKey(upper))) stop();
     if (run) {
@@ -1575,7 +1583,7 @@ function filteredOutput(f, args) {
   return result.stdout.split('\n').filter((line) => !line.startsWith('-'))
     .map((line) => line.replace(/^(@@ -[0-9][0-9,]* \+[0-9][0-9,]* @@).*/, '$1')).join('\n');
 }
-const scanLogArgs = ['log', '--pretty=medium', '--encoding=none', '-p', '-U0', '--inter-hunk-context=0', '--root',
+const scanLogArgs = ['log', '--pretty=medium', '--no-show-signature', '--encoding=none', '-p', '-U0', '--inter-hunk-context=0', '--root',
   '--no-ext-diff', '--no-textconv', '--text', '--no-color', '--diff-merges=separate'];
 const headStream = (f) => filteredOutput(f, [...scanLogArgs, '-1', 'HEAD', '--']);
 const stagedStream = (f) => filteredOutput(f, ['diff', '--cached', '-U0', '--inter-hunk-context=0', '--no-ext-diff',
@@ -2777,4 +2785,161 @@ test('each NX-7 rule change is needed: its cases pass with the 2.2.10 rule texts
     for (const [line, , label] of block.filter((item) => !item[3].length)) {
       assert.equal(scanCommit(f, settingsText(line)).status, 1, label);
     }
+  });
+
+// NX-7 #10: the commit email check reads `git log` placeholders, which Git
+// converts from the commit's encoding header, and splits rows on \x1e and
+// trailers on \x1f. Flagged addresses are assembled at runtime on reserved hosts.
+test('privacy checks block underscore-wrapped addresses, split trailers and non-UTF-8 encoding headers (NX-7 #10)', (t) => {
+  const f = fixture(t, { realRange: true });
+  const env = isolatedEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+  const check = (...args) => spawnSync(process.execPath, ['scripts/check-privacy.mjs', ...args], { cwd: f.repo, env, encoding: 'utf8' });
+  const at = (local, domain) => [local, domain].join('@');
+  const leaked = /person|private\.test|localhost|Hb\.Ec|ISO-2022|UTF-7/;
+  let base = f.head;
+  const commit = (message, config = []) => {
+    f.git(...config, 'commit', '--quiet', '--no-verify', '--allow-empty', '-m', message);
+    return f.git('rev-parse', 'HEAD');
+  };
+  const expect = (oid, status, error, label) => {
+    for (const result of [check('--range', oid, base), f.push([ref(oid, 'refs/heads/main', base)])]) {
+      assert.equal(result.status, status, `${label}: ${result.stderr}`);
+      if (error) assert.match(result.stderr, error, label);
+      assert.doesNotMatch(result.stderr + result.stdout, leaked, label);
+    }
+    if (!status) base = oid;
+    else f.git('reset', '--quiet', '--hard', base);
+  };
+  const messageError = /^[0-9a-f]{12}: commit message email must use a noreply address$/m;
+  const parseError = /^commit log could not be parsed$/m;
+  const encodingError = /^[0-9a-f]{12}: commit encoding must be UTF-8$/m;
+  // Passes: versions and noreply identities before an underscore, an ordinary
+  // message, and a stored UTF-8 encoding header (Git writes none for UTF-8, so
+  // that commit object is written directly).
+  expect(commit(`synthetic\n\nBump pkg@1.2.3_ and ${at('noreply', 'github.com')}_ please`), 0, null, 'versions');
+  expect(commit('synthetic\n\nAn ordinary message.'), 0, null, 'ordinary');
+  const tree = f.git('rev-parse', 'HEAD^{tree}');
+  const ident = `Synthetic <synthetic@users.noreply.github.com> 1700000000 +0000`;
+  const raw = `tree ${tree}\nparent ${base}\nauthor ${ident}\ncommitter ${ident}\nencoding UTF-8\n\nsynthetic utf-8 header\n`;
+  const written = spawnSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], { cwd: f.repo, env, input: raw, encoding: 'utf8' });
+  assert.equal(written.status, 0, written.stderr);
+  const utf8 = written.stdout.trim();
+  f.git('reset', '--quiet', '--hard', utf8);
+  assert.match(f.git('log', '-1', '--format=%e', utf8), /^UTF-8$/);
+  expect(utf8, 0, null, 'UTF-8 header');
+  // 10a: an address followed by an underscore was not matched at all.
+  expect(commit(`synthetic\n\nContact _${at('person', 'private.test')}_ please`), 1, messageError, 'underscore');
+  // 10b: a \x1e in a trailer moved the dotless address after it out of the
+  // trailer check; a \x1f split the trailer token before its @.
+  expect(commit(`synthetic\n\nSigned-off-by: x\x1e${at('person', 'localhost')}`), 1, parseError, 'record separator');
+  expect(commit(`synthetic\n\nCo-authored-by: person\x1f${at('', 'localhost')}`), 1, parseError, 'unit separator');
+  // 10c: ISO-2022-JP shift sequences turn the ASCII address bytes into other
+  // characters in the converted message, so the address was not seen.
+  const hidden = `synthetic\n\nContact \x1b$B${at('Ka', 'Hb.Ec')}\x1b(B now`;
+  const iso = commit(hidden, ['-c', 'i18n.commitEncoding=ISO-2022-JP']);
+  assert.match(f.git('cat-file', 'commit', iso), /^encoding ISO-2022-JP$/m);
+  assert.ok(f.git('cat-file', 'commit', iso).includes(at('Ka', 'Hb.Ec')), 'precondition: stored bytes hold the address');
+  assert.ok(!f.git('log', '-1', '--format=%B', iso).includes('@'), 'precondition: the converted message hides it');
+  expect(iso, 1, encodingError, 'ISO-2022-JP');
+  for (const encoding of ['UTF-7', 'UTF-16']) {
+    expect(commit(`synthetic\n\nContact +${at('personal', 'private.test')}`, ['-c', `i18n.commitEncoding=${encoding}`]),
+      1, encodingError, encoding);
+  }
+});
+
+// NX-7 #11: Gitleaks skips a finding whose lines hold its allow marker, and a
+// finding can start in a commit or diff header line.
+test('the stream filter neutralizes the allow marker in commit and diff headers only (NX-7 #11)', (t) => {
+  const f = fixture(t);
+  const saved = join(f.repo, '..', 'stream.txt');
+  const marked = `notes ${allowMarker}.txt`;
+  writeFileSync(join(f.repo, marked), `x = 1 # ${allowMarker}\n`);
+  f.git('add', marked);
+  let result = f.commitHook({ extraEnv: { GITLEAKS_STDIN: saved } });
+  assert.equal(result.status, 0, result.stderr);
+  let stream = readFileSync(saved, 'utf8');
+  assertScanStream(stream, 'pre-commit', stagedStream(f));
+  assert.ok(stream.includes('\ndiff --git a/notes gitleaks-allow.txt b/notes gitleaks-allow.txt\n'), 'pre-commit path');
+  // Git ends a ---/+++ path holding a space with a tab.
+  assert.match(stream, /^\+\+\+ b\/notes gitleaks-allow\.txt\t?$/m, 'pre-commit +++ path');
+  assert.ok(stream.includes(`\n+x = 1 # ${allowMarker}\n`), 'pre-commit added line');
+  rmSync(saved);
+  f.git('-c', `user.name=Synthetic ${allowMarker}`, 'commit', '--quiet', '--no-verify', '-m', `subject ${allowMarker}`);
+  const head = f.git('rev-parse', 'HEAD');
+  result = f.push([ref(head, 'refs/heads/main', f.head)], undefined, { GITLEAKS_STDIN: saved });
+  assert.equal(result.status, 0, result.stderr);
+  stream = readFileSync(saved, 'utf8');
+  assertScanStream(stream, 'secret-scan', filteredOutput(f, [...scanLogArgs, head, '--not', f.head, '--']));
+  assert.ok(stream.includes('\nAuthor: Synthetic gitleaks-allow <'), 'author name');
+  assert.ok(stream.includes('\ndiff --git a/notes gitleaks-allow.txt b/notes gitleaks-allow.txt\n'), 'path');
+  assert.ok(stream.includes(`\n+x = 1 # ${allowMarker}\n`), 'added line');
+  assert.ok(stream.includes(`\n    subject ${allowMarker}\n`), 'message');
+});
+
+test('an allow marker in an author name or a path no longer hides a finding from the scans (NX-7 #11)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const base = f.git('rev-parse', 'HEAD');
+    // 1. The author name opens a private key that the message completes; the
+    // key is generated now, and its BEGIN line is only in the author name.
+    const body = privateKeyPem().split('\n').filter((line) => line && !line.startsWith('-----BEGIN')).join('\n');
+    const shown = (result) => (result.stderr + result.stdout).includes(body.split('\n')[3]);
+    f.git('-c', `user.name=Synthetic -----BEGIN PRIVATE KEY----- ${allowMarker}`, 'commit', '--quiet', '--no-verify',
+      '--allow-empty', '-m', 'synthetic subject', '-m', body);
+    const author = f.git('rev-parse', 'HEAD');
+    let result = secretScan(f, `${author}^!`);
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(!shown(result));
+    result = f.push([ref(author, 'refs/heads/main', base)]);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /the secret scan failed or found a secret in the pushed commits/);
+    assert.ok(!shown(result));
+    // 2. A path holding the marker and a secret-named value.
+    const value = randomBytes(12).toString('hex');
+    const path = `${['POLL', 'SECRET'].join('_')}=${value} ${allowMarker}.txt`;
+    writeFileSync(join(f.repo, path), 'x\n');
+    f.git('add', '--', path);
+    for (const hook of [f.commitHook(), f.commitHook({ commit: true })]) {
+      assert.equal(hook.status, 1, hook.stderr);
+      assert.doesNotMatch(hook.stderr + hook.stdout, new RegExp(value));
+    }
+    f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic path');
+    const pathCommit = f.git('rev-parse', 'HEAD');
+    result = secretScan(f, `${pathCommit}^!`);
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stderr + result.stdout, new RegExp(value));
+    // 3. Passes: an added line with a trailing allow comment, and a marker path without a finding.
+    writeFileSync(join(f.repo, 'allowed.env'), `${['POLL', 'SECRET'].join('_')}=${randomBytes(12).toString('hex')} # ${allowMarker}\n`);
+    writeFileSync(join(f.repo, `notes-${allowMarker}.txt`), 'plain\n');
+    f.git('add', 'allowed.env', `notes-${allowMarker}.txt`);
+    assert.equal(f.commitHook().status, 0);
+    result = f.commitHook({ commit: true });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(secretScan(f, 'HEAD^!').status, 0);
+    // 4. Each block case passes the scan with the header replacement removed from the filter.
+    const filter = join(f.repo, 'scripts', 'hooks', 'lib', 'scan-stream.awk');
+    const current = readFileSync(filter, 'utf8');
+    const without = current.replace('  if (header) gsub(allow_marker, "gitleaks-allow")\n', '');
+    assert.notEqual(without, current);
+    writeFileSync(filter, without);
+    for (const commit of [author, pathCommit]) assert.equal(secretScan(f, `${commit}^!`).status, 0, commit);
+  });
+
+test('the secret scan ignores log.showSignature, so signature checks add no header lines (NX-7 #11)',
+  { skip: spawnSync('ssh-keygen', ['-?'], { stdio: 'ignore' }).error && 'ssh-keygen is not installed' }, (t) => {
+    const f = fixture(t);
+    const key = join(f.repo, '..', 'signing-key');
+    assert.equal(spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'synthetic', '-f', key]).status, 0);
+    writeFileSync(join(f.repo, 'public.txt'), 'signed\n');
+    f.git('-c', 'gpg.format=ssh', '-c', `user.signingkey=${key}`, 'commit', '--quiet', '--no-verify', '-S', '-am', 'signed');
+    const head = f.git('rev-parse', 'HEAD');
+    f.git('config', 'log.showSignature', 'true');
+    f.git('config', 'gpg.format', 'ssh');
+    const saved = join(f.repo, '..', 'stream.txt');
+    const result = f.scan([`${head}^!`], { GITLEAKS_STDIN: saved });
+    assert.equal(result.status, 0, result.stderr);
+    const stream = readFileSync(saved, 'utf8');
+    assertScanStream(stream, 'secret-scan', filteredOutput(f, [...scanLogArgs, `${head}^!`, '--']));
+    assert.match(stream, new RegExp(`^commit ${head}\n\nAuthor: `, 'm'));
   });

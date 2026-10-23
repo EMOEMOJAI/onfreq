@@ -26,6 +26,15 @@
 # than 1 024 bytes, a diff --git or commit line, or a new key's BEGIN line; so
 # no stretch without a blank line in a run exceeds 17 409 bytes.
 #
+# Gitleaks skips a finding whose lines hold its inline allow marker (gitleaks,
+# a colon, allow), and a finding can start in a header line: an author name
+# can open a private key that the message completes, and a path can hold a
+# whole secret. So in header lines, from a commit or diff --git line to the
+# next empty or @@ line, the marker becomes the same-length gitleaks-allow;
+# added (+) lines and the indented message keep it, so an inline allow comment
+# there still works. The marker is built at run time, so this file does not
+# hold it and is not named by the pre-push allow-marker note.
+#
 # Known limits: a blank line inside a key, such as a PGP armor header gap in a
 # commit message, ends a chunk there; a key spread over several hunks is not
 # one run; and rules that match across lines, such as kubernetes-secret-yaml,
@@ -34,6 +43,8 @@
 # bytes between newlines fails the scan; compressed formats rarely do. A long
 # line that reaches published history fails every later history scan, CI's
 # included, until that history is rewritten: the scan fails closed.
+
+BEGIN { allow_marker = "gitleaks" ":" "allow" }
 
 function starts_key(upper, begin) {
   begin = index(upper, "-----BEGIN")
@@ -77,7 +88,12 @@ function header_path(rest, half, first, second) {
   if (/^commit [0-9a-f]+( |$)/) {
     commit = $2
     path = ""
-  } else if (/^diff --git /) path = header_path(substr($0, 12))
+    header = 1
+  } else if (/^diff --git /) {
+    path = header_path(substr($0, 12))
+    header = 1
+  } else if ($0 == "" || /^@@ /) header = 0
+  if (header) gsub(allow_marker, "gitleaks-allow")
   if (n > 20000 && !long++) {
     long_bytes = n
     long_source = source()

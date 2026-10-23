@@ -153,7 +153,8 @@ test('range mode parses diff-tree rows and fails closed on unparseable output (S
 });
 
 test('checks commit trailer emails, allowing only noreply identities, and redacts them (T1-5)', () => {
-  const row = (trailers) => ['c'.repeat(40), '1+example@users.noreply.github.com', 'noreply@github.com', trailers].join('\t');
+  // The fourth field is the encoding header, empty when the commit has none.
+  const row = (trailers) => ['c'.repeat(40), '1+example@users.noreply.github.com', 'noreply@github.com', '', trailers].join('\t');
   const allowed = ['Co-Authored-By: Synthetic Model <noreply@anthropic.com>',
     'Co-authored-by: Example <2+example@users.noreply.github.com>', 'Signed-off-by: GitHub <noreply@github.com>'];
   assert.deepEqual(privateCommitEmails([row(''), row(allowed.join('\x1f')), ''].join('\0')), []);
@@ -184,7 +185,7 @@ test('checks commit trailer emails, allowing only noreply identities, and redact
   }
   assert.equal(privateCommitEmails(['d'.repeat(40), 'noreply@anthropic.com', 'noreply@anthropic.com', ''].join('\t')).length, 1);
   // Author and trailer failures are reported separately.
-  assert.equal(privateCommitEmails(['e'.repeat(40), 'person@example.test', 'noreply@github.com',
+  assert.equal(privateCommitEmails(['e'.repeat(40), 'person@example.test', 'noreply@github.com', '',
     'Co-authored-by: Person <person@example.test>'].join('\t')).length, 2);
 });
 
@@ -205,8 +206,8 @@ test('checks every address in the commit message, allowing only noreply identiti
   const at = (local, domain) => [local, domain].join('@');
   const person = at('person', 'example.invalid');
   const hash = 'c'.repeat(40);
-  const row = (message, trailers = '', author = '1+example@users.noreply.github.com') =>
-    `${[hash, author, 'noreply@github.com', trailers].join('\t')}\x1e${message}`;
+  const row = (message, trailers = '', author = '1+example@users.noreply.github.com', encoding = '') =>
+    `${[hash, author, 'noreply@github.com', encoding, trailers].join('\t')}\x1e${message}`;
   const messageError = `${'c'.repeat(12)}: commit message email must use a noreply address`;
   const trailerError = `${'c'.repeat(12)}: commit trailer email must use a noreply address`;
   const authorError = `${'c'.repeat(12)}: commit email must use GitHub noreply`;
@@ -219,7 +220,9 @@ test('checks every address in the commit message, allowing only noreply identiti
   for (const message of [`${person} subject`, `subject\n\n${person.toUpperCase()}`, `subject\n\n<${person}>.`,
     `subject\n\n${at('noreply', 'anthropic.com.example.invalid')}`, `subject\n\n${at('x.noreply', 'anthropic.com')}`,
     `subject\n\nmailto:${person}`, `subject\n\nhttps://a.example/u/${person}`, `subject\n\nhttps://a.example/@${person}`,
-    `subject\n\n${at('first.last+tag', 'mail.private.example.org')}`]) {
+    `subject\n\n${at('first.last+tag', 'mail.private.example.org')}`,
+    // An address inside _emphasis_ or followed by another non-alphanumeric word character (NX-7 #10).
+    `subject\n\n_${at('person', 'host.test')}_`, `subject\n\n${person}_x`]) {
     failures = privateCommitEmails(row(message));
     assert.deepEqual(failures, [messageError], message);
     redacted(failures, message);
@@ -227,6 +230,7 @@ test('checks every address in the commit message, allowing only noreply identiti
   // URL handle paths, person/@domain text, versions and noreply identities are not flagged.
   for (const message of ['subject\n\nSee https://x.example/@person', 'subject\n\nperson/@domain and `/@`',
     'subject\n\nBump pkg@1.2.3 and actions/checkout@v4.2.2', 'Thanks noreply@anthropic.com',
+    'subject\n\nBump pkg@1.2.3_ and noreply@github.com_ and noreply@github.com_x',
     'subject\n\nCo-authored-by: Example <123+name@users.noreply.github.com>',
     'subject\n\nCo-Authored-By: Synthetic Model <noreply@anthropic.com>\nMerged-by: noreply@github.com\n', '']) {
     assert.deepEqual(privateCommitEmails(row(message)), [], message);
@@ -236,28 +240,45 @@ test('checks every address in the commit message, allowing only noreply identiti
   failures = privateCommitEmails(row(`subject\n\n${trailer}\n`, trailer));
   assert.deepEqual(failures, [trailerError, messageError]);
   redacted(failures);
-  // 3. Tabs, \x1f and \x1e in the message do not break parsing; author and trailer checks still apply.
-  const odd = `subject\t\x1f\x1e\n\nbody\twith\x1fseparators\x1e and more\n`;
+  // 3. Tabs in the message do not break parsing; author and trailer checks still apply.
+  const odd = `subject\twith tab\n\nbody\twith\ttabs and more\n`;
   assert.deepEqual(privateCommitEmails(row(odd)), []);
   assert.deepEqual(privateCommitEmails([row(odd), row(`${odd}${person}`)].join('\0')), [messageError]);
   assert.deepEqual(privateCommitEmails(row(odd, '', at('person', 'users.noreply.github.com.example.invalid'))), [authorError]);
   assert.deepEqual(privateCommitEmails(row(odd, trailer)), [trailerError]);
-  // A trailer value holding \x1e: the trailer check covers the part before it, the message check the rest.
-  assert.deepEqual(privateCommitEmails(row('subject', `Link: x\x1e${person}`)), [messageError]);
-  assert.deepEqual(privateCommitEmails(row('subject', `Signed-off-by: ${person}\x1ex`)), [trailerError]);
-  // Rows without a commit hash fail closed without echoing the log text.
-  for (const bad of [`${person}\tx\ty`, `${'c'.repeat(39)}\t${person}`, `${'C'.repeat(40)}\tx`, `${'c'.repeat(41)}\x1e${person}`]) {
+  // Rows without a commit hash, and rows whose message (trailers included) holds
+  // \x1e or \x1f, fail closed without echoing the log text. A separator in a
+  // trailer value moved the rest of it out of the trailer check, where a dotless
+  // host is not an address (NX-7 #10).
+  const dotless = at('person', 'localhost');
+  for (const bad of [`${person}\tx\ty`, `${'c'.repeat(39)}\t${person}`, `${'C'.repeat(40)}\tx`, `${'c'.repeat(41)}\x1e${person}`,
+    row(`subject\n\nSigned-off-by: x\x1e${dotless}\n`, `Signed-off-by: x\x1e${dotless}`),
+    row(`subject\n\nCo-authored-by: person\x1f@localhost\n`, 'Co-authored-by: person\x1f@localhost'),
+    row(`subject\n\nLink: x\x1e${person}\n`, `Link: x\x1e${person}`), row('subject\x1e'), row('subject\n\nbody\x1fx')]) {
     failures = privateCommitEmails(bad);
     assert.deepEqual(failures, ['commit log could not be parsed'], JSON.stringify(bad));
     redacted(failures);
   }
   assert.deepEqual(privateCommitEmails(row('subject').replace(hash, 'd'.repeat(64))), []);
+  // 4. Placeholders are converted from the encoding header, so any header but
+  // UTF-8 fails closed without naming it (NX-7 #10); none or UTF-8 passes.
+  const encodingError = `${'c'.repeat(12)}: commit encoding must be UTF-8`;
+  for (const encoding of ['', 'UTF-8', 'utf-8', 'utf8', 'UTF8']) {
+    assert.deepEqual(privateCommitEmails(row('subject', '', undefined, encoding)), [], encoding);
+  }
+  for (const encoding of ['ISO-2022-JP', 'UTF-7', 'UTF-16', 'UTF-16LE', 'ISO-8859-1', 'UTF-8 ', ' UTF-8', 'UTF-88', 'x-utf-8']) {
+    failures = privateCommitEmails(row('subject', '', undefined, encoding));
+    assert.deepEqual(failures, [encodingError], encoding);
+    assert.doesNotMatch(failures.join(' '), /ISO|UTF-[17]|8859/, encoding);
+  }
+  // Other checks still run on such a commit.
+  assert.deepEqual(privateCommitEmails(row(`subject\n\n${person}`, '', undefined, 'ISO-8859-1')), [encodingError, messageError]);
 });
 
 test('address checks start only at a token, so a long token is checked in linear time (RA)', () => {
   const at = (local, domain) => [local, domain].join('@');
   const hash = 'c'.repeat(40);
-  const row = (message, trailers = '') => `${[hash, '1+example@users.noreply.github.com', 'noreply@github.com', trailers].join('\t')}\x1e${message}`;
+  const row = (message, trailers = '') => `${[hash, '1+example@users.noreply.github.com', 'noreply@github.com', '', trailers].join('\t')}\x1e${message}`;
   for (const token of ['a'.repeat(200000), 'a.'.repeat(100000), '1-'.repeat(100000), 'h'.repeat(199997) + '://x',
     `${'a'.repeat(199990)}@x`, `@${'a.'.repeat(99999)}`, 'a/'.repeat(100000)]) {
     for (const [message, trailers] of [[token, ''], ['subject', `Link: ${token}`]]) {

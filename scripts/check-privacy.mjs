@@ -114,19 +114,21 @@ export function imagePrivacy(file, data) {
 }
 
 /**
- * `git log -z` with COMMIT_EMAIL_FORMAT: hash, author email, committer email
- * and the message trailers, unfolded and separated by \x1f, then \x1e and the
- * whole message. Git forbids NUL in messages, so -z keeps rows
- * apart; a message (or trailer) may itself contain \x1e, so each row is split on
- * its first \x1e only and everything after it is message text.
+ * `git log -z` with COMMIT_EMAIL_FORMAT: hash, author email, committer email,
+ * the encoding header and the message trailers, unfolded and separated by
+ * \x1f, then \x1e and the whole message. Git forbids NUL in messages, so -z
+ * keeps rows apart. Each row is split on its first \x1e; a row with another
+ * \x1e, or a message holding \x1f, fails closed, as a separator inside a
+ * trailer would otherwise move part of it out of the trailer check.
  */
-export const COMMIT_EMAIL_FORMAT = '--format=%H%x09%ae%x09%ce%x09%(trailers:only,unfold,separator=%x1f)%x1e%B';
+export const COMMIT_EMAIL_FORMAT = '--format=%H%x09%ae%x09%ce%x09%e%x09%(trailers:only,unfold,separator=%x1f)%x1e%B';
 // `git log` arguments before the revisions: log.showSignature would add signature
 // lines that parse as commits, and --encoding=none stops i18n.logOutputEncoding
 // from re-encoding (and so breaking) the rows. --format placeholders are
-// still converted from a commit's encoding header to UTF-8: ASCII addresses
-// survive an ASCII-compatible encoding, and an ASCII-incompatible one (UTF-16)
-// garbles the author and committer too, so that commit fails closed.
+// still converted from a commit's encoding header to UTF-8, and a stateful or
+// ASCII-incompatible encoding (ISO-2022-JP, UTF-7, UTF-16) can turn ASCII
+// address bytes into other characters, so a commit whose encoding header is
+// not UTF-8 fails closed.
 export const COMMIT_EMAIL_LOG = ['log', '-z', '--no-show-signature', '--encoding=none', COMMIT_EMAIL_FORMAT];
 
 // GitHub creates merge commits with noreply@github.com as the committer; it is
@@ -143,15 +145,16 @@ const commitHash = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const urlHandles = (text) => text.replace(/(?<![a-z0-9+.-])([0-9+.-]*)([a-z][a-z0-9+.-]*:\/\/[^\s<>()"',;\x1f]*)/gi,
   (_, prefix, url) => `${prefix}${url.replaceAll('/@', '/')}`);
 // An address-shaped token with an alphabetic top-level domain, so versions such
-// as pkg@1.2.3 or checkout@v4.2.2 are not addresses. Known limits: non-ASCII,
-// quoted or obfuscated addresses, dotless hosts, addresses in author or
-// committer names, and, in a crafted commit object, text after a NUL or text
-// hidden by shift sequences of a stateful encoding header such as ISO-2022-JP.
+// as pkg@1.2.3 or checkout@v4.2.2 are not addresses. The domain ends before
+// any character but a letter or digit, so an address inside _emphasis_ counts.
+// Known limits: non-ASCII, quoted or obfuscated addresses, dotless hosts,
+// addresses in author or committer names, and, in a crafted commit object,
+// text after a NUL.
 // Each address is the run of local-part characters before an @, not reaching
 // back into the previous address, and the domain after it: the leftmost match
 // /[A-Za-z0-9._%+-]+@<domain>/g finds, without retrying every start of a run.
 const localChar = /[A-Za-z0-9._%+-]/;
-const domainPart = /[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/y;
+const domainPart = /[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?![A-Za-z0-9])/y;
 function messageAddresses(text) {
   const addresses = [];
   let end = 0;
@@ -171,10 +174,15 @@ export function privateCommitEmails(log) {
     const split = row.indexOf('\x1e');
     const fields = split < 0 ? row : row.slice(0, split);
     const message = split < 0 ? '' : row.slice(split + 1);
-    const [hash = '', author, committer, ...rest] = fields.split('\t');
+    const [hash = '', author, committer, encoding = '', ...rest] = fields.split('\t');
     // Never echo unparseable log text; it may hold the address being checked.
-    if (!commitHash.test(hash)) return ['commit log could not be parsed'];
+    // A second \x1e, or any \x1f, in the message (trailers included) could
+    // split a trailer so that its address escapes both checks.
+    if (!commitHash.test(hash) || /[\x1e\x1f]/.test(message)) return ['commit log could not be parsed'];
     const errors = [];
+    // Placeholders were converted from this encoding, so only UTF-8 (or none) is
+    // read as stored; the header itself is not printed.
+    if (encoding && !/^utf-?8$/i.test(encoding)) errors.push(`${hash.slice(0, 12)}: commit encoding must be UTF-8`);
     if (![author, committer].every((email) => noreply.test(email ?? ''))) {
       errors.push(`${hash.slice(0, 12)}: commit email must use GitHub noreply`);
     }
