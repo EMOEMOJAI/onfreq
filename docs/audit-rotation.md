@@ -67,7 +67,7 @@ Each of these changes makes the named chunk due at once, whatever its date:
 | ID | Chunk | Paths | Focus | Baseline | Last pass | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | T3-1 | Docs and agent instructions | `README.md`, `docs/**`, `llms.txt`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SECURITY.md`, `LICENSE`, `.github/copilot-instructions.md`, `.github/ISSUE_TEMPLATE/**`, `assets/**` | Trigger: before each release, or when setup or security guidance changes. Docs match code; no unsafe advice; no private data | 566364a | 2026-10-22 | clean |
-| T3-2 | Tests and repo-check tests | `test/**`, `scripts/test-hooks.mjs`, `scripts/test-repo-checks.mjs` | Trigger: when fixtures or helpers change, or when a chunk audit flags untested paths. Fixtures stay synthetic; tests can fail | 566364a | 2026-10-22 | clean |
+| T3-2 | Tests and repo-check tests | `test/**`, `scripts/test-hooks*.mjs`, `scripts/hook-test-helpers.mjs`, `scripts/test-repo-checks.mjs` | Trigger: when fixtures or helpers change, or when a chunk audit flags untested paths. Fixtures stay synthetic; tests can fail | 566364a | 2026-10-22 | clean |
 
 Baseline `932364b` is `main` after the full pre-ship audit (code quality, security, dependencies and build) finished on 2026-09-27. Changes since then were reviewed per change rather than per chunk, so the first pass of any touched chunk should review its whole delta.
 
@@ -142,6 +142,10 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-23 | T2-2 | P4 | Fixed deferred: continuation pages stay as they are while their parent card's edit is rejected permanently, until its content changes | c3e0191 |
 | 2026-10-23 | T1-6 | P4 | Fixed deferred: stored Discord cooldowns name channels outside `DISCORD_CHANNEL_IDS` only by a hash keyed with the bot token; cooldowns stay per channel | c3e0191 |
 | 2026-10-23 | T3-2 | P4 | Already fixed: the send-detection wrapper is `trackPosts`, with direct tests in `test/discord-rate-limit.test.ts` | - |
+| 2026-10-23 | T1-5 | P4 | Fixed: callsign lists with empty quote pairs, and quoted items a shell joins right after the setting name, are flagged; accepted fail-safe false positives for compact objects and string arrays. Deferred: a first item without an underscore, and quoted joins with blanks around the operator (not an assignment in a shell) | 1676363 |
+| 2026-10-23 | T1-5 | P4 | The pre-push note says which allow markers the scan applies (added lines and messages, not author names, emails or paths) | 1676363 |
+| 2026-10-23 | T3-2 | P3 | Real-Gitleaks hook tests split into four files run in parallel with a shared helper module, same tests and assertions; local script tests 136 s to 33 s (the macOS CI job had reached 9 of 20 minutes) | 69c533f |
+| 2026-10-23 | T3-2 | P4 | A test covers the GCA fallback that loads rate limits with the public channel set and the keyed hash | e5d3289 |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
