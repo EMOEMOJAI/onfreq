@@ -2265,31 +2265,64 @@ function g1Cases() {
 // FIR prefix NAME:list branch takes the blank class B around commas. The colon
 // rule had no text before NX5-L2, so its pinned earlier text is the one before
 // NX-6; the FIR text before NX-6 is pinned separately (firColonBeforeNx6).
+// NX-7 changed the current texts below (and the allowlists the earlier texts
+// are restored with); nx7Texts pins the 2.2.10 texts.
 const tick = '`';
 const blankClass = String.raw`[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]`;
 const itemClass = String.raw`[^\s,"'${tick};)}\]]*`;
 const callsignHead = String.raw`regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*["'${tick}]?`;
-const callsignRegex = String.raw`${callsignHead}${blankClass}*([A-Za-z0-9-]+_${itemClass}(?:${blankClass}*,${blankClass}*${itemClass})*)'''`;
+const callsign2210 = String.raw`${callsignHead}${blankClass}*([A-Za-z0-9-]+_${itemClass}(?:${blankClass}*,${blankClass}*${itemClass})*)'''`;
 const callsignItem = String.raw`[^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*`;
 const firBlank = String.raw`[\t \p{Zs}\x{FEFF}]`;
 const firBeforeL2 = String.raw`regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(?:["'${tick}](${firBlank}*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:${firBlank}*,${firBlank}*[A-Za-z]{0,4})*${firBlank}*)["'${tick}]|([A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)[ \t\r]*(?:#[^\n]*)?$)|\bFIR_PREFIXES=([A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[ \t\r;&|)]|$)'''`;
 // The FIR prefix rule's NAME:list branch, with `blank` around commas.
 const firColon = (blank) => String.raw`|\bFIR_PREFIXES:([A-Za-z]{1,4}(?:${blank}*,${blank}*[A-Za-z]{0,4})*)(?:[\s"'${tick};&|)]|$)'''`;
-const firCurrent = firBeforeL2.replaceAll(firBlank, blankClass).slice(0, -3) + firColon(blankClass);
-const firColonBeforeNx6 = firBeforeL2.replaceAll(firBlank, blankClass).slice(0, -3) + firColon(String.raw`[ \t]`);
+// The FIR prefix rule as released in 2.2.10, before NX-7.
+const fir2210 = firBeforeL2.replaceAll(firBlank, blankClass).slice(0, -3) + firColon(blankClass);
+// NX-7 texts. The callsign rule also reads blank escapes before the first item,
+// the letters that uppercase to Latin ones, an all-uppercase dotted first item
+// and quotes the shell joins; its allowlist takes a quote before an item.
+const blankEscape = String.raw`\\[ tvfrn]|\\x(?:0[9a-dA-D]|20|[aA]0)|\\u(?:00(?:0[9a-dA-D]|20|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000|[fF][eE][fF][fF])`;
+const someItem = String.raw`[^\s,"'${tick};)}\]]+`;
+const callsignRegexNx7 = String.raw`regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*(?:\$'|["'${tick}])?(?:${blankClass}|${blankEscape})*((?:[A-Za-z0-9\x{DF}\x{131}\x{17F}\x{FB00}-\x{FB06}-]+|[A-Z0-9-]+(?:\.[A-Z0-9-]*)+)_${itemClass}(?:${blankClass}*,${blankClass}*(?:["'${tick}]${someItem}|${itemClass})|["'${tick}],${someItem})*)'''`;
+const callsignAllow = (quote) => String.raw`regexes = ['''(?i)^[QX]${callsignItem}(?:${blankClass}*,${blankClass}*(?:${quote}[QX]${callsignItem})?)*${blankClass}*$''']`;
+// Every FIR prefix secret starts with its opening quote, = or :, and the
+// NAME=list, NAME:list and end-of-line forms may end in any blank of B.
+const firNx7Text = (colonBlank) => String.raw`regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(["'${tick}]${blankClass}*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:${blankClass}*,${blankClass}*[A-Za-z]{0,4})*${blankClass}*)["'${tick}]`
+  + String.raw`|\bFIR_PREFIXES\b["']?[ \t]*([=:][ \t]*[A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)${blankClass}*(?:#[^\n]*)?$`
+  + String.raw`|\bFIR_PREFIXES(=[A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029};&|)]|$)`
+  + String.raw`|\bFIR_PREFIXES(:[A-Za-z]{1,4}(?:${colonBlank}*,${colonBlank}*[A-Za-z]{0,4})*)(?:[\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}"'${tick};&|)]|$)'''`;
+const firNx7 = firNx7Text(blankClass);
+const firColonBeforeNx6 = firNx7Text(String.raw`[ \t]`);
+const firAllow = (delimiter) => String.raw`regexes = ['''(?i)^${delimiter}\s*[QX][A-Z]{0,3}(?:\s*,\s*(?:[QX][A-Z]{0,3})?)*\s*$''']`;
+const firAllowNx7 = firAllow(String.raw`(?:[=:][ \t]*|["'${tick}])?`);
+const quotedPart = String.raw`"[^"\n]*"|'[^'\n]*'|${tick}[^${tick}\n]*${tick}`;
+const colon2210 = String.raw`regex = '''\b${coordinatorName}:(?:"([^"\n]+)"|'([^'\n]+)'|${tick}([^${tick}\n]+)${tick}|([^\s"'${tick}#;&|)]+))'''`;
+const colonNx7 = String.raw`regex = '''\b${coordinatorName}(:(?:${quotedPart}|[^\s"'${tick}#;&|)]|"[^"\s,;)+}\]][^"\n]*|'[^'\s,;)+}\]][^'\n]*)+)'''`;
+const synthetic = 'synthetic[-A-Za-z0-9]*';
+const synthetic2210 = `regexes = ['''^${synthetic}$''']`;
+const colonAllowNx7 = String.raw`regexes = ['''^:(?:${synthetic}|"${synthetic}"|'${synthetic}'|${tick}${synthetic}${tick}|""|''|${tick}${tick})[}\]]*$''']`;
+const dotenv2210 = (name) => String.raw`regex = '''(?m)^[+]?\s*(?:export\s+)?${name}\s*=[ \t]*(?:"([^"\n]+)"|'([^'\n]+)'|${tick}([^${tick}\n]+)${tick}|([^\s"'${tick}#](?:[^#\n]*[^\s#])?))'''`;
+const dotenvNx7 = (name) => String.raw`regex = '''(?m)^[+]?\s*(?:export\s+)?${name}\s*(=[ \t]*(?:(?:${quotedPart})(?:${quotedPart}|[^\s"'${tick}#])+|"[^"\n]+"|'[^'\n]+'|${tick}[^${tick}\n]+${tick}|["'${tick}][^"'${tick}\n]*[^\s"'${tick}#]|[^\s"'${tick}#](?:[^#\n]*[^\s#])?))'''`;
+const firList = String.raw`\s*[QX][A-Z]{0,3}(?:\s*,\s*[QX][A-Z]{0,3})*\s*,?\s*`;
+const firDotenvAllowNx7 = String.raw`regexes = ['''(?i)^=[ \t]*(?:"${firList}"|'${firList}'|${tick}${firList}${tick}|${firList})$''']`;
+const coordinatorAllowNx7 = String.raw`regexes = ['''^=[ \t]*(?:${synthetic}|"${synthetic}"|'${synthetic}'|${tick}${synthetic}${tick})$''']`;
+const secretGroup = 'secretGroup = 1';
 const l2Texts = {
   'onfreq-excluded-callsigns-assignment': [
-    ['regex', callsignRegex,
+    ['regex', callsignRegexNx7,
       String.raw`${callsignHead}[ \t\p{Zs}\x{FEFF}]*([A-Za-z0-9]+_${itemClass}(?:[ \t]*,[ \t]*${itemClass})*)'''`],
-    ['regexes', String.raw`regexes = ['''(?i)^[QX]${callsignItem}(?:${blankClass}*,${blankClass}*(?:[QX]${callsignItem})?)*${blankClass}*$''']`,
+    ['regexes', callsignAllow(String.raw`["'${tick}]?`),
       String.raw`regexes = ['''(?i)^[QX][A-Z0-9_]*(?:[ \t]*,[ \t]*(?:[QX][A-Z0-9_]*)?)*$''']`],
   ],
   'onfreq-fir-prefixes-property': [
-    ['regex', firCurrent, firBeforeL2],
+    ['regex', firNx7, firBeforeL2],
+    ['regexes', firAllowNx7, firAllow('')],
   ],
   'onfreq-coordinator-name-colon': [
-    ['regex', String.raw`regex = '''\b${coordinatorName}:(?:"([^"\n]+)"|'([^'\n]+)'|${tick}([^${tick}\n]+)${tick}|([^\s"'${tick}#;&|)]+))'''`,
-      String.raw`regex = '''\b${coordinatorName}:([^\s"'${tick}#;&|)]+)'''`],
+    ['regex', colonNx7, String.raw`regex = '''\b${coordinatorName}:([^\s"'${tick}#;&|)]+)'''`],
+    ['secretGroup', secretGroup, null],
+    ['regexes', colonAllowNx7, synthetic2210],
   ],
   'onfreq-gca-policy-url-quoted-userinfo': [
     ['regex', String.raw`regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*["'${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*@[^\s"'${tick}]*|"[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:"(?:[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)?|['${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*|'[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:'(?:[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)?|["${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*|${tick}[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:${tick}[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*|["'\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*)'''`,
@@ -2297,19 +2330,20 @@ const l2Texts = {
   ],
 };
 // The configuration with each `key = ` line of rule `id` (its allowlist
-// included) changed from the expected current text to another.
+// included) changed from the expected current text to another, or removed
+// when the other is null.
 function editRule(rules, id, edits) {
   const lines = rules.toString().split('\n');
   const start = lines.indexOf(`id = "${id}"`);
   assert.ok(start > 0, id);
   const end = lines.indexOf('[[rules]]', start);
   for (const [key, from, to] of edits) {
-    const at = lines.findIndex((line, index) => index > start && line.startsWith(`${key} = `));
+    const at = lines.findIndex((line, index) => index > start && line?.startsWith(`${key} = `));
     assert.ok(at > start && (end < 0 || at < end), `${id} ${key}`);
     assert.equal(lines[at], from, `${id} ${key} is the current text`);
     lines[at] = to;
   }
-  return lines.join('\n');
+  return lines.filter((line) => line !== null).join('\n');
 }
 // The configuration with rule `id` as before NX5-L2.
 const beforeL2 = (rules, id) => editRule(rules, id, l2Texts[id]);
@@ -2384,8 +2418,11 @@ function l2Cases() {
         [`wrangler dev --var A:1 ${firPrefixes}:${jd}\n`, '', 'second --var item ending the line', false],
         [`wrangler dev --var A:1 ${firPrefixes}:${jd} --port 1\n`, '', 'second --var item before more options', true],
         [`wrangler dev --var "${firPrefixes}:${jd}, ${je}"\n`, `${jd}, ${je}`, 'quoted --var with a blank', true],
+        // NX-7's Unicode-blank terminators flag this one with ASCII blanks around commas too (as :JD,).
         [`wrangler dev --var ${firPrefixes}:${jd},\u00a0${je}\n`, `${jd},\u00a0${je}`,
-          'no-break space after a comma in NAME:list (NX-6)', true, true],
+          'no-break space after a comma in NAME:list (NX-6)', true],
+        [`wrangler dev --var ${firPrefixes}:QC,\u00a0${je}\n`, `QC,\u00a0${je}`,
+          'no-break space after a comma after a synthetic item in NAME:list (NX-6)', true, true],
       ],
       pass: [
         [`wrangler dev --var ${firPrefixes}:QC,XA --port 1\n`, 'synthetic NAME:list', false],
@@ -2464,7 +2501,7 @@ test('the NX-6 blanks around commas in the FIR prefix NAME:list branch are neede
     const id = 'onfreq-fir-prefixes-property';
     const needed = l2Cases()[id].block.filter((item) => item[4]);
     assert.ok(needed.length > 0);
-    commitRules(f, editRule(repoRules(), id, [['regex', firCurrent, firColonBeforeNx6]]));
+    commitRules(f, editRule(repoRules(), id, [['regex', firNx7, firColonBeforeNx6]]));
     const scan = scanCommit(f, needed.map(([line]) => settingsText(line)).join(''));
     assert.equal(scan.status, 0, `${id} before NX-6: ${scan.stderr}`);
   });
@@ -2491,10 +2528,10 @@ function withoutRule(rules, id) {
 }
 // The configuration with the callsign rule's regex as before NX4-G1: ASCII
 // blanks before the list and around commas, and items of letters, digits and
-// underscores. Its allowlist is the current one (NX5-L2), which every NX4-G1
+// underscores. Its allowlist is the current one (NX-7), which every NX4-G1
 // case's previous match passes.
 function previousCallsignRule(rules) {
-  return editRule(rules, 'onfreq-excluded-callsigns-assignment', [['regex', callsignRegex,
+  return editRule(rules, 'onfreq-excluded-callsigns-assignment', [['regex', callsignRegexNx7,
     String.raw`${callsignHead}[ \t]*([A-Za-z0-9]+_[A-Za-z0-9_]*(?:[ \t]*,[ \t]*[A-Za-z0-9_]*)*)'''`]]);
 }
 // Commits `text` without the hook and returns secret-scan.sh over that commit alone.
@@ -2570,4 +2607,174 @@ test('the repository Gitleaks rules pass every tracked line naming these setting
       + `${policyUrlName}="https://example.test" # ${address}\n`;
     const { hook, scan } = scanAssignment(f, text);
     for (const result of [...hook, scan]) assert.equal(result.status, 0, result.stderr);
+  });
+
+// NX-7: quotes the shell joins and unclosed quotes in callsign lists, coordinator
+// names and FIR prefixes; blank escapes, Unicode letters that uppercase to Latin
+// ones and an all-uppercase dotted first item in callsign lists; FIR prefix
+// lists ending in a Unicode blank; and secrets that keep their delimiter, so
+// Gitleaks' default allowlist cannot pass a list of one letter or one repeated
+// letter (FIR prefixes) or a value of one repeated letter or starting with
+// "true" (coordinator names). Flagged lines are assembled at runtime from
+// joined names, J prefixes and random values, so this file never holds one.
+// Each rule's 2.2.10 texts are pinned, with its allowlist and secret group.
+const nx7Texts = {
+  'onfreq-excluded-callsigns-assignment': [
+    ['regex', callsignRegexNx7, callsign2210],
+    ['regexes', callsignAllow(String.raw`["'${tick}]?`), callsignAllow('')],
+  ],
+  'onfreq-fir-prefixes-property': [
+    ['regex', firNx7, fir2210],
+    ['regexes', firAllowNx7, firAllow('')],
+  ],
+  'onfreq-coordinator-name-colon': [
+    ['regex', colonNx7, colon2210],
+    ['secretGroup', secretGroup, null],
+    ['regexes', colonAllowNx7, synthetic2210],
+  ],
+  'onfreq-coordinator-name-assignment': [
+    ['regex', dotenvNx7(coordinatorName), dotenv2210(coordinatorName)],
+    ['secretGroup', secretGroup, null],
+    ['regexes', coordinatorAllowNx7, synthetic2210],
+  ],
+  'onfreq-fir-prefixes-assignment': [
+    ['regex', dotenvNx7(firPrefixes), dotenv2210(firPrefixes)],
+    ['secretGroup', secretGroup, null],
+    ['regexes', firDotenvAllowNx7, String.raw`regexes = ['''(?i)^${firList}$''']`],
+  ],
+};
+// The configuration with rules `ids` as released in 2.2.10.
+const as2210 = (ids) => ids.reduce((rules, id) => editRule(rules, id, nx7Texts[id]), repoRules());
+// { block: [line, text or texts the redacted output must not show, label, ids of
+//   the rules whose 2.2.10 texts together pass it (none: Gitleaks already
+//   flagged it)][], pass: [line, label][] }
+function nx7Cases() {
+  const tower = jsonName('JDDD', 'TWR');
+  const [jd, je] = [jPrefix('D'), jPrefix('E')];
+  const name = ['jd', randomBytes(3).toString('hex')].join('-');
+  const [cs, cn, fp] = [callsignsName, coordinatorName, firPrefixes].map((setting) => (rest) => `${setting}${rest}\n`);
+  const [callsigns, colon, dotenv, firDotenv, fir] = ['onfreq-excluded-callsigns-assignment', 'onfreq-coordinator-name-colon',
+    'onfreq-coordinator-name-assignment', 'onfreq-fir-prefixes-assignment', 'onfreq-fir-prefixes-property'].map((id) => [id]);
+  const bs = '\\';
+  const twoJ = jPrefix('J');
+  return {
+    block: [
+      [cs(`="QCXX_CTR",${tower}`), tower, 'quoted synthetic first item joined to a later item', callsigns],
+      [cs(`='QCXX_CTR',${tower}`), tower, 'single-quoted synthetic first item joined to a later item', callsigns],
+      [cs(`=QCXX_CTR,"${tower}"`), tower, 'quoted later item', callsigns],
+      [cs(`=QCXX_CTR,'${tower}'`), tower, 'single-quoted later item', callsigns],
+      [cs(`=QCXX_CTR,${tick}${tower}${tick}`), tower, 'backtick-quoted later item', callsigns],
+      [cs(`="${bs}t${tower}"`), tower, 'tab escape before the first item', callsigns],
+      [cs(`=$'${bs}f${tower}'`), tower, 'ANSI-C form feed escape before the first item', callsigns],
+      [cs(`="${bs}x20${tower}"`), tower, 'hex space escape before the first item', callsigns],
+      [cs(`=$'${bs}xa0${tower}'`), tower, 'hex no-break space escape before the first item', callsigns],
+      [cs(`=${bs} ${tower}`), tower, 'backslash before a space before the first item', callsigns],
+      [cs('=ſDDD_TWR'), 'DDD_TWR', 'long s, which uppercases to S', callsigns],
+      [cs('=JDıD_TWR'), 'D_TWR', 'dotless i, which uppercases to I', callsigns],
+      [cs('=JDßD_TWR'), 'D_TWR', 'sharp s, which uppercases to SS', callsigns],
+      [cs('=JﬀD_TWR'), 'D_TWR', 'ff ligature, which uppercases to FF', callsigns],
+      [cs(`=QC.X_CTR,${tower}`), tower, 'all-uppercase dotted first item', callsigns],
+      // Gitleaks decodes \u escapes and scans the decoded text, so 2.2.10 already flagged this one.
+      [cs(`="${bs}u00a0${tower}"`), tower, 'Unicode no-break space escape before the first item', []],
+      [`wrangler dev --var ${cn(`:'synthetic'"${name}"`)}`, name, 'quoted synthetic name joined to more text', colon],
+      [`wrangler dev --var ${cn(`:"aa""${name}"`)}`, name, 'quoted parts joined', colon],
+      [cn(':zzzz'), 'zzzz', 'one repeated letter after the colon', colon],
+      [cn(`:true${name}`), name, 'value starting with true after the colon', colon],
+      [`wrangler dev --var ${cn(`:"${name}`)}`, name, 'unclosed double quote after the colon', colon],
+      [`wrangler dev --var ${cn(`:'${name}`)}`, name, 'unclosed single quote after the colon', colon],
+      [cn(`='synthetic'${name}`), name, 'quoted synthetic dotenv name joined to more text', dotenv],
+      [cn(`=""${name}`), name, 'empty quotes joined to a dotenv name', dotenv],
+      [cn(`="${name}`), name, 'unclosed quote in a dotenv name', dotenv],
+      [cn('=zzzz'), 'zzzz', 'dotenv name of one repeated letter', dotenv],
+      [cn(`=true${name}`), name, 'dotenv name starting with true', dotenv],
+      [fp(`="QX",${jd}`), `"QX",${jd}`, 'quoted synthetic dotenv list joined to a later item', firDotenv],
+      [fp(`="${jd}`), '', 'unclosed quote in a dotenv list', firDotenv],
+      [`  ${fp(": 'J',")}`, '', 'quoted one-letter list', fir],
+      [`wrangler dev --var ${fp(`:${twoJ}`)}`, '', 'NAME:list of one repeated letter', fir],
+      [`env ${firPrefixes}=J npm test\n`, '', 'NAME=list of one letter', fir],
+      [`  ${fp(`: ${twoJ}`)}`, '', 'YAML list of one repeated letter', fir],
+      [`wrangler dev --var ${fp(`:${jd},${je} `)}`, `${jd},${je}`, 'NAME:list ending in a no-break space', fir],
+      [`wrangler dev --var ${firPrefixes}:${jd}　 --port 1\n`, '', 'NAME:list before an ideographic space', fir],
+      [`env ${fp(`=${jd},${je} `)}`, `${jd},${je}`, 'NAME=list ending in a no-break space', fir],
+      [`A=1 ${firPrefixes}=${jd}　npm test\n`, '', 'NAME=list before an ideographic space', fir],
+      [`  ${fp(`: ${jd} `)}`, '', 'YAML list ending in a no-break space', fir],
+      [`  ${fp(`: ${jd}, ${je}　# note`)}`, `${jd}, ${je}`, 'YAML list before an ideographic space and a comment', fir],
+      // At the start of a line both FIR prefix rules read it.
+      [fp(`=${twoJ}`), '', 'dotenv list of one repeated letter', [...firDotenv, ...fir]],
+    ],
+    pass: [
+      [`{"${callsignsName}":"QCXX_CTR","N":1}\n`, 'compact JSON callsign'],
+      [`{ ${callsignsName}: 'QCXX_CTR', N: 1 }\n`, 'TypeScript object callsign'],
+      [cs('="QCXX_CTR",QDXX_APP'), 'quoted synthetic first item joined to a synthetic one'],
+      [cs("='QCXX_CTR',QDXX_APP"), 'single-quoted synthetic first item joined to a synthetic one'],
+      [cs('=QCXX_CTR,"QDXX_APP"'), 'quoted synthetic later item'],
+      [cs('=QCXX_CTR,""'), 'empty quoted later item'],
+      [cs(`="${bs}tQCXX_CTR"`), 'tab escape before a synthetic item'],
+      [cs(`=$'${bs}fQCXX_CTR'`), 'ANSI-C form feed escape before a synthetic item'],
+      [cs(`=$${callsignsName}`), 'shell variable'],
+      [`{${cn(":'synthetic-x'}").trimEnd()}\n`, 'compact TypeScript object with a synthetic name'],
+      [`'${coordinatorName}:' + value\n`, 'concatenation'],
+      [`Set ${tick}${coordinatorName}:${tick} first.\n`, 'Markdown span ending at the colon'],
+      [cn('="synthetic-state"'), 'double-quoted synthetic dotenv name'],
+      [cn("='synthetic-state'"), 'single-quoted synthetic dotenv name'],
+      [`wrangler dev --var ${fp(':QC,XA')}`, 'synthetic NAME:list'],
+      [fp('=QQ'), 'synthetic list of one repeated letter'],
+      [`  ${fp(": 'XD',")}`, 'quoted synthetic list'],
+      [`wrangler dev --var ${fp(':QC,XA ')}`, 'synthetic NAME:list ending in a no-break space'],
+      [`env ${fp('=QC,XA ')}`, 'synthetic NAME=list ending in a no-break space'],
+      [`  ${fp(': QC, XA ')}`, 'synthetic YAML list ending in a no-break space'],
+    ],
+  };
+}
+
+test('the repository Gitleaks rules block NX-7 callsign, coordinator name and FIR prefix forms, redacted (NX-7)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const [line, secret, label] of nx7Cases().block) {
+      const { hook, scan } = scanAssignment(f, settingsText(line));
+      for (const result of [...hook, scan]) {
+        assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+        for (const text of [secret].flat()) {
+          if (text) assert.ok(!(result.stderr + result.stdout).includes(text), `${label}: ${text.length} characters shown`);
+        }
+      }
+    }
+  });
+
+test('the repository Gitleaks rules pass NX-7 synthetic, quoted, code and Markdown forms (NX-7)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const [line, label] of nx7Cases().pass) {
+      const { hook, scan } = scanAssignment(f, settingsText(line));
+      for (const result of [...hook, scan]) assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+    }
+  });
+
+test('each NX-7 rule change is needed: its cases pass with the 2.2.10 rule texts (NX-7)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const { block } = nx7Cases();
+    for (const id of Object.keys(nx7Texts)) {
+      const needed = block.filter(([, , , ids]) => ids.length === 1 && ids[0] === id);
+      assert.ok(needed.length > 0, id);
+      commitRules(f, as2210([id]));
+      const scan = scanCommit(f, needed.map(([line]) => settingsText(line)).join(''));
+      assert.equal(scan.status, 0, `${id} as in 2.2.10: ${scan.stderr}`);
+    }
+    // A case that several rules flag passes only with all of them as in 2.2.10.
+    for (const [line, , label, ids] of block.filter((item) => item[3].length > 1)) {
+      commitRules(f, as2210(ids));
+      assert.equal(scanCommit(f, settingsText(line)).status, 0, `${label}: all as in 2.2.10`);
+      for (const id of ids) {
+        commitRules(f, as2210(ids.filter((other) => other !== id)));
+        assert.equal(scanCommit(f, settingsText(line)).status, 1, `${label}: only ${id} current`);
+      }
+    }
+    // Cases Gitleaks already flagged stay flagged with every rule as in 2.2.10.
+    commitRules(f, as2210(Object.keys(nx7Texts)));
+    for (const [line, , label] of block.filter((item) => !item[3].length)) {
+      assert.equal(scanCommit(f, settingsText(line)).status, 1, label);
+    }
   });
