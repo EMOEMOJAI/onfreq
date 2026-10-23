@@ -133,6 +133,8 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-23 | T1-5 | P4 | Fixed deferred: callsign lists accept synthetic values before `.` or `<`, catch a dash before the underscore and control or Unicode line-separator blanks (FIR lists too); a policy link closed by its quote before `;` or `&` passes; `wrangler --var` colon forms of `FIR_PREFIXES` and `COORDINATOR_NAME` are flagged. Deferred: quote-joined later items, escaped leading blanks, a dotted first callsign item, prose after a comma (fails safe) | c301dd2 |
 | 2026-10-23 | T2-3 | P4 | Fixed deferred: the delivery-budget poll test now fails without the 10 s start margin | 4d4eff0 |
 | 2026-10-23 | T1-6 | P4 | Fixed deferred: a record's stored session id always joins its id set, so ids left by a rollback to 2.2.6 still match; reaches production with the next deploy | 4d4eff0 |
+| 2026-10-23 | T1-5 | P3 | Fixed: the coordinator-name colon form (as in `wrangler --var`) now flags quoted and backtick-quoted values, and a non-breaking or other Unicode blank around a comma no longer hides a FIR prefix list in the colon form. Accepted: string concatenation and Markdown with a later backtick can be flagged (fails safe) | c054bc9 |
+| 2026-10-23 | T1-5 | P4 | Deferred: a plain space inside a callsign item, quote-joined later items or values (also a synthetic quoted coordinator name joined to more text), escaped blanks, a dotted first callsign item, and an unclosed quote | c054bc9 |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
