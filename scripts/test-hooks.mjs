@@ -143,6 +143,9 @@ const checks = 'run --silent check:privacy\nrun --silent check:setup\n';
 const rangeCheck = (head, remote = zero, name = 'origin') => `run --silent check:privacy -- --range ${head} ${remote} ${name}\n`;
 // One fake Gitleaks run over the piped log: its arguments, then the scanned commits.
 const leakScan = (...commits) => `[stdin][--redact][--no-banner]\n${commits.map((c) => `${c}\n`).join('')}`;
+// The pre-push note naming pushed commits that change Gitleaks settings or carry
+// gitleaks:allow; the note does not block the push.
+const gitleaksNote = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or gitleaks:allow lines, or carry gitleaks:allow in a message, author or path \\(${hashes}\\); the scan applies the settings and markers on added lines and in messages, not in author names, emails or paths, so review those commits\\.$`, 'm');
 
 test('pre-push runs range, privacy and setup checks when the pushed commit is the clean HEAD', (t) => {
   const f = fixture(t);
@@ -533,24 +536,23 @@ test('pre-push notes, without blocking, pushed commits that change Gitleaks sett
     f.git('commit', '--quiet', '--no-verify', '-m', message);
     return [f.git('rev-parse', 'HEAD'), f.git('log', '-1', '--format=%h')];
   };
-  const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
   let result = f.push([ref(f.head)]);
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /note/);
   const [ignore, ignoreShort] = commit('ignore list', { '.gitleaksignore': '# synthetic\n' });
   result = f.push([ref(ignore, 'refs/heads/main', f.head)]);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stderr, note(ignoreShort));
+  assert.match(result.stderr, gitleaksNote(ignoreShort));
   const [allow, allowShort] = commit('allow', { 'allowed.txt': 'example = "synthetic" # gitleaks:allow\n' });
   result = f.push([ref(allow, 'refs/heads/main', ignore)]);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stderr, note(allowShort));
+  assert.match(result.stderr, gitleaksNote(allowShort));
   assert.equal(result.gitleaks, leakScan(allow), 'the scan is unchanged');
   // Each commit is named once, whichever way it qualifies.
   const [both, bothShort] = commit('both', { '.gitleaksignore': '# synthetic\n# more\n', 'allowed.txt': 'x = 1 # gitleaks:allow\n' });
   result = f.push([ref(both, 'refs/heads/main', f.head)]);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stderr, note(`${bothShort} ${ignoreShort} ${allowShort}`));
+  assert.match(result.stderr, gitleaksNote(`${bothShort} ${ignoreShort} ${allowShort}`));
   // A later ordinary commit is not named.
   const [plain] = commit('plain', { 'public.txt': 'plain\n' });
   result = f.push([ref(plain, 'refs/heads/main', both)]);
@@ -565,7 +567,6 @@ test('pre-push notes, without blocking, pushed commits that change Gitleaks sett
 });
 
 test('pre-push notes a gitleaks:allow line or Gitleaks settings change that only a merge resolution adds', (t) => {
-  const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
   // Neither parent adds the file; only the merge commit's own diff does, and no
   // later commit removes it, since a removal would be named too.
   const mergeOnly = (f, name, text) => {
@@ -589,7 +590,7 @@ test('pre-push notes a gitleaks:allow line or Gitleaks settings change that only
       const [merge, mergeShort] = mergeOnly(f, name, text);
       const result = f.push([ref(merge, 'refs/heads/main', f.head)]);
       assert.equal(result.status, 0, result.stderr);
-      assert.match(result.stderr, note(mergeShort), `${name} log.diffMerges=${diffMerges}`);
+      assert.match(result.stderr, gitleaksNote(mergeShort), `${name} log.diffMerges=${diffMerges}`);
     }
   }
 });
@@ -1236,7 +1237,6 @@ test('privacy checks reject private emails anywhere in commit messages, however 
 });
 
 test('pre-push names commits whose message carries gitleaks:allow, however encoded (ROT-1)', (t) => {
-  const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
   const f = fixture(t);
   let base = f.head;
   let n = 0;
@@ -1254,13 +1254,13 @@ test('pre-push names commits whose message carries gitleaks:allow, however encod
   };
   // Message only, in any case.
   let [oid, short] = commit('synthetic change\n\nGitleaks:Allow');
-  assert.match(pushNew(oid).stderr, note(short));
+  assert.match(pushNew(oid).stderr, gitleaksNote(short));
   // A UTF-16 encoding header, then a UTF-16 log output encoding, cannot hide it.
   [oid, short] = commit('synthetic gitleaks:allow', { config: ['-c', 'i18n.commitEncoding=UTF-16'] });
-  assert.match(pushNew(oid).stderr, note(short));
+  assert.match(pushNew(oid).stderr, gitleaksNote(short));
   f.git('config', 'i18n.logOutputEncoding', 'UTF-16');
   [oid, short] = commit('synthetic gitleaks:allow again');
-  assert.match(pushNew(oid).stderr, note(short));
+  assert.match(pushNew(oid).stderr, gitleaksNote(short));
   f.git('config', '--unset', 'i18n.logOutputEncoding');
   // A merge carrying it in its message.
   f.git('checkout', '--quiet', '-b', 'side');
@@ -1271,18 +1271,17 @@ test('pre-push names commits whose message carries gitleaks:allow, however encod
   const mergeShort = f.git('log', '-1', '--format=%h');
   const sideShort = f.git('log', '-1', '--format=%h', 'side');
   const mergeResult = pushNew(merge);
-  assert.match(mergeResult.stderr, note(mergeShort));
+  assert.match(mergeResult.stderr, gitleaksNote(mergeShort));
   assert.doesNotMatch(mergeResult.stderr, new RegExp(sideShort));
   // In both the message and the diff: named once.
   [oid, short] = commit('both gitleaks:allow', { file: 'allowed.txt', text: 'x = 1 # gitleaks:allow\n' });
-  assert.match(pushNew(oid).stderr, note(short));
+  assert.match(pushNew(oid).stderr, gitleaksNote(short));
   // A plain commit is not named.
   [oid] = commit('plain');
   assert.doesNotMatch(pushNew(oid).stderr, /note/);
 });
 
 test('pre-push names commits whose author or changed path carries gitleaks:allow (NX-1c)', (t) => {
-  const note = (hashes) => new RegExp(`^pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow \\(${hashes}\\); the scan honoured them, so review those changes\\.$`, 'm');
   const f = fixture(t);
   // Stored names map to other names here, so the stored and mailmapped
   // identities differ; the scan prints either, depending on log.mailmap.
@@ -1312,17 +1311,17 @@ test('pre-push names commits whose author or changed path carries gitleaks:allow
     ['mailmapped name only', ['Mapped Author', 'mapped@example.test']],
     ['stored name only', ['Raw gitleaks:allow', 'raw@example.test']]]) {
     const [oid, short] = commit({ author });
-    assert.match(pushNew(oid), note(short), label);
+    assert.match(pushNew(oid), gitleaksNote(short), label);
   }
   // A path, added or as either side of a rename, without the marker in any
   // line of the diff: -G alone would not name these commits.
   const marked = 'notes-GitLeaks:Allow.txt';
   let [oid, short] = commit({ file: marked });
-  assert.match(pushNew(oid), note(short), 'added path');
+  assert.match(pushNew(oid), gitleaksNote(short), 'added path');
   [oid, short] = commit({ file: 'renamed.txt', rename: marked });
-  assert.match(pushNew(oid), note(short), 'renamed from');
+  assert.match(pushNew(oid), gitleaksNote(short), 'renamed from');
   [oid, short] = commit({ file: `again-${marked}`, rename: 'renamed.txt' });
-  assert.match(pushNew(oid), note(short), 'renamed to');
+  assert.match(pushNew(oid), gitleaksNote(short), 'renamed to');
   // A path only a merge resolution adds.
   f.git('checkout', '--quiet', '-b', 'side');
   commit({ file: 'side.txt' });
@@ -1333,7 +1332,7 @@ test('pre-push names commits whose author or changed path carries gitleaks:allow
   f.git('add', 'merge-gitleaks:allow.txt');
   f.git('commit', '--quiet', '--no-verify', '-m', 'merge side');
   const merge = f.git('rev-parse', 'HEAD');
-  assert.match(pushNew(merge), note(f.git('log', '-1', '--format=%h')), 'merge-only path');
+  assert.match(pushNew(merge), gitleaksNote(f.git('log', '-1', '--format=%h')), 'merge-only path');
   // Ordinary commits by an ordinary author are not named.
   [oid] = commit();
   assert.doesNotMatch(pushNew(oid), /note/);
@@ -2274,7 +2273,9 @@ function g1Cases() {
 // rule had no text before NX5-L2, so its pinned earlier text is the one before
 // NX-6; the FIR text before NX-6 is pinned separately (firColonBeforeNx6).
 // NX-7 changed the current texts below (and the allowlists the earlier texts
-// are restored with); nx7Texts pins the 2.2.10 texts.
+// are restored with); nx7Texts pins the 2.2.10 texts. NX-8 changed the callsign
+// rule and allowlist again (callsignRegexNx8, callsignAllowNx8); the NX-7 texts
+// are those of 2.2.11.
 const tick = '`';
 const blankClass = String.raw`[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]`;
 const itemClass = String.raw`[^\s,"'${tick};)}\]]*`;
@@ -2293,7 +2294,13 @@ const fir2210 = firBeforeL2.replaceAll(firBlank, blankClass).slice(0, -3) + firC
 const blankEscape = String.raw`\\[ tvfrn]|\\x(?:0[9a-dA-D]|20|[aA]0)|\\u(?:00(?:0[9a-dA-D]|20|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000|[fF][eE][fF][fF])`;
 const someItem = String.raw`[^\s,"'${tick};)}\]]+`;
 const callsignRegexNx7 = String.raw`regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*(?:\$'|["'${tick}])?(?:${blankClass}|${blankEscape})*((?:[A-Za-z0-9\x{DF}\x{131}\x{17F}\x{FB00}-\x{FB06}-]+|[A-Z0-9-]+(?:\.[A-Z0-9-]*)+)_${itemClass}(?:${blankClass}*,${blankClass}*(?:["'${tick}]${someItem}|${itemClass})|["'${tick}],${someItem})*)'''`;
-const callsignAllow = (quote) => String.raw`regexes = ['''(?i)^[QX]${callsignItem}(?:${blankClass}*,${blankClass}*(?:${quote}[QX]${callsignItem})?)*${blankClass}*$''']`;
+const callsignAllow = (quote, pairs = '') => String.raw`regexes = ['''(?i)^[QX]${callsignItem}(?:${blankClass}*,${blankClass}*${pairs}(?:${quote}[QX]${callsignItem})?)*${blankClass}*$''']`;
+const callsignAllowNx7 = callsignAllow(String.raw`["'${tick}]?`);
+// NX-8 (A1): the callsign rule and its allowlist also read empty quote pairs
+// after a comma, which the shell drops (<item>,"",<item>).
+const emptyPairs = String.raw`(?:""|''|${tick}${tick})*`;
+const callsignRegexNx8 = String.raw`regex = '''\b(?i:EXCLUDED_CALLSIGNS)\b["']?\s*[=:]\s*(?:\$'|["'${tick}])?(?:${blankClass}|${blankEscape})*((?:[A-Za-z0-9\x{DF}\x{131}\x{17F}\x{FB00}-\x{FB06}-]+|[A-Z0-9-]+(?:\.[A-Z0-9-]*)+)_${itemClass}(?:${blankClass}*,${blankClass}*${emptyPairs}(?:["'${tick}]${someItem}|${itemClass})|["'${tick}],${someItem})*)'''`;
+const callsignAllowNx8 = callsignAllow(String.raw`["'${tick}]?`, emptyPairs);
 // Every FIR prefix secret starts with its opening quote, = or :, and the
 // NAME=list, NAME:list and end-of-line forms may end in any blank of B.
 const firNx7Text = (colonBlank) => String.raw`regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(["'${tick}]${blankClass}*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:${blankClass}*,${blankClass}*[A-Za-z]{0,4})*${blankClass}*)["'${tick}]`
@@ -2318,9 +2325,9 @@ const coordinatorAllowNx7 = String.raw`regexes = ['''^=[ \t]*(?:${synthetic}|"${
 const secretGroup = 'secretGroup = 1';
 const l2Texts = {
   'onfreq-excluded-callsigns-assignment': [
-    ['regex', callsignRegexNx7,
+    ['regex', callsignRegexNx8,
       String.raw`${callsignHead}[ \t\p{Zs}\x{FEFF}]*([A-Za-z0-9]+_${itemClass}(?:[ \t]*,[ \t]*${itemClass})*)'''`],
-    ['regexes', callsignAllow(String.raw`["'${tick}]?`),
+    ['regexes', callsignAllowNx8,
       String.raw`regexes = ['''(?i)^[QX][A-Z0-9_]*(?:[ \t]*,[ \t]*(?:[QX][A-Z0-9_]*)?)*$''']`],
   ],
   'onfreq-fir-prefixes-property': [
@@ -2337,6 +2344,13 @@ const l2Texts = {
       String.raw`regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*["'${tick}]?[ \t]*([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*["'${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*@[^\s"'${tick}]*)'''`],
   ],
 };
+// NX-8: the quoted-join rule reads the same callsign lists as the callsign
+// rule, so every rollback of the callsign rule (editRule and withoutRule below,
+// and so beforeL2, previousCallsignRule and as2210) also removes it, and each
+// earlier callsign text is checked alone.
+const callsignRule = 'onfreq-excluded-callsigns-assignment';
+const quotedJoinRule = 'onfreq-excluded-callsigns-quoted-join';
+const withoutCompanions = (text, id) => (id === callsignRule ? withoutRule(text, quotedJoinRule) : text);
 // The configuration with each `key = ` line of rule `id` (its allowlist
 // included) changed from the expected current text to another, or removed
 // when the other is null.
@@ -2351,7 +2365,7 @@ function editRule(rules, id, edits) {
     assert.equal(lines[at], from, `${id} ${key} is the current text`);
     lines[at] = to;
   }
-  return lines.filter((line) => line !== null).join('\n');
+  return withoutCompanions(lines.filter((line) => line !== null).join('\n'), id);
 }
 // The configuration with rule `id` as before NX5-L2.
 const beforeL2 = (rules, id) => editRule(rules, id, l2Texts[id]);
@@ -2532,14 +2546,14 @@ function withoutRule(rules, id) {
   const start = text.indexOf(`[[rules]]\nid = "${id}"\n`);
   assert.ok(start >= 0, id);
   const next = text.indexOf('\n[[rules]]\n', start);
-  return text.slice(0, start) + (next < 0 ? '' : text.slice(next + 1));
+  return withoutCompanions(text.slice(0, start) + (next < 0 ? '' : text.slice(next + 1)), id);
 }
 // The configuration with the callsign rule's regex as before NX4-G1: ASCII
 // blanks before the list and around commas, and items of letters, digits and
-// underscores. Its allowlist is the current one (NX-7), which every NX4-G1
+// underscores. Its allowlist is the current one (NX-8), which every NX4-G1
 // case's previous match passes.
 function previousCallsignRule(rules) {
-  return editRule(rules, 'onfreq-excluded-callsigns-assignment', [['regex', callsignRegexNx7,
+  return editRule(rules, 'onfreq-excluded-callsigns-assignment', [['regex', callsignRegexNx8,
     String.raw`${callsignHead}[ \t]*([A-Za-z0-9]+_[A-Za-z0-9_]*(?:[ \t]*,[ \t]*[A-Za-z0-9_]*)*)'''`]]);
 }
 // Commits `text` without the hook and returns secret-scan.sh over that commit alone.
@@ -2628,8 +2642,8 @@ test('the repository Gitleaks rules pass every tracked line naming these setting
 // Each rule's 2.2.10 texts are pinned, with its allowlist and secret group.
 const nx7Texts = {
   'onfreq-excluded-callsigns-assignment': [
-    ['regex', callsignRegexNx7, callsign2210],
-    ['regexes', callsignAllow(String.raw`["'${tick}]?`), callsignAllow('')],
+    ['regex', callsignRegexNx8, callsign2210],
+    ['regexes', callsignAllowNx8, callsignAllow('')],
   ],
   'onfreq-fir-prefixes-property': [
     ['regex', firNx7, fir2210],
@@ -2785,6 +2799,94 @@ test('each NX-7 rule change is needed: its cases pass with the 2.2.10 rule texts
     for (const [line, , label] of block.filter((item) => !item[3].length)) {
       assert.equal(scanCommit(f, settingsText(line)).status, 1, label);
     }
+  });
+
+// NX-8 (A1, A2): empty quote pairs after a comma, which the shell drops, and
+// quoted items the shell joins (NAME="<item>","<item>"). Flagged lines are
+// assembled at runtime from the joined name and a J tower, so this file never
+// holds one. A1 cases need the callsign rule's NX-8 regex: the callsign rule
+// alone blocks them, and they pass with its 2.2.11 regex (the quoted-join rule
+// removed). A2 cases need the quoted-join rule: they pass with only that rule
+// removed. Synthetic lists with empty quotes need the NX-8 allowlist.
+function nx8Cases() {
+  const tower = jsonName('JDDD', 'TWR');
+  const cs = (rest) => `${callsignsName}${rest}\n`;
+  return {
+    // [line, text the redacted output must not show, label, 'regex' (A1) or 'join' (A2)]
+    block: [
+      [cs(`=QCXX_CTR,"",${tower}`), tower, 'empty double quotes after a comma', 'regex'],
+      [cs(`=QCXX_CTR,'',${tower}`), tower, 'empty single quotes after a comma', 'regex'],
+      [cs(`=QCXX_CTR,""${tower}`), tower, 'empty quotes joined to the next item', 'regex'],
+      [cs(` = QCXX_CTR,"",${tower}`), tower, 'blanks around = and empty quotes', 'regex'],
+      [cs(`="QCXX_CTR","${tower}"`), tower, 'double-quoted items joined', 'join'],
+      [cs(`='QCXX_CTR','${tower}'`), tower, 'single-quoted items joined', 'join'],
+      [cs(`=QCXX_CTR,"QDXX","${tower}"`), tower, 'quoted items joined after a quoted synthetic item', 'join'],
+      [cs(`="QCXX_CTR"",${tower}"`), tower, 'empty quotes joining two items', 'join'],
+      [`wrangler dev --var ${cs(`:"QCXX_CTR","${tower}"`)}`, tower, 'wrangler --var NAME:list with quoted items', 'join'],
+    ],
+    // [line, label, needs the NX-8 allowlist]
+    pass: [
+      [`{"${callsignsName}":"QCXX_CTR","N":1}\n`, 'compact JSON', false],
+      [`{"${callsignsName}":"QCXX_CTR","":1}\n`, 'compact JSON with an empty key', false],
+      [`{ ${callsignsName}: 'QCXX_CTR', 'N': 1 }\n`, 'TypeScript object with a quoted key', false],
+      [cs('=QCXX_CTR,""'), 'empty quotes ending a synthetic list', true],
+      [cs('=QCXX_CTR,"",QDXX_APP'), 'empty quotes before a synthetic item', true],
+      [cs('=QCXX_CTR,""QDXX_APP'), 'empty quotes joined to a synthetic item', true],
+      [cs('="QCXX_CTR","QDXX_APP"'), 'quoted synthetic items joined', false],
+      [cs('=QCXX_CTR,"QDXX","QEXX_APP"'), 'three quoted synthetic items', false],
+      [cs('=["QCXX_CTR","QDXX_APP"]'), 'array of synthetic items', false],
+      [`{"${callsignsName}":["QCXX_CTR","QDXX_APP"]}\n`, 'JSON array of synthetic items', false],
+    ],
+  };
+}
+
+test('the repository Gitleaks rules block NX-8 callsign lists with empty or joined quotes, redacted (NX-8)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const [line, secret, label] of nx8Cases().block) {
+      const { hook, scan } = scanAssignment(f, settingsText(line));
+      for (const result of [...hook, scan]) {
+        assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+        assert.ok(!(result.stderr + result.stdout).includes(secret), `${label}: ${secret.length} characters shown`);
+      }
+    }
+  });
+
+test('the repository Gitleaks rules pass NX-8 synthetic lists and JSON, TypeScript and array forms (NX-8)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    for (const [line, label] of nx8Cases().pass) {
+      const { hook, scan } = scanAssignment(f, settingsText(line));
+      for (const result of [...hook, scan]) assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+    }
+  });
+
+test('each NX-8 callsign change is needed: its cases pass with the 2.2.11 texts or without the quoted-join rule (NX-8)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const { block, pass } = nx8Cases();
+    const [widened, joined] = ['regex', 'join'].map((need) => block.filter((item) => item[3] === need));
+    const needsAllow = pass.filter((item) => item[2]);
+    assert.ok(widened.length && joined.length && needsAllow.length);
+    const text = (cases) => cases.map(([line]) => settingsText(line)).join('');
+    // Without the quoted-join rule: the callsign rule alone blocks each A1 case, and the A2 cases pass.
+    commitRules(f, withoutRule(repoRules(), quotedJoinRule));
+    for (const [line, , label] of widened) assert.equal(scanCommit(f, settingsText(line)).status, 1, `${label}: callsign rule alone`);
+    let scan = scanCommit(f, text(joined));
+    assert.equal(scan.status, 0, `quoted-join rule removed: ${scan.stderr}`);
+    // The callsign rule's 2.2.11 regex, alone and with its 2.2.11 allowlist (each edit also removes the quoted-join rule).
+    const regex2211 = ['regex', callsignRegexNx8, callsignRegexNx7];
+    const allow2211 = ['regexes', callsignAllowNx8, callsignAllowNx7];
+    for (const edits of [[regex2211], [regex2211, allow2211]]) {
+      commitRules(f, editRule(repoRules(), callsignRule, edits));
+      scan = scanCommit(f, text(widened));
+      assert.equal(scan.status, 0, `${edits.map(([key]) => key).join(' and ')} as in 2.2.11: ${scan.stderr}`);
+    }
+    // The NX-8 regex with the 2.2.11 allowlist flags synthetic lists with empty quotes.
+    commitRules(f, editRule(repoRules(), callsignRule, [allow2211]));
+    for (const [line, label] of needsAllow) assert.equal(scanCommit(f, settingsText(line)).status, 1, `${label}: 2.2.11 allowlist`);
   });
 
 // NX-7 #10: the commit email check reads `git log` placeholders, which Git

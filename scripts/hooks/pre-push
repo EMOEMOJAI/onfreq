@@ -143,7 +143,7 @@ for remote_oid in "$@"; do
     if ! gitleaks_note=$(pushed_gitleaks_changes "$range" 2>/dev/null); then
       printf 'pre-push: note — could not check the pushed commits for Gitleaks settings changes or gitleaks:allow.\n' >&2
     elif [ -n "$gitleaks_note" ]; then
-      printf 'pre-push: note — pushed commits change Gitleaks settings or add gitleaks:allow (%s); the scan honoured them, so review those changes.\n' \
+      printf 'pre-push: note — pushed commits change Gitleaks settings or gitleaks:allow lines, or carry gitleaks:allow in a message, author or path (%s); the scan applies the settings and markers on added lines and in messages, not in author names, emails or paths, so review those commits.\n' \
         "$gitleaks_note" >&2
     fi
   else
