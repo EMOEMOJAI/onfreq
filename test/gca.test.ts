@@ -9,6 +9,7 @@ import type { OnlineAtc } from '../src/types';
 import { postMessage, type DiscordEmbed } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
 import { cleanupGcaCopies } from '../src/retention';
+import { BOT_TOKEN } from './helpers';
 
 const START = Date.parse('2026-09-09T12:00:00Z');
 const QDLE = '100000000000000002';
@@ -1471,5 +1472,90 @@ describe('staff copies', () => {
     expect((await statuses())[0]).toMatchObject({ status: 'sent', attempts: 1 });
     await check([], config());
     expect(copies).toHaveLength(1); // staff copy still queued, not skipped as a failure
+  });
+});
+
+// NX-8 B: without a caller-supplied instance, sendGcaReminders loads the rate
+// limits itself with the configured public channels and the bot token as the
+// hash key, so a stored plain DM channel key is renamed to its keyed hash.
+// Synthetic ids and the synthetic test token; the hash is recomputed here.
+describe('rate-limit fallback', () => {
+  const PUBLIC_A = '900000000000000011';
+  const PUBLIC_B = '900000000000000012';
+  const LIMITS_ENTRY = 'discord-rate-limits-v1';
+  const route = (id: string) => `/channels/${id}/messages`;
+  const fallbackConfig = (overrides: Partial<Env> = {}): Env => ({
+    ...settings(), DISCORD_CHANNEL_IDS: ` ${PUBLIC_A} , ,${PUBLIC_B}, `, DISCORD_BOT_TOKEN: BOT_TOKEN, ...overrides,
+  });
+
+  async function hashedRoute(id: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', encoder.encode(BOT_TOKEN), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(`onfreq-rate-limit:v1:${id}`)));
+    return `/channels/@h:${[...mac.slice(0, 16)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}/messages`;
+  }
+
+  /** Every KV entry and every GCA table row, as one string. */
+  function storageDump() {
+    return runInDurableObject(stub(), async (_instance, ctx) => {
+      const kv = Object.fromEntries(await ctx.storage.list());
+      const tables = ctx.storage.sql.exec<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'sqlite_%'")
+        .toArray().map(({ name }) => name);
+      const rows = Object.fromEntries(tables.map((name) => [name, ctx.storage.sql.exec(`SELECT * FROM "${name}"`).toArray()]));
+      return JSON.stringify({ kv, rows });
+    });
+  }
+
+  it('loads limits with the parsed public channels and the token, renaming a plain DM channel key', async () => {
+    const config = fallbackConfig();
+    const load = vi.spyOn(DiscordRateLimits, 'load');
+    const logs = [vi.spyOn(console, 'log'), vi.spyOn(console, 'warn'), vi.spyOn(console, 'error')];
+    await runInDurableObject(stub(), (_instance, ctx) => sendGcaReminders(config, [], ctx.storage, now, parseGcaPolicy(config), []));
+    load.mockClear();
+    const until = now + 60_000;
+    await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.put(LIMITS_ENTRY, {
+      [route(CHANNEL)]: until, [route(PUBLIC_A)]: until,
+    }));
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      await sendGcaReminders(config, [atc()], ctx.storage, now, parseGcaPolicy(config), []);
+      expect(load).toHaveBeenCalledTimes(1);
+      const [storage, publicChannels, hashKey] = load.mock.calls[0]!;
+      expect(storage).toBe(ctx.storage);
+      expect(publicChannels).toBeInstanceOf(Set);
+      expect(publicChannels).toEqual(new Set([PUBLIC_A, PUBLIC_B]));
+      expect(hashKey === BOT_TOKEN).toBe(true); // compared without printing the token
+    });
+    const stored = await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.get<Record<string, number>>(LIMITS_ENTRY));
+    expect(stored).toEqual({ [await hashedRoute(CHANNEL)]: until, [route(PUBLIC_A)]: until });
+    // The renamed cooldown still applies: the DM was deferred before any message request.
+    expect(sent).toHaveLength(0);
+    expect(network.mock.calls.some(([url]) => String(url).endsWith('/users/@me/channels'))).toBe(true);
+    expect(network.mock.calls.some(([url]) => String(url).endsWith(route(CHANNEL)))).toBe(false);
+    expect((await statuses())[0]).toMatchObject({ status: 'pending' });
+    const dump = await storageDump();
+    expect(dump).toContain(await hashedRoute(CHANNEL));
+    expect(dump).toContain('gca_reminders');
+    expect(dump.includes(CHANNEL)).toBe(false);
+    expect(dump.includes(BOT_TOKEN)).toBe(false);
+    const logText = JSON.stringify(logs.flatMap((spy) => spy.mock.calls));
+    expect(logText.includes(CHANNEL)).toBe(false);
+    expect(logText.includes(BOT_TOKEN)).toBe(false);
+  });
+
+  it('does not load limits when the caller passes an instance', async () => {
+    const config = fallbackConfig();
+    const load = vi.spyOn(DiscordRateLimits, 'load');
+    await runInDurableObject(stub(), (_instance, ctx) =>
+      sendGcaReminders(config, [], ctx.storage, now, parseGcaPolicy(config), [], new DiscordRateLimits(ctx.storage)));
+    expect(load).not.toHaveBeenCalled();
+  });
+
+  it.each([['false'], [''], ['TRUE']])('does not load limits when GCA_DM_ENABLED is %j', async (enabled) => {
+    const config = fallbackConfig({ GCA_DM_ENABLED: enabled });
+    const load = vi.spyOn(DiscordRateLimits, 'load');
+    await runInDurableObject(stub(), (_instance, ctx) => sendGcaReminders(config, [atc()], ctx.storage, now, parseGcaPolicy(config), []));
+    expect(load).not.toHaveBeenCalled();
+    expect(network).not.toHaveBeenCalled();
   });
 });
