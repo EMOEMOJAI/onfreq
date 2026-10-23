@@ -27,16 +27,18 @@
 # spaces, and the shared filter scripts/hooks/lib/scan-stream.awk adds a blank
 # line after every line except inside a multi-line private key or a curl
 # command continued with backslashes, so each chunk ends at the end of a line
-# and such runs stay in one chunk. scripts/hooks/pre-commit runs the same
-# stages; the filter lists the known limits, such as lines longer than about
-# 25 KB.
+# and such runs stay in one chunk. A line over 20 000 bytes could still be cut
+# between chunks, so the filter exits 3 for one and the scan fails.
+# scripts/hooks/pre-commit runs the same stages; the filter lists the known
+# limits.
 #
 # Exit status: 0 clean; 1 Gitleaks found a secret or failed; 2 the commits
-# could not be read. POSIX sh has no pipefail, so each failed Git or filter
-# stage leaves a marker file instead. A Gitleaks that exits before reading all
-# its input, for example on a bad configuration, can make those stages fail on
-# the closed pipe, so when both fail the message names both causes; the status
-# is still 2.
+# could not be read, or add a line over 20 000 bytes. POSIX sh has no pipefail,
+# so each failed Git or filter stage leaves a marker file instead, and the
+# filter's exit 3 a separate one. A Gitleaks that exits before reading all its
+# input, for example on a bad configuration, can make those stages fail on the
+# closed pipe, so when both fail the message names both causes, as it does for
+# a long line and a failed scan; the status is still 2.
 set -eu
 # The GITLEAKS_CONFIG* variables would replace the repository's Gitleaks rules,
 # for example with an empty rule set; the scan uses only the reviewed
@@ -67,13 +69,22 @@ status=0
     : >"$tmp/failed"; } |
   { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
   { LC_ALL=C tr '\000' ' ' || : >"$tmp/failed"; } |
-  { LC_ALL=C awk -f "$filter" || : >"$tmp/failed"; } |
+  { LC_ALL=C awk -f "$filter" || case $? in (3) : >"$tmp/long" ;; (*) : >"$tmp/failed" ;; esac; } |
   gitleaks stdin --redact --no-banner || status=$?
+if [ -e "$tmp/long" ]; then
+  printf 'secret-scan: the secret scan cannot read lines over 20 000 bytes whole; split the line into shorter lines.\n' >&2
+fi
 if [ -e "$tmp/failed" ]; then
   if [ "$status" != 0 ]; then
     printf 'secret-scan: the secret scan failed or could not read the commits; see the output above.\n' >&2
   else
     printf 'secret-scan: could not read the commits to scan.\n' >&2
+  fi
+  exit 2
+fi
+if [ -e "$tmp/long" ]; then
+  if [ "$status" != 0 ]; then
+    printf 'secret-scan: the secret scan also failed or found a secret; see the output above.\n' >&2
   fi
   exit 2
 fi

@@ -1811,8 +1811,9 @@ test('both scans keep a private key block together and add blank lines everywher
 test('runs end before a long line, a diff or commit line, and a new key, and stay below 17 500 bytes (NX3-S1 c3)', (t) => {
   const f = fixture(t);
   const saved = join(f.repo, '..', 'stream.txt');
-  const long = (char) => char.repeat(24000);
-  // Adversarial input: 24 000-byte lines, keys without END and long continued commands.
+  // Over the 1 024 bytes that end a run; lines over 20 000 bytes fail the scan (L1).
+  const long = (char) => char.repeat(2000);
+  // Adversarial input: 2 000-byte lines, keys without END and long continued commands.
   writeFileSync(join(f.repo, 'a.txt'), [
     long('a'), `-----BEGIN ${keyKind}-----`, 'k1', long('b'), 'plain',
     `-----BEGIN ${keyKind}-----`, ...Array.from({ length: 40 }, () => 'm'.repeat(1000)),
@@ -1918,26 +1919,155 @@ test('a secret after a NUL byte, on its line or the next, is flagged through bot
     }
   });
 
-test('a real-shaped Discord ID near the end of a 22 000-byte ID list is flagged, as before (NX3-S1 c2)',
+// A DISCORD_CHANNEL_IDS line of `count` synthetic IDs with a real-shaped one third from the end.
+function idListLine(count) {
+  const ids = Array.from({ length: count }, (_, index) => String(900000000000000001n + BigInt(index)));
+  ids.splice(-3, 0, realShaped);
+  return assignment('DISCORD_CHANNEL_IDS', ids.join(','));
+}
+
+test('a real-shaped Discord ID near the end of a 19 000-byte ID list is flagged, as before (NX3-S1 c2)',
   { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });
     commitRules(f, repoRules());
-    const ids = Array.from({ length: 1160 }, (_, index) => String(900000000000000001n + BigInt(index)));
-    ids.splice(-3, 0, realShaped);
-    const line = assignment('DISCORD_CHANNEL_IDS', ids.join(','));
-    assert.ok(line.length > 22000 && line.length < 22100, String(line.length));
+    const line = idListLine(1020);
+    // Under the 20 000-byte long-line limit, with the diff's +.
+    assert.ok(line.length > 19000 && line.length < 19900, String(line.length));
     const { hook, scan } = scanAssignment(f, `# synthetic\n${line}# end\n`);
     for (const result of [...hook, scan]) {
       assert.equal(result.status, 1, result.stderr);
+      assert.doesNotMatch(result.stderr + result.stdout, /over 20 000 bytes/);
       assert.doesNotMatch(result.stderr + result.stdout, new RegExp(realShaped));
     }
   });
+
+test('a 22 000-byte ID list line holding a real-shaped Discord ID fails as a long line, redacted (NX3-S1 c2, NX5-L1)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const line = idListLine(1160);
+    assert.ok(line.length > 22000 && line.length < 22100, String(line.length));
+    const { hook, scan } = scanAssignment(f, `# synthetic\n${line}# end\n`);
+    for (const result of hook) {
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan cannot read lines over 20 000 bytes whole/);
+      assert.doesNotMatch(result.stderr + result.stdout, new RegExp(realShaped));
+    }
+    assert.equal(scan.status, 2, scan.stderr);
+    assert.match(scan.stderr, /secret-scan: the secret scan cannot read lines over 20 000 bytes whole/);
+    assert.doesNotMatch(scan.stderr + scan.stdout, new RegExp(realShaped));
+  });
+
+// NX5-L1: Gitleaks can cut a line over about 25 KB where a chunk ends, so the
+// filter fails both scans for a line over 20 000 bytes, counting the diff's +
+// or the message indent and any CR, as bytes. Each long line holds a random
+// marker that no output may show.
+const lineMarker = () => `m${randomBytes(8).toString('hex')}`;
+const longLine = {
+  hook: /^pre-commit: BLOCKED — the secret scan cannot read lines over 20 000 bytes whole; split the line into shorter lines\.$/m,
+  scan: /^secret-scan: the secret scan cannot read lines over 20 000 bytes whole; split the line into shorter lines\.$/m,
+};
+const longFilter = (bytes, where) =>
+  new RegExp(`^scan-stream: a line of ${bytes} bytes in ${where} is over 20 000 bytes, which the secret scan cannot read whole\\.$`, 'm');
+
+test('a line over 20 000 bytes blocks the commit and fails the history scan without showing it (NX5-L1)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    // A random AWS-shaped key, built at runtime.
+    const base32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    const key = ['AKIA', Array.from(randomBytes(16), (byte) => base32[byte % 32]).join('')].join('');
+    // Classic Mac line ends: short lines separated by CR only, one 30 000-byte Git line.
+    const crOnly = (m) => {
+      let text = `${m}\r`;
+      for (let index = 0; text.length < 30000; index++) text += `x${index}\r`;
+      return text.slice(0, 30000);
+    };
+    // [label, file content, the long line's bytes as Git prints it]
+    const cases = [
+      ['20 000 characters', (m) => `${m}${'a'.repeat(20000 - m.length)}`],
+      ['30 000 bytes with CR line ends only', crOnly, true],
+      ['5 001 four-byte characters', (m) => `${m}${'\u{1F600}'.repeat(5001)}`],
+      ['15 000 x "a "', (m) => `${m} ${'a '.repeat(15000)}`],
+      ['30 000 bytes ending in a real-shaped key', (m) => `${m}${'k'.repeat(30000 - m.length - key.length - 24)} aws_access_key_id = ${key}`],
+    ].map(([label, build, whole]) => {
+      const m = lineMarker();
+      const line = build(m);
+      return [label, m, whole ? line : `# synthetic\n${line}\n# end\n`, Buffer.byteLength(line) + 1];
+    });
+    for (const [label, m, text, bytes] of cases) {
+      const { hook, scan } = scanAssignment(f, text);
+      for (const result of hook) {
+        assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+        assert.match(result.stderr, longLine.hook, label);
+        assert.match(result.stderr, longFilter(bytes, 'file settings\\.env'), label);
+        assert.ok(!(result.stderr + result.stdout).includes(m), `${label}: marker shown`);
+        assert.ok(!(result.stderr + result.stdout).includes(key.slice(4)), `${label}: key shown`);
+      }
+      assert.equal(scan.status, 2, `${label}: ${scan.stderr}`);
+      assert.match(scan.stderr, longLine.scan, label);
+      assert.match(scan.stderr, longFilter(bytes, 'file settings\\.env of commit [0-9a-f]{40}'), label);
+      assert.ok(!(scan.stderr + scan.stdout).includes(m), `${label}: marker shown`);
+      assert.ok(!(scan.stderr + scan.stdout).includes(key.slice(4)), `${label}: key shown`);
+    }
+    // 19 999 characters are 20 000 bytes with the +: scanned as before.
+    const { hook, scan } = scanAssignment(f, `# synthetic\n${'a'.repeat(19999)}\n# end\n`);
+    for (const result of [...hook, scan]) {
+      assert.equal(result.status, 0, result.stderr);
+      assert.doesNotMatch(result.stderr, /over 20 000 bytes/);
+    }
+  });
+
+test('a commit message line over 20 000 bytes fails the history scan without showing it (NX5-L1)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const m = lineMarker();
+    // Git indents each message line by four spaces: 20 001 bytes become 20 005.
+    f.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m', `${m}${'b'.repeat(20001 - m.length)}`);
+    const head = f.git('rev-parse', 'HEAD');
+    let result = secretScan(f, 'HEAD^!');
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, longLine.scan);
+    assert.match(result.stderr, longFilter(20005, `the commit message of commit ${head}`));
+    assert.ok(!(result.stderr + result.stdout).includes(m), 'marker shown');
+    // 19 996 bytes are 20 000 with the indent.
+    f.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m', 'b'.repeat(19996));
+    result = secretScan(f, 'HEAD^!');
+    assert.equal(result.status, 0, result.stderr);
+  });
+
+test('a long line and a failing Gitleaks are both named; the filter still passes every line on (NX5-L1)', (t) => {
+  const f = fixture(t, { gitleaksExit: 1 });
+  const saved = join(f.repo, '..', 'stream.txt');
+  const m = lineMarker();
+  writeFileSync(join(f.repo, 'long.txt'), `${m}${'c'.repeat(25000)}\nshort\n${'d'.repeat(20001)}\n`);
+  f.git('add', 'long.txt');
+  const both = (result, label, prefix) => {
+    assert.match(result.stderr, new RegExp(`^${prefix}: the secret scan also failed or found a secret; see the output above\\.$`, 'm'), label);
+    assert.match(result.stderr, /^scan-stream: lines over 20 000 bytes in all: 2\.$/m, label);
+    assert.ok(!(result.stderr + result.stdout).includes(m), `${label}: marker shown`);
+  };
+  for (const options of [{ extraEnv: { GITLEAKS_STDIN: saved } }, { commit: true }]) {
+    const result = f.commitHook(options);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, longLine.hook);
+    both(result, JSON.stringify(options), 'pre-commit');
+  }
+  assertScanStream(readFileSync(saved, 'utf8'), 'pre-commit', stagedStream(f));
+  f.git('commit', '--quiet', '--no-verify', '-m', 'synthetic long lines');
+  const result = f.scan(['-1', 'HEAD'], { GITLEAKS_STDIN: saved });
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, longLine.scan);
+  both(result, 'secret-scan', 'secret-scan');
+  assertScanStream(readFileSync(saved, 'utf8'), 'secret-scan', headStream(f));
+});
 
 test('both scans run the shared stream filter after NUL replacement, each stage with a failure marker (NX3-S1)', (t) => {
   for (const file of ['./secret-scan.sh', './hooks/pre-commit']) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
     assert.match(source, /^filter=(?:\$\(dirname -- "\$0"\)\/|scripts\/)hooks\/lib\/scan-stream\.awk$/m, file);
-    assert.match(source, /^ +\{ LC_ALL=C sed -e '\/\^-\/d' -e '[^']*' \|\| : >"\$tmp\/failed"; \} \|\n +\{ LC_ALL=C tr '\\000' ' ' \|\| : >"\$tmp\/failed"; \} \|\n +\{ LC_ALL=C awk -f "\$filter" \|\| : >"\$tmp\/failed"; \} \|\n +gitleaks stdin /m, file);
+    // The filter's exit 3, a line over 20 000 bytes, leaves its own marker; any other failure the shared one.
+    assert.match(source, /^ +\{ LC_ALL=C sed -e '\/\^-\/d' -e '[^']*' \|\| : >"\$tmp\/failed"; \} \|\n +\{ LC_ALL=C tr '\\000' ' ' \|\| : >"\$tmp\/failed"; \} \|\n +\{ LC_ALL=C awk -f "\$filter" \|\| case \$\? in \(3\) : >"\$tmp\/long" ;; \(\*\) : >"\$tmp\/failed" ;; esac; \} \|\n +gitleaks stdin /m, file);
     assert.doesNotMatch(source, / -e G\b/, file);
   }
   const f = fixture(t);
@@ -1945,6 +2075,17 @@ test('both scans run the shared stream filter after NUL replacement, each stage 
   f.git('add', 'public.txt');
   const bin = join(f.repo, '..', 'bin');
   const realAwk = spawnSync('/bin/sh', ['-c', 'command -v awk'], { encoding: 'utf8' }).stdout.trim();
+  // A filter that exits 3 reports a long line, not a read failure.
+  writeFileSync(join(bin, 'awk'), `#!/bin/sh\nif [ "$1" = -f ]; then cat >/dev/null; exit 3; fi\nexec "${realAwk}" "$@"\n`, { mode: 0o700 });
+  let long = f.scan(['HEAD']);
+  assert.equal(long.status, 2, long.stderr);
+  assert.match(long.stderr, /^secret-scan: the secret scan cannot read lines over 20 000 bytes whole/m);
+  assert.doesNotMatch(long.stderr, /could not read the commits/);
+  long = f.commitHook();
+  assert.equal(long.status, 1, long.stderr);
+  assert.match(long.stderr, /^pre-commit: BLOCKED — the secret scan cannot read lines over 20 000 bytes whole/m);
+  assert.doesNotMatch(long.stderr, /could not be read|could not read/);
+  rmSync(join(bin, 'awk'));
   for (const [name, wrapper] of [
     ['awk', `#!/bin/sh\nif [ "$1" = -f ]; then cat >/dev/null; exit 2; fi\nexec "${realAwk}" "$@"\n`],
     ['tr', '#!/bin/sh\ncat >/dev/null\nexit 1\n'],

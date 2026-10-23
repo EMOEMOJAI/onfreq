@@ -8,6 +8,14 @@
 # return only a few KiB. So every line is printed followed by a blank line, and
 # a line of up to about 25 000 bytes reaches Gitleaks whole.
 #
+# A longer line could be cut where a chunk ends, so a line over 20 000 bytes
+# (counting the diff's + or the message indent, and any CR) fails the scan: it
+# is still printed, and at the end the filter names its length and where it is
+# (the diff --git header's path or the commit message, and the last commit
+# line's commit), never its content, on standard error and exits 3. The scans
+# then block, naming any Gitleaks failure too; no inline allow comment passes
+# it. Git C-quotes control characters in paths, so none reach the terminal raw.
+#
 # Runs are the exception: a multi-line private key, from a line with -----BEGIN
 # and then PRIVATE KEY but no -----END, to the next line holding -----END,
 # KEY----- or KEY BLOCK-----; and a curl command continued with a backslash at
@@ -18,11 +26,14 @@
 # than 1 024 bytes, a diff --git or commit line, or a new key's BEGIN line; so
 # no stretch without a blank line in a run exceeds 17 409 bytes.
 #
-# Known limits: a line longer than about 25 KB can be cut where a chunk ends; a
-# blank line inside a key, such as a PGP armor header gap in a commit message,
-# ends a chunk there; a key spread over several hunks is not one run; and
-# rules that match across lines, such as kubernetes-secret-yaml, see the added
-# blank lines (each costs a byte of their windows).
+# Known limits: a blank line inside a key, such as a PGP armor header gap in a
+# commit message, ends a chunk there; a key spread over several hunks is not
+# one run; and rules that match across lines, such as kubernetes-secret-yaml,
+# see the added blank lines (each costs a byte of their windows). Git's --text
+# shows a binary file as text, so an uncompressed binary with over 20 000
+# bytes between newlines fails the scan; compressed formats rarely do. A long
+# line that reaches published history fails every later history scan, CI's
+# included, until that history is rewritten: the scan fails closed.
 
 function starts_key(upper, begin) {
   begin = index(upper, "-----BEGIN")
@@ -41,9 +52,36 @@ function stop() {
   print ""
   run = 0
 }
+# Where the current line is: a file named by the last diff --git header, or the
+# commit message after a commit line, with that commit when there is one.
+function source(where) {
+  where = path == "" ? "the commit message" : "file " path
+  return commit == "" ? where : where " of commit " commit
+}
+# The path of a diff --git header: "a/P b/P", quoted or not, gives P; other
+# headers, such as renames, give both names. Over-long names are not printed.
+function header_path(rest, half, first, second) {
+  if (length(rest) > 4096) return "(a path over 4 096 bytes)"
+  half = (length(rest) - 1) / 2
+  first = substr(rest, 1, half)
+  second = substr(rest, half + 2)
+  if (half == int(half) && substr(rest, half + 1, 1) == " ") {
+    if (substr(first, 1, 2) == "a/" && substr(second, 1, 2) == "b/" && substr(first, 3) == substr(second, 3)) return substr(first, 3)
+    if (substr(first, 1, 3) == "\"a/" && substr(second, 1, 3) == "\"b/" && substr(first, 4) == substr(second, 4)) return "\"" substr(first, 4)
+  }
+  return rest
+}
 
 {
   n = length($0)
+  if (/^commit [0-9a-f]+( |$)/) {
+    commit = $2
+    path = ""
+  } else if (/^diff --git /) path = header_path(substr($0, 12))
+  if (n > 20000 && !long++) {
+    long_bytes = n
+    long_source = source()
+  }
   upper = toupper($0)
   if (run && (n > 1024 || /^diff --git / || /^commit [0-9a-f]+( |$)/ || starts_key(upper))) stop()
   if (run) {
@@ -66,4 +104,9 @@ function stop() {
 
 END {
   if (run) print ""
+  if (long) {
+    printf("scan-stream: a line of %d bytes in %s is over 20 000 bytes, which the secret scan cannot read whole.\n", long_bytes, long_source) > "/dev/stderr"
+    if (long > 1) printf("scan-stream: lines over 20 000 bytes in all: %d.\n", long) > "/dev/stderr"
+    exit 3
+  }
 }

@@ -41,7 +41,10 @@ trap 'exit 1' HUP INT TERM
 # 36 000-byte preamble keeps Gitleaks from skipping the input as a binary file,
 # and NUL bytes become spaces before the shared filter
 # scripts/hooks/lib/scan-stream.awk adds the blank lines that keep a line, a
-# private key or a continued curl command from being cut between chunks.
+# private key or a continued curl command from being cut between chunks. A
+# line over 20 000 bytes could still be cut, so the filter exits 3 for one,
+# which leaves its own marker and blocks the commit; no inline allow comment
+# passes it.
 unset GIT_DIFF_OPTS
 filter=scripts/hooks/lib/scan-stream.awk
 if [ ! -r "$filter" ]; then
@@ -54,9 +57,19 @@ output=$({ { preamble && git diff --cached -U0 --inter-hunk-context=0 --no-ext-d
     : >"$tmp/failed"; } |
   { LC_ALL=C sed -e '/^-/d' -e 's/^\(@@ -[0-9][0-9,]* +[0-9][0-9,]* @@\).*/\1/' || : >"$tmp/failed"; } |
   { LC_ALL=C tr '\000' ' ' || : >"$tmp/failed"; } |
-  { LC_ALL=C awk -f "$filter" || : >"$tmp/failed"; } |
+  { LC_ALL=C awk -f "$filter" || case $? in (3) : >"$tmp/long" ;; (*) : >"$tmp/failed" ;; esac; } |
   gitleaks stdin --no-banner --redact 2>&1) || status=$?
 if [ -e "$tmp/failed" ] || [ "$status" != 0 ]; then printf '\n%s\n' "$output" >&2; fi
+if [ -e "$tmp/long" ]; then
+  printf '\npre-commit: BLOCKED — the secret scan cannot read lines over 20 000 bytes whole; split the line into shorter lines.\n' >&2
+  if [ -e "$tmp/failed" ]; then
+    printf 'pre-commit: the staged changes also could not be read for the secret scan; see the output above.\n' >&2
+  fi
+  if [ "$status" != 0 ]; then
+    printf 'pre-commit: the secret scan also failed or found a secret; see the output above.\n' >&2
+  fi
+  exit 1
+fi
 # A Gitleaks that exits before reading all its input, for example on a bad
 # configuration, makes Git or sed fail on the closed pipe, so both causes are
 # named.
