@@ -755,6 +755,24 @@ describe('short-session reminders: presence regressions send nothing', () => {
       .toEqual([{ online_since: ms(0), session_ids: '[5,9]' }]);
   });
 
+  it('NX-4: a session_id outside session_ids (left by 2.2.6) still matches after a long gap', async () => {
+    const other = entry('QCZZ_APP', 600002, 119.1, 7);
+    await at(0, [other]);
+    await at(1, [twr(5), app(9), other]);
+    await at(60, [twr(5), app(9), other]);
+    await at(61, [other]);
+    await during(62, 76, 2, [other]);
+    await sql(`UPDATE ${ONLINE} SET session_id = 12 WHERE user_id = ${VID}`);
+    await at(77, [twr(12), other]);
+    await at(92, [other]);
+    await at(93, [other]);
+    await at(110, [other]);
+    await expectNothing();
+    expect(await sql(`SELECT online_since, session_ids FROM ${ONLINE} WHERE user_id = ${VID}`))
+      .toEqual([{ online_since: ms(0), session_ids: '[5,9,12]' }]);
+    expect(pollFailures).toEqual([]);
+  });
+
   it('NX-4: adds session_ids in place to an online table without it, keeping its rows', async () => {
     await at(0, []);
     await at(1, [twr(4), app(6)]);

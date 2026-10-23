@@ -572,13 +572,14 @@ describe('polling through the Durable Object', () => {
       await ctx.storage.put(POLL_SNAPSHOT_KEY, { state: {}, pendingOffline: jobs } satisfies PollSnapshot);
     });
     feed = [entry(b)];
-    // A slow Discord: each request takes 15 s of the mocked clock, so with the
-    // 10 s start margin the 45 s budget allows three requests (at 0, 15, 30 s).
+    // A slow Discord: each request takes 12 s of the mocked clock, so with the
+    // 10 s start margin the 45 s budget allows three requests (at 0, 12, 24 s); a
+    // fourth at 36 s would be deferred as 36 + 10 > 45 (a bare deadline check would start it).
     const original = network.getMockImplementation()!;
     let slow = true;
     network.mockImplementation(async (input, init) => {
       const response = await original(input, init);
-      if (slow && String(input).startsWith('https://discord.com/')) now += 15_000;
+      if (slow && String(input).startsWith('https://discord.com/')) now += 12_000;
       return response;
     });
     const discordCalls = () => network.mock.calls.filter(([input]) => String(input).startsWith('https://discord.com/')).length;

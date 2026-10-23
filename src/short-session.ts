@@ -153,8 +153,9 @@ const isVid = (id: number) => Number.isSafeInteger(id) && id > 0;
 const MAX_SESSION_IDS = 8;
 
 /**
- * A record's stored ids: the valid elements of session_ids, else [session_id]
- * when that is valid. Unparsable or invalid text never throws; it falls back.
+ * A record's stored ids: the valid elements of session_ids plus session_id when
+ * that is valid (an UPDATE by an older version can leave session_id outside the
+ * set). Unparsable or invalid text never throws; it contributes nothing.
  */
 function storedSessionIds(text: string | null, sessionId: number | null): Set<number> {
   let ids: number[] = [];
@@ -164,7 +165,7 @@ function storedSessionIds(text: string | null, sessionId: number | null): Set<nu
       if (Array.isArray(parsed)) ids = parsed.filter((id): id is number => typeof id === 'number' && isVid(id));
     } catch { /* fall back below */ }
   }
-  if (!ids.length && typeof sessionId === 'number' && isVid(sessionId)) ids = [sessionId];
+  if (typeof sessionId === 'number' && isVid(sessionId)) ids.push(sessionId);
   return new Set(ids);
 }
 
