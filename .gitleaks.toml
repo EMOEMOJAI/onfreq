@@ -107,14 +107,16 @@ regexes = ['''(?i)^\s*[QX][A-Z]{0,3}(?:\s*,\s*[QX][A-Z]{0,3})*\s*,?\s*$''']
 # JSON, YAML or PowerShell (real lists have no Q or X item); an unquoted
 # uppercase list that ends the line, as in YAML or a compose list item;
 # NAME=list without blanks, as after env or A=1; or NAME:list, as in
-# `wrangler dev --var NAME:list`, with items in either case, up to a blank,
-# quote, ;, &, | or ). So code (`NAME: prefixes`), names in prose and
-# `wrangler secret put` pass, and so do values that are not prefix lists. Lists
-# of Q and X items, with empty items, are synthetic.
+# `wrangler dev --var NAME:list`, with items in either case and the same blanks
+# allowed around commas, up to an ASCII blank, quote, ;, &, | or ). So code
+# (`NAME: prefixes`), names in prose and `wrangler secret put` pass, and so do
+# values that are not prefix lists. Lists of Q and X items, with empty items,
+# are synthetic; a synthetic NAME:list with a Unicode blank around a comma is
+# flagged, which fails safe.
 [[rules]]
 id = "onfreq-fir-prefixes-property"
 description = "onfreq FIR_PREFIXES assigned a prefix list"
-regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(?:["'`]([\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*[A-Za-z]{0,4})*[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*)["'`]|([A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)[ \t\r]*(?:#[^\n]*)?$)|\bFIR_PREFIXES=([A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[ \t\r;&|)]|$)|\bFIR_PREFIXES:([A-Za-z]{1,4}(?:[ \t]*,[ \t]*[A-Za-z]{0,4})*)(?:[\s"'`;&|)]|$)'''
+regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(?:["'`]([\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*[A-Za-z]{0,4})*[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*)["'`]|([A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)[ \t\r]*(?:#[^\n]*)?$)|\bFIR_PREFIXES=([A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[ \t\r;&|)]|$)|\bFIR_PREFIXES:([A-Za-z]{1,4}(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*[A-Za-z]{0,4})*)(?:[\s"'`;&|)]|$)'''
 keywords = ["fir_prefixes"]
 
 [[rules.allowlists]]
@@ -135,12 +137,19 @@ regexTarget = "secret"
 regexes = ['''^synthetic[-A-Za-z0-9]*$''']
 
 # The coordinator name as NAME:value, as in `wrangler dev --var NAME:value`,
-# anywhere on a line, with the exact uppercase name, up to a blank, quote, #, ;,
-# &, | or ). Code and JSON (`NAME: value`, `"NAME":`) have no such form.
+# anywhere on a line, with the exact uppercase name: a whole double-quoted,
+# single-quoted or backtick-quoted value, or an unquoted value up to a blank,
+# quote, #, ;, &, | or ). The secret is the first non-empty group, so a quoted
+# value is checked whole and a blank inside it is not allowlisted. The compact
+# TypeScript object form, a quoted value right after the colon inside braces,
+# is flagged too; code and JSON with a blank or a quote between the name and
+# the value (`NAME: value`, `"NAME":`) pass. A concatenation such as
+# 'NAME:' + value, and Markdown whose code span ends right after the colon with
+# another backtick later on the line, are flagged as well, which fails safe.
 [[rules]]
 id = "onfreq-coordinator-name-colon"
 description = "onfreq COORDINATOR_NAME passed as NAME:value"
-regex = '''\bCOORDINATOR_NAME:([^\s"'`#;&|)]+)'''
+regex = '''\bCOORDINATOR_NAME:(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([^\s"'`#;&|)]+))'''
 keywords = ["coordinator_name"]
 
 [[rules.allowlists]]
@@ -235,9 +244,11 @@ keywords = ["gca_policy_url"]
 # characters or an unquoted one without a digit, a callsign list whose first
 # item has no underscore or a dot before it (so env.NAME references pass), and
 # a policy link without a scheme. Shell quoting that joins a synthetic quoted
-# first item to the rest (NAME="QCXX_CTR",<item> or FIR_PREFIXES="QX",<item>),
-# blanks written as escapes ("\t<item>", $'\f<item>') and Unicode letters
-# that uppercase to Latin ones are not covered either. Gitleaks' default
+# first item to the rest (NAME="QCXX_CTR",<item> or FIR_PREFIXES="QX",<item>)
+# or a synthetic quoted coordinator name to more text (NAME:'synthetic'"<more>"),
+# a coordinator name whose quote after the colon is never closed, blanks
+# written as escapes ("\t<item>", $'\f<item>') and Unicode letters that
+# uppercase to Latin ones are not covered either. Gitleaks' default
 # global allowlist passes values that start with "true", contain "false" or
 # end with "null" (any case), $VAR-style templates, one repeated character and
 # system paths; it cannot be removed while the default rules are extended.

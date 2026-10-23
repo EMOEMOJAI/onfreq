@@ -2261,6 +2261,10 @@ function g1Cases() {
 // coordinator name are flagged. Flagged lines are assembled at runtime from joined names, J
 // prefixes, random hosts and values, so this file never holds one. Each rule's
 // texts before NX5-L2 are pinned here, so the necessity test can restore them.
+// NX-6: the coordinator-name colon rule also takes a whole quoted value, and the
+// FIR prefix NAME:list branch takes the blank class B around commas. The colon
+// rule had no text before NX5-L2, so its pinned earlier text is the one before
+// NX-6; the FIR text before NX-6 is pinned separately (firColonBeforeNx6).
 const tick = '`';
 const blankClass = String.raw`[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]`;
 const itemClass = String.raw`[^\s,"'${tick};)}\]]*`;
@@ -2269,6 +2273,10 @@ const callsignRegex = String.raw`${callsignHead}${blankClass}*([A-Za-z0-9-]+_${i
 const callsignItem = String.raw`[^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*`;
 const firBlank = String.raw`[\t \p{Zs}\x{FEFF}]`;
 const firBeforeL2 = String.raw`regex = '''(?m)\bFIR_PREFIXES\b["']?[ \t]*[=:][ \t]*(?:["'${tick}](${firBlank}*[A-PR-WYZa-pr-wyz][A-Za-z]{0,3}(?:${firBlank}*,${firBlank}*[A-Za-z]{0,4})*${firBlank}*)["'${tick}]|([A-Z]{1,4}(?:[ \t]*,[ \t]*[A-Z]{1,4})*)[ \t\r]*(?:#[^\n]*)?$)|\bFIR_PREFIXES=([A-Za-z]{1,4}(?:,[A-Za-z]{0,4})*)(?:[ \t\r;&|)]|$)'''`;
+// The FIR prefix rule's NAME:list branch, with `blank` around commas.
+const firColon = (blank) => String.raw`|\bFIR_PREFIXES:([A-Za-z]{1,4}(?:${blank}*,${blank}*[A-Za-z]{0,4})*)(?:[\s"'${tick};&|)]|$)'''`;
+const firCurrent = firBeforeL2.replaceAll(firBlank, blankClass).slice(0, -3) + firColon(blankClass);
+const firColonBeforeNx6 = firBeforeL2.replaceAll(firBlank, blankClass).slice(0, -3) + firColon(String.raw`[ \t]`);
 const l2Texts = {
   'onfreq-excluded-callsigns-assignment': [
     ['regex', callsignRegex,
@@ -2277,8 +2285,11 @@ const l2Texts = {
       String.raw`regexes = ['''(?i)^[QX][A-Z0-9_]*(?:[ \t]*,[ \t]*(?:[QX][A-Z0-9_]*)?)*$''']`],
   ],
   'onfreq-fir-prefixes-property': [
-    ['regex', firBeforeL2.replaceAll(firBlank, blankClass).slice(0, -3)
-      + String.raw`|\bFIR_PREFIXES:([A-Za-z]{1,4}(?:[ \t]*,[ \t]*[A-Za-z]{0,4})*)(?:[\s"'${tick};&|)]|$)'''`, firBeforeL2],
+    ['regex', firCurrent, firBeforeL2],
+  ],
+  'onfreq-coordinator-name-colon': [
+    ['regex', String.raw`regex = '''\b${coordinatorName}:(?:"([^"\n]+)"|'([^'\n]+)'|${tick}([^${tick}\n]+)${tick}|([^\s"'${tick}#;&|)]+))'''`,
+      String.raw`regex = '''\b${coordinatorName}:([^\s"'${tick}#;&|)]+)'''`],
   ],
   'onfreq-gca-policy-url-quoted-userinfo': [
     ['regex', String.raw`regex = '''\b(?i:GCA_POLICY_URL)\b["']?\s*[=:]\s*([A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*["'${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*@[^\s"'${tick}]*|"[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:"(?:[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)?|['${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*|'[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:'(?:[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)?|["${tick}\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*|${tick}[ \t]*[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~%!$&*+;=-]*(?:${tick}[A-Za-z0-9._~%!$*+=:"'${tick}\\-][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*|["'\\][A-Za-z0-9._~%!$&*+;=:"'${tick}\\-]*)@[^\s"'${tick}]*)'''`,
@@ -2295,23 +2306,26 @@ function editRule(rules, id, edits) {
   for (const [key, from, to] of edits) {
     const at = lines.findIndex((line, index) => index > start && line.startsWith(`${key} = `));
     assert.ok(at > start && (end < 0 || at < end), `${id} ${key}`);
-    assert.equal(lines[at], from, `${id} ${key} is the NX5-L2 text`);
+    assert.equal(lines[at], from, `${id} ${key} is the current text`);
     lines[at] = to;
   }
   return lines.join('\n');
 }
 // The configuration with rule `id` as before NX5-L2.
 const beforeL2 = (rules, id) => editRule(rules, id, l2Texts[id]);
-// rule id -> { block: [line, text the redacted output must not show, label, needs the change][],
+// rule id -> { block: [line, text or texts the redacted output must not show, label, needs the change,
+//                      needs NX-6's FIR blanks][],
 //              pass: [line, label, needs the change][] }; "needs the change" marks
-// cases whose outcome differs with the rule's text before NX5-L2 (pass instead
+// cases whose outcome differs with the rule's pinned earlier text (pass instead
 // of block, or block instead of pass); the others guard against regressions.
 function l2Cases() {
   const host = `jddd-${randomBytes(3).toString('hex')}.org`;
   const tower = jsonName('JDDD', 'TWR');
   const [jd, je] = [jPrefix('D'), jPrefix('E')];
   const name = ['jd', randomBytes(3).toString('hex')].join('-');
+  const [first, last] = ['jd', 'je'].map((part) => [part, randomBytes(3).toString('hex')].join('-'));
   const mail = ['a', 'b.test'].join('@');
+  const cn = (rest) => `${coordinatorName}${rest}\n`;
   const cs = (rest) => `${callsignsName}${rest}\n`;
   return {
     'onfreq-excluded-callsigns-assignment': {
@@ -2370,17 +2384,36 @@ function l2Cases() {
         [`wrangler dev --var A:1 ${firPrefixes}:${jd}\n`, '', 'second --var item ending the line', false],
         [`wrangler dev --var A:1 ${firPrefixes}:${jd} --port 1\n`, '', 'second --var item before more options', true],
         [`wrangler dev --var "${firPrefixes}:${jd}, ${je}"\n`, `${jd}, ${je}`, 'quoted --var with a blank', true],
+        [`wrangler dev --var ${firPrefixes}:${jd},\u00a0${je}\n`, `${jd},\u00a0${je}`,
+          'no-break space after a comma in NAME:list (NX-6)', true, true],
       ],
       pass: [
         [`wrangler dev --var ${firPrefixes}:QC,XA --port 1\n`, 'synthetic NAME:list', false],
+        [`wrangler dev --var ${firPrefixes}:QC,XA\n`, 'synthetic NAME:list ending the line (NX-6)', false],
       ],
     },
     'onfreq-coordinator-name-colon': {
       block: [
-        [`wrangler dev --var ${coordinatorName}:${name}\n`, name, 'wrangler --var NAME:value', true],
+        // The unquoted value was already flagged before NX-6.
+        [`wrangler dev --var ${cn(`:${name}`)}`, name, 'wrangler --var NAME:value', false],
+        [`wrangler dev --var ${cn(`:'${first} ${last}'`)}`, [first, last], 'single-quoted name with a blank (NX-6)', true],
+        [`wrangler dev --var ${cn(`:"${name}"`)}`, name, 'double-quoted name (NX-6)', true],
+        [`wrangler dev --var ${cn(`:${tick}${name}${tick}`)}`, name, 'backtick-quoted name (NX-6)', true],
+        [`wrangler dev --var ${cn(`:' ${name}'`)}`, name, 'quoted name with a leading blank (NX-6)', true],
+        [`wrangler dev --var ${cn(`:"synthetic ${name}"`)}`, name, 'quoted synthetic word and a blank (NX-6)', true],
+        [`const vars = {${coordinatorName}:'${name}'};\n`, name, 'compact TypeScript object (NX-6)', true],
+        [`wrangler dev --var ${cn(`:"synthetic-x\\"${name}\\""`)}`, name, 'escaped quote after a synthetic word (NX-6)', true],
+        [cn(`:${name}`), name, 'NAME:value at the start of a line (NX-6 regression)', false],
+        [`wrangler dev --var "${coordinatorName}:${first} ${last}"\n`, first, 'quoted --var with a blank (NX-6 regression)', false],
       ],
       pass: [
         [`wrangler dev --var ${coordinatorName}:synthetic-x\n`, 'synthetic NAME:value', false],
+        [`wrangler dev --var ${cn(':"synthetic-x"')}`, 'double-quoted synthetic name (NX-6)', false],
+        [`wrangler dev --var ${cn(":'synthetic-x'")}`, 'single-quoted synthetic name (NX-6)', false],
+        [cn(":''"), 'empty single-quoted value (NX-6)', false],
+        [cn(':""'), 'empty double-quoted value (NX-6)', false],
+        [`{"${coordinatorName}":"${name}"}\n`, 'compact JSON (NX-6)', false],
+        [cn(": ' preserved-state '"), 'code with a blank after the colon (NX-6)', false],
       ],
     },
   };
@@ -2417,10 +2450,23 @@ test('the repository Gitleaks rules block NX5-L2 callsign, policy link, FIR pref
         const { hook, scan } = scanAssignment(f, settingsText(line));
         for (const result of [...hook, scan]) {
           assert.equal(result.status, 1, `${label}: ${result.stderr}`);
-          if (secret) assert.ok(!(result.stderr + result.stdout).includes(secret), label);
+          for (const text of [secret].flat()) {
+            if (text) assert.ok(!(result.stderr + result.stdout).includes(text), `${label}: ${text.length} characters shown`);
+          }
         }
       }
     }
+  });
+
+test('the NX-6 blanks around commas in the FIR prefix NAME:list branch are needed: their cases pass with ASCII blanks (NX-6)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const id = 'onfreq-fir-prefixes-property';
+    const needed = l2Cases()[id].block.filter((item) => item[4]);
+    assert.ok(needed.length > 0);
+    commitRules(f, editRule(repoRules(), id, [['regex', firCurrent, firColonBeforeNx6]]));
+    const scan = scanCommit(f, needed.map(([line]) => settingsText(line)).join(''));
+    assert.equal(scan.status, 0, `${id} before NX-6: ${scan.stderr}`);
   });
 
 test('the repository Gitleaks rules pass NX5-L2 synthetic, reference and shell-separated forms (NX5-L2)',
