@@ -57,6 +57,43 @@ test('the repository Gitleaks allowlist matches whole synthetic fixture values o
     assert.equal(scan.status, 0, scan.stderr);
   });
 
+test('the repository Gitleaks rule blocks GCA records signing keys and passes synthetic ones (GR G2)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    // Names and values are assembled at runtime, so this file never holds an assignment.
+    const primary = jsonName('GCA', 'ADMIN', 'HMAC', 'KEY');
+    const next = jsonName(primary, 'NEXT');
+    // 34 characters, low-entropy and not synthetic: the default rules alone miss it.
+    const value = 'cd'.repeat(17);
+    const nextLine = `${next}=${value}\n`;
+    const rules = repoRules().toString();
+    const withoutGca = rules.replace(`|${primary}(?:_NEXT)?`, '').replace(', "gca_admin_hmac_key"', '');
+    assert.notEqual(withoutGca, rules);
+    for (const before of ['[extend]\nuseDefault = true\n', withoutGca]) {
+      commitRules(f, before);
+      const { hook, scan } = scanAssignment(f, nextLine);
+      for (const result of hook) assert.equal(result.status, 0, result.stderr);
+      assert.equal(scan.status, 0, scan.stderr);
+    }
+    commitRules(f, rules);
+    for (const text of [nextLine, assignment(primary, value), `export ${next}='${value}'\n`, `  ${primary}: '${value}',\n`,
+      `"${next}": "${value}"\n`]) {
+      const { hook, scan } = scanAssignment(f, text);
+      for (const result of hook) {
+        assert.equal(result.status, 1, `${text}: ${result.stderr}`);
+        assert.match(result.stderr, /pre-commit: BLOCKED — the secret scan failed or found a secret/);
+        assert.doesNotMatch(result.stderr + result.stdout, new RegExp(value));
+      }
+      assert.equal(scan.status, 1, `${text}: ${scan.stderr}`);
+      assert.doesNotMatch(scan.stderr + scan.stdout, new RegExp(value));
+    }
+    // Synthetic fixtures, empty placeholders and binding references pass.
+    const { hook, scan } = scanAssignment(f, assignment(primary, 'synthetic-gca-admin-test-key-0001-abcdef')
+      + `${next}=synthetic-gca-admin-next-key-0002-abcdef\n${primary}=""\n${next}=\n  ${primary}: env.${primary},\n`);
+    for (const result of hook) assert.equal(result.status, 0, result.stderr);
+    assert.equal(scan.status, 0, scan.stderr);
+  });
+
 test('the repository Gitleaks rules block real-shaped Discord IDs and private JSON literals, redacted (ROT-1)',
   { skip: gitleaksSkip }, (t) => {
     const f = fixture(t, { gitleaks: 'real' });

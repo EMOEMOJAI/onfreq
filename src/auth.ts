@@ -1,7 +1,8 @@
 /**
  * Shared-secret authentication for the bearer-gated HTTP routes: POLL_SECRET
- * protects /poll and /health; HISTORY_SECRET protects /gca-history and
- * /gca-history/cleanup.
+ * protects /poll and /health; HISTORY_SECRET protects /gca-history,
+ * /gca-history/cleanup and the operator's /gca-history/records routes. The
+ * signed GCA records routes are verified in src/gca-records-http.ts.
  *
  * /poll exists as a fallback for when Cloudflare's cron scheduler stops
  * firing (as it did on 2026-08-17): any external scheduler can drive the poll
@@ -10,6 +11,19 @@
 
 /** Shorter bearer secrets are too guessable for these unthrottled endpoints. */
 export const MIN_SECRET_LENGTH = 32;
+
+/**
+ * The GCA records signing keys (primary, then the optional next key during a
+ * rotation). A bearer secret equal to either disables its routes, and either
+ * equal to a bearer or other secret disables the signed routes.
+ */
+export const GCA_KEY_NAMES = ['GCA_ADMIN_HMAC_KEY', 'GCA_ADMIN_HMAC_KEY_NEXT'] as const;
+
+/** The name of the GCA key `secret` equals (trimmed, non-empty), if any. */
+export function reusedGcaKey(env: Pick<Env, (typeof GCA_KEY_NAMES)[number]>, secret: string): string | undefined {
+  if (!secret) return undefined;
+  return GCA_KEY_NAMES.find((name) => env[name]?.trim() === secret);
+}
 
 /**
  * Reasons already logged in this isolate. Invalid configuration is checked on

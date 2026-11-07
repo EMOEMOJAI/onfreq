@@ -20,6 +20,8 @@ type OptionalSecrets = {
   POLL_SECRET?: string;
   HISTORY_SECRET?: string;
   IVAO_WEBHOOK_SECRET?: string;
+  GCA_ADMIN_HMAC_KEY?: string;
+  GCA_ADMIN_HMAC_KEY_NEXT?: string;
 };
 
 // Extra local secret names must not turn optional features into required bindings.

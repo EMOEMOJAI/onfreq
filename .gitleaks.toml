@@ -9,9 +9,9 @@ useDefault = true
 [[rules]]
 id = "onfreq-secret-assignment"
 description = "onfreq secret assigned a non-empty value"
-regex = '''\b(?:POLL_SECRET|HISTORY_SECRET|IVAO_WEBHOOK_SECRET|IVAO_CLIENT_SECRET|DISCORD_BOT_TOKEN)\b["']?\s*[=:]\s*["'`]?[ \t]*([^\s"'`]{16,})'''
+regex = '''\b(?:POLL_SECRET|HISTORY_SECRET|IVAO_WEBHOOK_SECRET|IVAO_CLIENT_SECRET|DISCORD_BOT_TOKEN|GCA_ADMIN_HMAC_KEY(?:_NEXT)?)\b["']?\s*[=:]\s*["'`]?[ \t]*([^\s"'`]{16,})'''
 secretGroup = 1
-keywords = ["poll_secret", "history_secret", "ivao_webhook_secret", "ivao_client_secret", "discord_bot_token"]
+keywords = ["poll_secret", "history_secret", "ivao_webhook_secret", "ivao_client_secret", "discord_bot_token", "gca_admin_hmac_key"]
 
 # Content-based only: hooks and CI scan `gitleaks stdin`, which has no paths.
 # Test fixtures use values that begin with "synthetic-"; the other entries are

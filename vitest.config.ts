@@ -30,6 +30,9 @@ export default defineConfig({
         POLL_SECRET: 'synthetic-poll-secret-for-vitest-only',
         HISTORY_SECRET: 'synthetic-history-secret-for-vitest-only',
         IVAO_WEBHOOK_SECRET: 'synthetic-ivao-webhook-signing-secret-vitest',
+        // The plan's fixed-vector dummy key (key id 839683debc9ccbd0) and a distinct next key.
+        GCA_ADMIN_HMAC_KEY: 'synthetic-gca-admin-test-key-0001-abcdef',
+        GCA_ADMIN_HMAC_KEY_NEXT: 'synthetic-gca-admin-next-key-0002-abcdef',
         FIR_PREFIXES: 'XA,QC,QE,QF,QG,QH',
         FIR_LABELS: '',
         OFFLINE_GRACE_POLLS: '2',

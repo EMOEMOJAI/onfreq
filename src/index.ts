@@ -1,5 +1,6 @@
-import { configuredSecret, extractBearer, logConfigInvalidOnce, secretsMatch } from './auth';
+import { configuredSecret, extractBearer, logConfigInvalidOnce, reusedGcaKey, secretsMatch } from './auth';
 import { getCoordinator } from './config';
+import { GCA_SIGNED_ROUTES, gcaMetaResponse, handleGcaRecords } from './gca-records-http';
 import { errorResponse } from './http';
 import { handleWebhook, WEBHOOK_PATH } from './webhook';
 
@@ -40,7 +41,9 @@ function routeFailed(url: URL, err: unknown): Response {
  * Unset or too-short secrets disable the endpoint. A HISTORY_SECRET equal to
  * POLL_SECRET also disables the history routes, since the poll token is held
  * by monitors. A bearer secret equal to IVAO_WEBHOOK_SECRET disables its
- * routes, since that signing secret is also held by IVAO's webhook service.
+ * routes, since that signing secret is also held by IVAO's webhook service,
+ * and so does one equal to either GCA records signing key, which the staff
+ * website holds.
  */
 async function requireSecret(request: Request, env: Env, name: Route['secret']): Promise<Response | null> {
   let expected = configuredSecret(env[name], name);
@@ -51,6 +54,11 @@ async function requireSecret(request: Request, env: Env, name: Route['secret']):
   }
   if (expected && expected === env.IVAO_WEBHOOK_SECRET?.trim()) {
     logConfigInvalidOnce(`${name}_reuses_IVAO_WEBHOOK_SECRET`);
+    expected = '';
+  }
+  const gcaKey = reusedGcaKey(env, expected);
+  if (gcaKey) {
+    logConfigInvalidOnce(`${name}_reuses_${gcaKey}`);
     expected = '';
   }
   if (!expected) return errorResponse('endpoint disabled', 503);
@@ -130,11 +138,34 @@ async function handleCleanup(request: Request, _url: URL, env: Env): Promise<Res
   return Response.json(result, { status: result.busy ? 409 : 200 });
 }
 
+/** Operator view of the stored GCA records: the same meta the signed route returns. */
+async function handleRecordsMeta(_request: Request, _url: URL, env: Env): Promise<Response> {
+  const result = await getCoordinator(env).gcaRecordsMeta();
+  // Only the signed route can be refused; treat anything else as unavailable.
+  if (!result.ok) return errorResponse('coordinator unavailable', 503);
+  return gcaMetaResponse(result);
+}
+
+/**
+ * Emergency delete of the stored GCA records and their history, only with
+ * explicit confirmation. The version counter is kept, so a later publish
+ * never reuses a version.
+ */
+async function handleRecordsDelete(request: Request, _url: URL, env: Env): Promise<Response> {
+  if (request.headers.get('x-onfreq-confirm') !== 'delete-gca-records') {
+    return errorResponse('confirm with X-Onfreq-Confirm: delete-gca-records', 400);
+  }
+  const result = await getCoordinator(env).gcaRecordsOperatorDelete();
+  return Response.json({ ok: true, deleted: result.deleted, history: result.history });
+}
+
 const ROUTES = new Map<string, Route>([
   ['/poll', { methods: ['POST'], secret: 'POLL_SECRET', handle: handlePoll }],
   ['/health', { methods: ['GET'], secret: 'POLL_SECRET', handle: handleHealth }],
   ['/gca-history', { methods: ['GET'], secret: 'HISTORY_SECRET', handle: handleHistory }],
   ['/gca-history/cleanup', { methods: ['GET', 'POST'], secret: 'HISTORY_SECRET', handle: handleCleanup }],
+  ['/gca-history/records', { methods: ['GET'], secret: 'HISTORY_SECRET', handle: handleRecordsMeta }],
+  ['/gca-history/records/delete', { methods: ['POST'], secret: 'HISTORY_SECRET', handle: handleRecordsDelete }],
 ]);
 
 export default {
@@ -143,6 +174,15 @@ export default {
 
     const route = ROUTES.get(url.pathname);
     if (route) return serve(route, request, url, env);
+
+    // Signed by the staff website (HMAC), verified before any coordinator call.
+    if (GCA_SIGNED_ROUTES.has(url.pathname)) {
+      try {
+        return noStore(await handleGcaRecords(request, url, env));
+      } catch (err) {
+        return noStore(routeFailed(url, err));
+      }
+    }
 
     // Authenticated by its Hook0 signature rather than a bearer token.
     if (url.pathname === WEBHOOK_PATH) {
