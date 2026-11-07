@@ -39,26 +39,26 @@ Each of these changes makes the named chunk due at once, whatever its date:
 
 ## Next up
 
-**T1-6**: Short-session reminders (due now: `src/short-session.ts` changed since its baseline)
+**T1-1**: HTTP surface and bearer auth (quarterly, due 2027-02-07; every chunk had a pass on 2026-11-07)
 
-## Tier 1 (quarterly; due 2027-01-18)
+## Tier 1 (quarterly; due 2027-02-07)
 
 | ID | Chunk | Paths | Focus | Baseline | Last pass | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | T1-1 | HTTP surface and bearer auth | `src/index.ts`, `src/auth.ts`, `src/http.ts`, `src/gca-records-http.ts` | Route auth and secret separation, fixed error bodies, no-store, bounded upstream reads, no redirects | 5215d11 | 2026-11-07 | clean |
 | T1-2 | IVAO webhook | `src/webhook.ts` | HMAC verification order, replay cache, body cap, no Durable Object call before verification, log privacy | 8d51b34 | 2026-11-07 | clean |
-| T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | b0bcc2a | 2026-10-19 | clean |
+| T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | 316559d | 2026-11-07 | clean |
 | T1-4 | GCA reminders and member data | `src/gca.ts`, `src/retention.ts`, `src/gca-records.ts` | Policy parsing fails closed, DM reservations and dedup ledgers, history privacy, cleanup vs polling | c06a72a | 2026-11-07 | clean |
 | T1-5 | Secrets hygiene and privacy gates | `scripts/check-privacy.mjs`, `scripts/secret-scan.sh`, `scripts/hooks/**`, `.github/actions/**`, `.gitignore`, `.gitleaks.toml`, `.dev.vars.example`, `config/**`, `src/env.d.ts` | No real IDs or secrets in history, hook coverage, optional-secret boundaries | 25834e6 | 2026-11-07 | clean |
-| T1-6 | Short-session reminders | `src/short-session.ts`; `src/poll.ts` and `src/coordinator.ts` call sites | Presence invariants, continuity/baseline, at-most-once and daily cap, GCA interaction, retention/purge, log privacy | 566364a | 2026-10-22 | clean |
+| T1-6 | Short-session reminders | `src/short-session.ts`; `src/poll.ts` and `src/coordinator.ts` call sites | Presence invariants, continuity/baseline, at-most-once and daily cap, GCA interaction, retention/purge, log privacy | 316559d | 2026-11-07 | clean |
 
-## Tier 2 (semi-annually; due 2027-04-18)
+## Tier 2 (semi-annually; due 2027-05-07)
 
 | ID | Chunk | Paths | Focus | Baseline | Last pass | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | T2-1 | Coordinator and scheduling | `src/coordinator.ts`, `src/config.ts` | Single coordinator, inFlight serialization, throttles and alarms, heartbeat and health, persist() field coverage | 8d51b34 | 2026-11-07 | clean |
 | T2-2 | Delivery pipeline | `src/poll.ts`, `src/state.ts`, `src/roster.ts`, `src/types.ts` | Untrusted feed data, at-least-once delivery, grace windows, nonce keys, retry budgets | 8d51b34 | 2026-11-07 | clean |
-| T2-3 | Discord client and rendering | `src/discord.ts`, `src/discord-rate-limit.ts` | Markdown and mention escaping, rate-limit waits, error handling without leaking IDs | 566364a | 2026-10-22 | clean |
+| T2-3 | Discord client and rendering | `src/discord.ts`, `src/discord-rate-limit.ts` | Markdown and mention escaping, rate-limit waits, error handling without leaking IDs | 316559d | 2026-11-07 | clean |
 | T2-4 | Build and deploy config | `wrangler.jsonc`, `tsconfig.json`, `vitest.config.ts`, `.node-version`, `scripts/check-deploy.mjs`, `scripts/check-setup.mjs` | Public KV ID stays all-zero, Durable Object identity and migrations, deploy refusal with private config | 8d51b34 | 2026-11-07 | clean |
 | T2-5 | CI and supply chain | `.github/workflows/**`, `package.json`, `package-lock.json`, `.markdownlint-cli2.jsonc`, `scripts/lint-docs.mjs`, `scripts/check-links.mjs`, `scripts/repo-files.mjs` | Pinned actions and minimal permissions, audit gate intact, overrides justified, lint script path safety | 8d51b34 | 2026-11-07 | clean |
 
@@ -66,8 +66,8 @@ Each of these changes makes the named chunk due at once, whatever its date:
 
 | ID | Chunk | Paths | Focus | Baseline | Last pass | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| T3-1 | Docs and agent instructions | `README.md`, `docs/**`, `llms.txt`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SECURITY.md`, `LICENSE`, `.github/copilot-instructions.md`, `.github/ISSUE_TEMPLATE/**`, `assets/**` | Trigger: before each release, or when setup or security guidance changes. Docs match code; no unsafe advice; no private data | 566364a | 2026-10-22 | clean |
-| T3-2 | Tests and repo-check tests | `test/**`, `scripts/test-hooks*.mjs`, `scripts/hook-test-helpers.mjs`, `scripts/test-repo-checks.mjs` | Trigger: when fixtures or helpers change, or when a chunk audit flags untested paths. Fixtures stay synthetic; tests can fail | 566364a | 2026-10-22 | clean |
+| T3-1 | Docs and agent instructions | `README.md`, `docs/**`, `llms.txt`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SECURITY.md`, `LICENSE`, `.github/copilot-instructions.md`, `.github/ISSUE_TEMPLATE/**`, `assets/**` | Trigger: before each release, or when setup or security guidance changes. Docs match code; no unsafe advice; no private data | 316559d | 2026-11-07 | clean |
+| T3-2 | Tests and repo-check tests | `test/**`, `scripts/test-hooks*.mjs`, `scripts/hook-test-helpers.mjs`, `scripts/test-repo-checks.mjs` | Trigger: when fixtures or helpers change, or when a chunk audit flags untested paths. Fixtures stay synthetic; tests can fail | 316559d | 2026-11-07 | clean |
 
 Baseline `932364b` is `main` after the full pre-ship audit (code quality, security, dependencies and build) finished on 2026-09-27. Changes since then were reviewed per change rather than per chunk, so the first pass of any touched chunk should review its whole delta.
 
@@ -159,6 +159,10 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-11-07 | T2-2 | P3 | Fixed: a Discord 401 (rejected bot token) was charged against every retry budget, so an outage of about 11 polls abandoned closeouts, first cards and roster pages for good; a 401 is now a definite not-posted result, not charged, and stops the rest of the poll's delivery. Also: the delivery deadline counts from the poll start (at least 15 s for delivery), corrupt stored first-card retry counters are dropped on load, a recovery re-post needs room for its closing edit, and budget deferrals are tested on every path. Deferred: no relative guard against a feed that drops the whole division (same as a real IVAO restart) | 4476994 |
 | 2026-11-07 | T2-4 | P3 | Fixed: the public deploy guard checked only the first Git worktree; it now checks every worktree (bare layouts, siblings, Git before 2.36 by fallback) and refuses when worktrees cannot be listed or read. Also: private config names in any letter case, the Worker name and the whole Durable Object block pinned with failing tests, and the secret rule's allowlist checked against realistic values | 78df6bb |
 | 2026-11-07 | T2-5 | P4 | Fixed: markdownlint 0.42.1 brings re2js 2.9.1, so the re2js override is removed; the checks job installs with `--ignore-scripts` and runs `npm audit signatures`; codeql-action v4.39.3, setup-node v7.1.0 and vitest 5.1.0 pinned. Accepted: upstream prerelease pins inside wrangler's dependencies | 8d51b34 |
+| 2026-11-07 | T1-3 | P3 | Fixed: a rejected IVAO token request was retried about every minute forever; rejected credentials now pause minting for 30 minutes and other failures back off 1-15 minutes, logged once per pause with a status or error category only. Also: feed text cleaned before the empty checks, member countries from the snapshot validated and capped, the cached token bound to an HMAC fingerprint of the client id and secret and capped, KV error logs carry the error name only, member-country logs carry no VID, the lookup deadline re-checked before each profile request. Deferred: whether one tracker 403 can pause authenticated polling for 30 minutes (no evidence in production logs) | a9c476d |
+| 2026-11-07 | T1-6, T2-3 | P4 | Fixed: a Discord 401 on any path (including reminder DMs, staff copies and the member list, and oversized 401s) marks the in-memory outage; a 401 on a reminder leaves it pending and uncounted instead of rejecting it; a member-list 401 or in-memory deferral stores no lookup backoff; member-list pages need a full request's budget; a leading `+` is escaped. Rejected: mapping oversized 403/404 to their status (would drop message references); deferred: the deadline-deferral exemption note | 80a0cae |
+| 2026-11-07 | T3-2 | P3 | Fixed: heavy tests got a 30 s timeout and explicit waits, a short-session test no longer leaves a due real alarm, the shared GCA vectors use synthetic region codes AA-AD (owner decision; the website matched them), filler callsigns use a J prefix, poll tests catch only their injected failure, cleanup runs in `finally`, a timer spy is restored, and CI fails instead of skipping when ssh-keygen is missing or tests run as root. Deferred: a signed PUT that succeeds across the real Durable Object boundary; accepted: the webhook key cache has no reset hook | 885f83f |
+| 2026-11-07 | T3-1 | P3 | Fixed: the rollback runbook now unsets the GCA signing keys first, so nothing can be published between deleting the stored record and redeploying; AGENTS.md describes the signed records surface and its invariants; wording fixes for the coordinator's 360 s window, rejection log events, Discord 401 behaviour, country-code checks, the 10,000-member limit, cleanup batches, llms.txt, the optional-settings comments, retention of the country cache and up to 8 session ids. Deferred: compromised-key 429 note, AGENTS npm ci wording, mentionable role note | 316559d |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
