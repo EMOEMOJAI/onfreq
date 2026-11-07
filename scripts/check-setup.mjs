@@ -133,8 +133,11 @@ export function validateGitleaksConfig(text) {
  * Every optional or first-run secret name ending in _SECRET, _TOKEN, _KEY or
  * _KEY_NEXT is flagged by the onfreq-secret-assignment rule: its regex, compiled
  * here, matches NAME= and 16 characters, and Gitleaks' keyword prefilter passes
- * the line, as the lowercase name contains one of the rule's keywords. A secret
- * added without a rule update fails. Errors name the setting, never a value.
+ * the line, as the lowercase name contains one of the rule's keywords. The
+ * rule's own allowlist regexes, also compiled here (a leading (?i) as the i
+ * flag), must pass none of those values: 16 x characters and generated
+ * base64url and hex secrets (T2-4 B4). A secret added without a rule update
+ * fails. Errors name the setting, never a value.
  */
 export function validateSecretRule(gitleaks, envTypes) {
   const lines = gitleaks.split('\n');
@@ -151,11 +154,29 @@ export function validateSecretRule(gitleaks, envTypes) {
     regex = new RegExp(regexLine.slice("regex = '''".length, -3));
     keywords = JSON.parse(keywordsLine.slice('keywords = '.length));
   } catch { assert.fail('Gitleaks rule onfreq-secret-assignment could not be read'); }
+  // The allowlist's regexes: single-line arrays or one literal per line inside `regexes = [`.
+  const sources = [];
+  let inArray = false;
+  for (const line of rule) {
+    if (inArray) inArray = line !== ']';
+    else if (!line.startsWith('regexes = ')) continue;
+    else inArray = line === 'regexes = [';
+    sources.push(...[...line.matchAll(/'''((?:(?!''').)*)'''/g)].map((match) => match[1]));
+  }
+  let allowlist;
+  try {
+    allowlist = sources.map((source) => source.startsWith('(?i)') ? new RegExp(source.slice(4), 'i') : new RegExp(source));
+  } catch { assert.fail('Gitleaks rule onfreq-secret-assignment could not be read'); }
+  const generated = (alphabet, length) => Array.from({ length }, (_, i) => alphabet[(i * 29 + 7) % alphabet.length]).join('');
+  const values = ['x'.repeat(16),
+    generated('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_', 43), generated('0123456789abcdef', 64)];
+  assert.ok(values.every((value) => !allowlist.some((allowed) => allowed.test(value))),
+    'Gitleaks rule onfreq-secret-assignment allowlist passes a secret-shaped value');
   const names = [...new Set([...optionalSecretNames(envTypes), ...FIRST_RUN])]
     .filter((name) => /_(?:SECRET|TOKEN|KEY|KEY_NEXT)$/.test(name));
   assert.ok(names.length, 'No secret names to check');
   for (const name of names) {
-    assert.ok(regex.test(`${name}=${'x'.repeat(16)}`), `Gitleaks rule onfreq-secret-assignment misses ${name}`);
+    assert.ok(values.every((value) => regex.test(`${name}=${value}`)), `Gitleaks rule onfreq-secret-assignment misses ${name}`);
     const lower = name.toLowerCase();
     assert.ok(Array.isArray(keywords) && keywords.some((keyword) => typeof keyword === 'string' && keyword && lower.includes(keyword)),
       `Gitleaks rule onfreq-secret-assignment has no keyword for ${name}`);
@@ -174,7 +195,12 @@ export function validateWranglerSecretNames(text, envTypes) {
 export function validateSetup(config, pkg, examples) {
   assert.deepEqual(publicConfig(config), [], 'Public configuration contains operator settings');
   assert.deepEqual(config.kv_namespaces, [{ binding: 'ATC_STATE', id: '0'.repeat(32) }]);
-  assert.deepEqual(config.durable_objects?.bindings, [{ name: 'POLL_COORDINATOR', class_name: 'PollCoordinator' }]);
+  // The Worker name and the whole Durable Object setup are deployment identity (T2-4 B3).
+  assert.equal(config.name, 'onfreq');
+  assert.deepEqual(config.durable_objects, {
+    bindings: [{ name: 'POLL_COORDINATOR', class_name: 'PollCoordinator' }],
+    code_update_strategy: { mode: 'immediate' },
+  });
   assert.deepEqual(config.migrations, [{ tag: 'v1', new_sqlite_classes: ['PollCoordinator'] }]);
   const required = [...FIRST_RUN].sort();
   const lines = settingLines(examples);
@@ -229,8 +255,9 @@ export function testDeployGuard(guard, deploy = PUBLIC_DEPLOY) {
       assert.doesNotMatch(result.stdout, /^DEPLOY_REACHED$/m);
       assert.match(result.stderr, message);
     };
+    // Names are matched in any case (T2-4 B2), as case-insensitive file systems open them alike.
     for (const name of ['wrangler.local.jsonc', 'wrangler.local.json', 'wrangler.local.toml', 'wrangler.local.yaml',
-      'wrangler.local.jsonc.bak', 'wrangler.local.']) {
+      'wrangler.local.jsonc.bak', 'wrangler.local.', 'Wrangler.Local.jsonc', 'WRANGLER.LOCAL.TOML']) {
       writeFileSync(join(dir, name), '{}');
       refuses(false, /Private deployment config detected/);
       refuses(true, /Private deployment config detected/);

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -427,6 +427,17 @@ test('validates guided setup and rejects changed prompts, values and deployment 
   assert.throws(() => validateSetup(config, { ...pkg, cloudflare: { bindings: {} } }, example));
   // Relying on predeploy alone is bypassed by npm --ignore-scripts.
   assert.throws(() => validateSetup(config, { ...pkg, scripts: { ...pkg.scripts, deploy: 'wrangler deploy' } }, example));
+  // T2-4 B3: the Worker name and the whole Durable Object setup are pinned; each change alone fails.
+  const durable = config.durable_objects;
+  for (const [label, changed] of [
+    ['Worker rename', { ...config, name: 'onfreq-renamed' }],
+    ['binding rename', { ...config, durable_objects: { ...durable, bindings: [{ name: 'POLL_RENAMED', class_name: 'PollCoordinator' }] } }],
+    ['class rename', { ...config, durable_objects: { ...durable, bindings: [{ name: 'POLL_COORDINATOR', class_name: 'PollRenamed' }] } }],
+    ['missing code_update_strategy', { ...config, durable_objects: { bindings: durable.bindings } }],
+    ['changed code_update_strategy', { ...config, durable_objects: { ...durable, code_update_strategy: { mode: 'deferred' } } }],
+    ['migration tag change', { ...config, migrations: [{ tag: 'v2', new_sqlite_classes: ['PollCoordinator'] }] }],
+    ['extra migration', { ...config, migrations: [...config.migrations, { tag: 'v2', deleted_classes: ['PollCoordinator'] }] }],
+  ]) assert.throws(() => validateSetup(changed, pkg, example), assert.AssertionError, label);
 });
 
 test('optional setting examples are empty and name exactly the optional secrets (T1-5)', () => {
@@ -493,6 +504,17 @@ test('the Gitleaks secret-assignment rule and its keywords cover every secret, t
   assert.throws(() => validateSecretRule(replaceOnce(rules, 'id = "onfreq-secret-assignment"', 'id = "onfreq-other"'), envTypes),
     /Missing Gitleaks rule/);
   assert.throws(() => validateSecretRule(replaceOnce(rules, '[^\\s"\'`]{16,}', '(['), envTypes), /could not be read/);
+  // T2-4 B4: the rule's own allowlist must pass neither a plain 16-character value nor
+  // realistic secret shapes (generated, so no secret-shaped literal is committed).
+  for (const allow of ["'''^.*$'''", "'''x{16}'''", "'''^[A-Za-z0-9_-]{32,}$'''", "'''(?i)^[0-9A-F]{64}$'''"]) {
+    // split/join, as String.replace would expand the $' in these patterns.
+    const changed = rules.split("'''^test-poll-secret$'''").join(allow);
+    assert.notEqual(changed, rules, allow);
+    validateGitleaksConfig(changed);
+    assert.throws(() => validateSecretRule(changed, envTypes), /allowlist passes a secret-shaped value$/, allow);
+  }
+  assert.throws(() => validateSecretRule(replaceOnce(rules, "'''^test-poll-secret$'''", "'''(?<'''"), envTypes),
+    /could not be read/);
 });
 
 test('public deploy permits a fresh template and blocks private configuration, even with ignore-scripts', () => {
@@ -529,7 +551,8 @@ test('public deploy guard also sees private config in the main checkout of a Git
   git(main, 'worktree', 'add', '--quiet', '--detach', linked);
   const guard = (cwd) => spawnSync(process.execPath, ['scripts/check-deploy.mjs'], { cwd, env, encoding: 'utf8' });
   assert.equal(guard(linked).status, 0);
-  for (const name of ['wrangler.local.jsonc', 'wrangler.local.json', 'wrangler.local.toml']) {
+  for (const name of ['wrangler.local.jsonc', 'wrangler.local.json', 'wrangler.local.toml', 'Wrangler.Local.jsonc',
+    'WRANGLER.LOCAL.TOML']) {
     writeFileSync(join(main, name), '{}');
     for (const cwd of [main, linked]) {
       const result = guard(cwd);
@@ -557,15 +580,18 @@ test('public deploy guard also sees private config in the main checkout of a Git
     { cwd, env: { ...env, PATH: join(base, 'no-tools') }, encoding: 'utf8' });
   const blind = withoutGit(linked);
   assert.equal(blind.status, 1);
-  assert.match(blind.stderr, /Could not find the main Git worktree/);
-  assert.equal(withoutGit(main).status, 0, 'a main checkout is checked directly');
+  assert.match(blind.stderr, /Could not list the Git worktrees/);
+  // T2-4 B1: a main checkout may have linked worktrees elsewhere, so without Git it fails closed too.
+  const blindMain = withoutGit(main);
+  assert.equal(blindMain.status, 1, 'a main checkout without Git cannot list its worktrees');
+  assert.match(blindMain.stderr, /Could not list the Git worktrees/);
   const detached = join(base, 'detached');
   mkdirSync(join(detached, 'scripts'), { recursive: true });
   copyFileSync(new URL('./check-deploy.mjs', import.meta.url), join(detached, 'scripts/check-deploy.mjs'));
   writeFileSync(join(detached, '.git'), `gitdir: ${join(base, 'missing-git-dir')}\n`);
   const missing = guard(detached);
   assert.equal(missing.status, 1);
-  assert.match(missing.stderr, /Could not find the main Git worktree/);
+  assert.match(missing.stderr, /Could not list the Git worktrees/);
 
   // Inherited GIT_* variables must not redirect the lookup to another repository.
   writeFileSync(join(main, 'wrangler.local.jsonc'), '{}');
@@ -579,6 +605,146 @@ test('public deploy guard also sees private config in the main checkout of a Git
     assert.match(redirected.stderr, /Private deployment config detected/);
   }
   rmSync(join(main, 'wrangler.local.jsonc'));
+});
+
+/** A synthetic repository whose commit holds the current deploy guard, for worktree layouts. */
+function guardRepository(t, prefix) {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  const env = isolatedEnv();
+  const restore = [];
+  t.after(() => {
+    for (const dir of restore) chmodSync(dir, 0o755);
+    rmSync(base, { recursive: true, force: true });
+  });
+  const git = (cwd, ...args) => {
+    const result = spawnSync('git', ['-c', 'user.name=Synthetic', '-c', 'user.email=synthetic@example.test',
+      '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, env, encoding: 'utf8' });
+    assert.equal(result.status, 0, `git ${args[0]} failed`);
+  };
+  const main = join(base, 'main');
+  mkdirSync(join(main, 'scripts'), { recursive: true });
+  copyFileSync(new URL('./check-deploy.mjs', import.meta.url), join(main, 'scripts/check-deploy.mjs'));
+  git(main, 'init', '--quiet');
+  git(main, 'add', 'scripts/check-deploy.mjs');
+  git(main, 'commit', '--quiet', '--no-verify', '-m', 'synthetic');
+  const guard = (cwd, extra = {}) => spawnSync(process.execPath, ['scripts/check-deploy.mjs'],
+    { cwd, env: { ...env, ...extra }, encoding: 'utf8' });
+  const lock = (dir, mode) => { restore.push(dir); chmodSync(dir, mode); };
+  return { base, env, git, main, guard, lock };
+}
+
+const refused = (result, message, label) => {
+  assert.equal(result.status, 1, label);
+  assert.match(result.stderr, message, label);
+};
+
+test('public deploy guard checks every worktree Git lists, in any layout, and fails closed (T2-4 B1)', (t) => {
+  const { base, env, git, main, guard } = guardRepository(t, 'onfreq-worktrees-');
+  const private_ = /Private deployment config detected/;
+  const unlisted = /Could not list the Git worktrees/;
+  // Sibling linked worktrees: private config in one is seen from the other and from the main checkout.
+  const first = join(base, 'first');
+  const second = join(base, 'second');
+  git(main, 'worktree', 'add', '--quiet', '--detach', first);
+  git(main, 'worktree', 'add', '--quiet', '--detach', second);
+  for (const cwd of [main, first, second]) assert.equal(guard(cwd).status, 0);
+  writeFileSync(join(first, 'wrangler.local.jsonc'), '');
+  refused(guard(second), private_, 'sibling from a linked worktree');
+  refused(guard(main), private_, 'linked worktree from the main checkout');
+  rmSync(join(first, 'wrangler.local.jsonc'));
+
+  // A bare repository lists its own directory first; its worktrees are checked too.
+  const bare = join(base, 'bare.git');
+  git(base, 'clone', '--quiet', '--bare', main, bare);
+  const bareFirst = join(base, 'bare-first');
+  const bareSecond = join(base, 'bare-second');
+  git(bare, 'worktree', 'add', '--quiet', '--detach', bareFirst);
+  git(bare, 'worktree', 'add', '--quiet', '--detach', bareSecond);
+  assert.equal(guard(bareSecond).status, 0);
+  writeFileSync(join(bareFirst, 'wrangler.local.jsonc'), '');
+  refused(guard(bareSecond), private_, 'bare layout');
+  rmSync(join(bareFirst, 'wrangler.local.jsonc'));
+
+  // A worktree path with a newline is read whole from the NUL-separated listing.
+  const newline = join(base, 'new\nline');
+  git(main, 'worktree', 'add', '--quiet', '--detach', newline);
+  assert.equal(guard(main).status, 0);
+  writeFileSync(join(newline, 'wrangler.local.jsonc'), '');
+  refused(guard(main), private_, 'newline path');
+  rmSync(join(newline, 'wrangler.local.jsonc'));
+
+  // Git older than 2.36 rejects -z; the newline listing is used instead, strictly.
+  const shims = join(base, 'shims');
+  const realGit = spawnSync('sh', ['-c', 'command -v git'], { env, encoding: 'utf8' }).stdout.trim();
+  assert.ok(realGit, 'git must be on PATH');
+  const shim = (name, body) => {
+    mkdirSync(join(shims, name), { recursive: true });
+    writeFileSync(join(shims, name, 'git'), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    return { PATH: `${join(shims, name)}:${env.PATH}` };
+  };
+  const quoted = `'${realGit.replaceAll("'", "'\\''")}'`;
+  const oldGit = shim('old', `for arg in "$@"; do if [ "$arg" = -z ]; then echo 'usage: git worktree list' >&2; exit 129; fi; done\nexec ${quoted} "$@"`);
+  // The newline path cannot be parsed without -z, so the fallback refuses while it exists.
+  refused(guard(main, oldGit), unlisted, 'fallback with a newline path');
+  git(main, 'worktree', 'remove', newline);
+  assert.equal(guard(second, oldGit).status, 0, 'fallback allows a clean repository');
+  writeFileSync(join(first, 'wrangler.local.jsonc'), '');
+  refused(guard(second, oldGit), private_, 'fallback still sees a sibling worktree');
+  rmSync(join(first, 'wrangler.local.jsonc'));
+  // A listing that does not parse cleanly refuses: an unknown field, or a record without its terminator.
+  const record = `worktree ${main}\\000HEAD ${'0'.repeat(40)}\\000detached\\000`;
+  const listed = (name, listing) => shim(name, `printf '%b' ${`'${listing.replaceAll("'", "'\\''")}'`}`);
+  assert.equal(guard(second, listed('clean', `${record}\\000`)).status, 0, 'a fixed clean listing parses');
+  refused(guard(second, listed('unknown', `${record}future\\000\\000`)), unlisted, 'unknown field');
+  refused(guard(second, listed('unterminated', record)), unlisted, 'unterminated record');
+  // Both listings failing in a checkout (a .git entry) refuses; a non-checkout keeps today's behaviour.
+  const failing = shim('failing', 'exit 128');
+  refused(guard(second, failing), unlisted, 'linked worktree, both listings fail');
+  refused(guard(main, failing), unlisted, 'main checkout, both listings fail');
+  const plain = join(base, 'plain');
+  mkdirSync(join(plain, 'scripts'), { recursive: true });
+  copyFileSync(new URL('./check-deploy.mjs', import.meta.url), join(plain, 'scripts/check-deploy.mjs'));
+  assert.equal(guard(plain, failing).status, 0, 'a non-checkout is checked directly');
+  writeFileSync(join(plain, 'wrangler.local.jsonc'), '');
+  refused(guard(plain, failing), private_, 'a non-checkout still checks itself');
+
+  // A worktree Git still reports (locked, so not prunable) but whose directory is gone fails closed.
+  const locked = join(base, 'locked');
+  git(main, 'worktree', 'add', '--quiet', '--lock', '--detach', locked);
+  rmSync(locked, { recursive: true });
+  refused(guard(main), /Could not check for private deployment config/, 'missing locked worktree');
+  // Once unlocked, Git reports it prunable and it is skipped.
+  git(main, 'worktree', 'unlock', locked);
+  assert.equal(guard(main).status, 0, 'prunable worktree');
+});
+
+test('public deploy guard refuses entries it cannot read (T2-4 B5)', (t) => {
+  if (typeof process.getuid !== 'function' || process.getuid() === 0) {
+    t.skip('permissions cannot be simulated on this platform or as root');
+    return;
+  }
+  const { base, git, main, guard, lock } = guardRepository(t, 'onfreq-unreadable-');
+  const unchecked = /Could not check for private deployment config/;
+  // This checkout's directory listing (searchable but not readable).
+  const plain = join(base, 'plain');
+  mkdirSync(join(plain, 'scripts'), { recursive: true });
+  copyFileSync(new URL('./check-deploy.mjs', import.meta.url), join(plain, 'scripts/check-deploy.mjs'));
+  assert.equal(guard(plain).status, 0);
+  lock(plain, 0o311);
+  refused(guard(plain), unchecked, 'unreadable checkout');
+  chmodSync(plain, 0o755);
+  // A config path Wrangler could be redirected to that cannot be looked up.
+  mkdirSync(join(plain, '.wrangler'));
+  lock(join(plain, '.wrangler'), 0o000);
+  refused(guard(plain), unchecked, 'unsearchable .wrangler');
+  chmodSync(join(plain, '.wrangler'), 0o755);
+  assert.equal(guard(plain).status, 0);
+  // Another worktree's directory listing.
+  const linked = join(base, 'linked');
+  git(main, 'worktree', 'add', '--quiet', '--detach', linked);
+  assert.equal(guard(main).status, 0);
+  lock(linked, 0o311);
+  refused(guard(main), unchecked, 'unreadable linked worktree');
 });
 
 test('public deploy guard honours GIT_CEILING_DIRECTORIES around an enclosing private checkout (S19-26)', (t) => {
