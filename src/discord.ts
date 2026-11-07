@@ -47,8 +47,8 @@ export function formatDuration(totalSeconds: number): string {
  * is left readable.
  *
  * Invisible format characters (bidi overrides, zero-width characters) are
- * removed; a leading `#`, `-` or ordered-list marker (`1.`) is escaped so it
- * cannot start a header or list item; `://` is written as `:\/\/`, which
+ * removed; a leading `#`, `-`, `+` or ordered-list marker (`1.`) is escaped so
+ * it cannot start a header or list item; `://` is written as `:\/\/`, which
  * Discord displays as `://` without turning the text into a clickable link.
  */
 export function escapeMarkdown(text: string): string {
@@ -57,7 +57,7 @@ export function escapeMarkdown(text: string): string {
       char === '_' && /[A-Za-z0-9]/.test(whole[index - 1] ?? '') && /[A-Za-z0-9]/.test(whole[index + 1] ?? '')
         ? char : `\\${char}`)
     .replace(/:\/\//g, ':\\/\\/')
-    .replace(/^(\s*)([#-])/, '$1\\$2')
+    .replace(/^(\s*)([#+-])/, '$1\\$2')
     .replace(/^(\s*)(\d+)\.(?=\s)/, '$1$2\\.');
 }
 
@@ -444,7 +444,11 @@ export function countsAgainstBudget(err: unknown): boolean {
  * messages were stuffed with large content, say). Discord is reachable, so
  * this never marks an outage; it is classified as a definite 4xx-like
  * rejection so every budgeted caller (`countsAgainstBudget`) gives up after
- * its bounded retries instead of retrying every poll. The synthetic status
+ * its bounded retries instead of retrying every poll. An oversized 401 is the
+ * exception: it never becomes this error but a plain, uncharged 401
+ * `DiscordApiError`, and the rate limiter marks the bot-token outage for it.
+ * An oversized 403 or 404 stays this bounded 413, never `isGone`, so it cannot
+ * drop a stored message reference. The synthetic status
  * never reaches Discord; `upstreamStatus` is the status of the discarded response.
  */
 export class DiscordResponseTooLargeError extends DiscordApiError {
@@ -500,13 +504,6 @@ const MAX_ATTEMPTS = 4;
 
 /** How long later calls in the same poll fail fast after a request exhausts its 5xx retries. */
 const OUTAGE_COOLDOWN_MS = 30_000;
-/**
- * How long later calls fail fast after Discord rejects the bot token (a 401).
- * Longer than a poll's whole public delivery budget, so the rest of that
- * delivery sends no further requests; in memory only, so the next poll (a
- * new rate-limit instance) tries the token again.
- */
-const UNAUTHORIZED_COOLDOWN_MS = 60_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -553,6 +550,9 @@ async function discordRequest(
         if (err.status >= 500) return err.status;
         // Discord responded, so this is neither an outage nor a POST failure.
         limits.noteDiscordResponded();
+        // A rejected bot token, whatever its body size: never charged, and
+        // the limiter has already deferred every later request (see below).
+        if (err.status === 401) throw new DiscordApiError(401);
         // An accepted POST created its message even though its id is unreadable.
         if (err.status >= 200 && err.status < 300) {
           if (method === 'POST') throw new DiscordUnconfirmedPostError();
@@ -587,9 +587,9 @@ async function discordRequest(
         // 5xx/timeout before an outage is declared.
         if (method !== 'POST' || limits.notePostFailure()) limits.markOutage(OUTAGE_COOLDOWN_MS);
       }
-      // A rejected bot token fails every later request the same way: defer
-      // them all (not sent, not charged) instead of spending a subrequest on each.
-      if (status === 401) limits.markOutage(UNAUTHORIZED_COOLDOWN_MS);
+      // A 401 (a rejected bot token) needs nothing more here: `limits.fetch`
+      // has already marked the in-memory outage that defers every later
+      // request (not sent, not charged) instead of spending a subrequest on each.
       throw new DiscordApiError(status, body);
     }
     const backoff = 500 * 2 ** (attempt - 1);

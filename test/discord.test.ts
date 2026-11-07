@@ -248,6 +248,19 @@ describe('embeds', () => {
     expect(escapeMarkdown(input)).toBe(expected);
   });
 
+  it.each([
+    ['+ fake list item', '\\+ fake list item'],
+    ['  + indented item', '  \\+ indented item'],
+    ['\n+ after newline', ' \\+ after newline'],
+    ['+44 Tower', '\\+44 Tower'],
+  ])('R234 T23-3: escapes a leading + list marker in %j', (input, expected) => {
+    expect(escapeMarkdown(input)).toBe(expected);
+  });
+
+  it('R234 T23-3: keeps a mid-text + as is', () => {
+    expect(escapeMarkdown('Gate 3 + North')).toBe('Gate 3 + North');
+  });
+
   it('keeps a mid-text # or - as is', () => {
     expect(escapeMarkdown('Gate #3 - North')).toBe('Gate #3 - North');
   });
@@ -1120,6 +1133,49 @@ describe('REST calls', () => {
     stubFetch(new Response('x', { status: 400, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }));
     await expect(editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, new DiscordRateLimits()))
       .rejects.toBeInstanceOf(DiscordResponseTooLargeError);
+  });
+
+  it.each(['POST', 'PATCH', 'DELETE', 'GET'] as const)(
+    'R234 T23-2: an oversized 401 to a %s is an uncharged 401 that defers the rest of the poll', async (method) => {
+      const oversized401 = () => new Response('x', { status: 401, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } });
+      const fetchMock = stubFetch(oversized401(), Response.json({ id: '100000000000000999' }));
+      const limits = new DiscordRateLimits();
+      const at = 1_800_000_000_000;
+      const call = {
+        POST: () => postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, limits),
+        PATCH: () => editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, limits),
+        DELETE: () => deleteMessage('token', '100000000000000123', '100000000000000999', limits),
+        GET: () => findBotMessages(BOT_TOKEN, '100000000000000123', { from: at, to: at }, limits, () => true),
+      }[method];
+      const err = await call().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(DiscordApiError);
+      expect(err).not.toBeInstanceOf(DiscordResponseTooLargeError);
+      expect(err).toMatchObject({ status: 401 });
+      expect(isUnauthorized(err)).toBe(true);
+      expect(countsAgainstBudget(err)).toBe(false);
+      expect(mayHavePosted(err)).toBe(false);
+      expect((err as DiscordApiError).isGone).toBe(false);
+      await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
+        .rejects.toMatchObject({ status: 429, requestMade: false, reason: 'outage' });
+      // Only the one request reached Discord (no smaller scan retry, no later send).
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+  it.each([403, 404])('R234 A-5: an oversized %i stays the bounded 413, never gone, and marks no outage', async (status) => {
+    const fetchMock = stubFetch(
+      new Response('x', { status, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }),
+      Response.json({ id: '100000000000000999' }),
+    );
+    const limits = new DiscordRateLimits();
+    const err = await editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, limits)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DiscordResponseTooLargeError);
+    expect(err).toMatchObject({ status: 413, upstreamStatus: status });
+    expect((err as DiscordApiError).isGone).toBe(false);
+    expect(isUnauthorized(err)).toBe(false);
+    await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
+      .resolves.toBe('100000000000000999');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it.each(['../100000000000000999', '100000000000000999/reactions', 'posted-1', '123', '1'.repeat(21), ''])(

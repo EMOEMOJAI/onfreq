@@ -1740,3 +1740,59 @@ describe('public delivery time budget', () => {
     expect(response.status).toBe(200);
   });
 });
+
+// R234: a rejected bot token (a 401) is "not delivered, retry later".
+describe('R234: a rejected bot token (401) and short-session delivery', () => {
+  const unauthorized = () => Response.json({ message: '401: Unauthorized', code: 0 }, { status: 401 });
+
+  it.each(['message POST', 'DM open'] as const)(
+    'T16-1/A-4: a 401 on the %s returns the reminder to pending, uncounted, and retries it after 60 s', async (step) => {
+      await shortSession();
+      const base = globalThis.fetch;
+      let failing = true;
+      vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input, init) => {
+        const response = await base(input, init);
+        return failing && step === 'message POST' && String(input).endsWith(`/channels/${DM_CHANNEL}/messages`)
+          ? unauthorized() : response;
+      }));
+      if (step === 'DM open') dmOpenStatus = [401];
+      await at(15, []);
+      expect(dms).toHaveLength(step === 'message POST' ? 1 : 0);
+      if (step === 'message POST') expect(statusDuringPost).toEqual(['reserved']);
+      // Not rejected and not failed (so not counted by skipped_daily): pending, its attempt not counted.
+      expect(await rows()).toMatchObject([{ status: 'pending', attempts: 0, retry_at: ms(15) + 60_000 }]);
+      expect(logged('short_session_dm_failed')).toEqual([{ event: 'short_session_dm_failed', status: 401, retry: true }]);
+      failing = false;
+      await at(16, []);
+      expect(dms).toHaveLength(step === 'message POST' ? 2 : 1);
+      expect(await rows()).toMatchObject([{ status: 'sent', attempts: 1 }]);
+      await at(20, []);
+      expect(dms).toHaveLength(step === 'message POST' ? 2 : 1);
+    });
+
+  it('T16-2/A-2: a public 401 defers the member-list lookup in memory only, writing no GCA backoff', async () => {
+    await shortSession();
+    cardStatus = 401;
+    calls = [];
+    await at(15, [entry('QCZZ_CTR', 700001, 125.1, 9)]);
+    // The only card failed, so the poll reports it; the DM step still ran first.
+    expect(pollFailures.map(String)).toEqual(['Error: all Discord notifications failed']);
+    pollFailures = [];
+    expect(calls).toEqual(['card_POST']);
+    expect(memberListCalls).toBe(0);
+    expect(await rows()).toMatchObject([{ status: 'pending', attempts: 0 }]);
+    expect(logged('gca_member_list_failed')).toEqual([{
+      event: 'gca_member_list_failed', reason: 'outage', status: 429, requestMade: false, counted: false,
+    }]);
+    expect([
+      await storageGet('gca-member-list-backoff-v1'), await storageGet('gca-member-list-deadline-failures-v1'),
+      await storageGet(BACKOFF_KEY), await storageGet('discord-rate-limits-v1'),
+    ]).toEqual([undefined, undefined, undefined, undefined]);
+    // The next poll (new limits, a working token) looks the list up and sends.
+    cardStatus = 200;
+    await at(16, [entry('QCZZ_CTR', 700001, 125.1, 9)]);
+    expect(memberListCalls).toBe(1);
+    expect(dms).toHaveLength(1);
+    expect(await statuses()).toEqual(['sent']);
+  });
+});

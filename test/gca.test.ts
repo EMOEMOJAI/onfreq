@@ -2,8 +2,8 @@ import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  buildGcaEmbed, cappedCopyContent, gcaMismatch, indexMemberVids, parseGcaPolicy, sendGcaReminders,
-  type GuildMember,
+  buildGcaEmbed, cappedCopyContent, gcaMismatch, indexMemberVids, MEMBER_LIST_BACKOFF_KEY, parseGcaPolicy,
+  sendGcaReminders, type GuildMember,
 } from '../src/gca';
 import type { OnlineAtc } from '../src/types';
 import { postMessage, type DiscordEmbed } from '../src/discord';
@@ -1958,5 +1958,163 @@ describe('T1-4 F8 rollback: older versions treat a capped row as terminal', () =
     // And this version's own prune keeps it too.
     await check([], config);
     expect((await statuses()).find((row) => row.session_key === '600001:4')).toMatchObject({ status: 'sent' });
+  });
+});
+
+// R234: a rejected bot token (a 401) is "not delivered, retry later", never a
+// rejection of the member; and member-list pages start only with budget left.
+describe('R234: rejected bot token (401) and member-list page budget', () => {
+  const unauthorized = { message: '401: Unauthorized', code: 0 };
+  const storageGet = (key: string) => runInDurableObject(stub(), (_instance, ctx) => ctx.storage.get(key));
+  const reminder = (key: string) => runInDurableObject(stub(), (_instance, ctx) => ctx.storage.sql.exec(
+    'SELECT status, attempts, retry_at FROM gca_reminders WHERE session_key = ?', key).one());
+  const opens = () => network.mock.calls.filter(([url]) => String(url).endsWith('/users/@me/channels')).length;
+
+  it.each([
+    ['the message POST', () => { messageStatus = 401; }, 1],
+    ['opening the DM', () => { openStatus = 401; }, 0],
+  ] as const)('T16-1/A-4: a 401 on %s leaves the reminder pending and uncounted, then sends it with the same number', async (_label, fail, posted) => {
+    await check([]);
+    await check([atc({ sessionId: 1 })]);
+    await check([atc({ sessionId: 2 })]);
+    expect(titles()).toHaveLength(2);
+    const warn = vi.spyOn(console, 'warn');
+    const [sentBefore, opensBefore] = [sent.length, opens()];
+    fail();
+    await check([atc({ sessionId: 3 }), atc({ sessionId: 4 })]);
+    // Back to pending with the attempt not counted, retried after the 60 s token outage.
+    expect(await reminder('600001:3')).toEqual({ status: 'pending', attempts: 0, retry_at: START + 60_000 });
+    // Its reserved occurrence (if any) is released.
+    expect((await occurrences()).map((row) => row.session_key)).toEqual(['600001:1', '600001:2']);
+    // The loop stopped: session 4 was never attempted.
+    expect(await reminder('600001:4')).toEqual({ status: 'pending', attempts: 0, retry_at: 0 });
+    expect(opens() - opensBefore).toBe(1);
+    expect(sent.length - sentBefore).toBe(posted);
+    expect(logged(warn, 'gca_dm_failed')).toEqual([{ event: 'gca_dm_failed', status: 401, retry: true }]);
+    messageStatus = openStatus = 200;
+    now += 59_999;
+    await check([atc({ sessionId: 3 })]);
+    expect(sent.length - sentBefore).toBe(posted);
+    expect(await reminder('600001:3')).toMatchObject({ status: 'pending', attempts: 0 });
+    now += 1;
+    await check([atc({ sessionId: 3 })]);
+    // Not counted towards the 24-hour cap of 3 (it would be capped otherwise), and numbered 3rd.
+    expect(await reminder('600001:3')).toMatchObject({ status: 'sent', attempts: 1 });
+    expect(titles().at(-1)).toContain('[3rd occurrence]');
+    expect(await occurrences()).toEqual([
+      { session_key: '600001:1', occurrence: 1 }, { session_key: '600001:2', occurrence: 2 },
+      { session_key: '600001:3', occurrence: 3 },
+    ]);
+  });
+
+  it('A-4: a staff copy rejected with 401 keeps its payload and stays pending, then is sent once', async () => {
+    const COPY_USER = '111111111111111111';
+    const COPY_CHANNEL = '222222222222222222';
+    const config = { ...settings(), GCA_COPY_USER_ID: COPY_USER };
+    const copies: Record<string, unknown>[] = [];
+    let copyStatus = 401;
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/users/@me/channels') && JSON.parse(String(init?.body)).recipient_id === COPY_USER) {
+        return Response.json({ id: COPY_CHANNEL, type: 1, recipients: [{ id: COPY_USER }] });
+      }
+      if (url.endsWith(`/channels/${COPY_CHANNEL}/messages`)) {
+        copies.push(JSON.parse(String(init?.body)));
+        return Response.json(copyStatus === 200 ? { id: '333333333333333333' } : unauthorized, { status: copyStatus });
+      }
+      return original(input, init);
+    });
+    const copyRow = () => runInDurableObject(stub(), (_instance, ctx) => ctx.storage.sql.exec<{
+      status: string; attempts: number; retry_at: number; payload: string;
+    }>('SELECT status, attempts, retry_at, payload FROM gca_copies').one());
+    await check([], config);
+    await check([atc()], config);
+    expect([sent.length, copies.length]).toEqual([1, 1]);
+    const row = await copyRow();
+    expect(row).toMatchObject({ status: 'pending', attempts: 0, retry_at: START + 60_000 });
+    expect(JSON.parse(row.payload)).toEqual(copies[0]);
+    copyStatus = 200;
+    now += 60_000;
+    await check([atc()], config);
+    expect([sent.length, copies.length]).toEqual([1, 2]);
+    expect(copies[1]).toEqual(copies[0]);
+    expect(await copyRow()).toMatchObject({ status: 'sent', attempts: 1, payload: '' });
+    now += 300_000;
+    await check([atc()], config);
+    expect([sent.length, copies.length]).toEqual([1, 2]);
+  });
+
+  it('A-3: a member-list 401 stores no backoff and leaves the deadline count; the next poll fetches the list', async () => {
+    await check([]);
+    await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.put('gca-member-list-deadline-failures-v1', 1));
+    const warn = vi.spyOn(console, 'warn');
+    listStatus = 401;
+    await expect(check([atc()])).rejects.toThrow('Discord status 401');
+    expect(await storageGet(MEMBER_LIST_BACKOFF_KEY)).toBeUndefined();
+    expect(await storageGet('gca-member-list-deadline-failures-v1')).toBe(1);
+    expect(logged(warn, 'gca_member_list_failed')).toEqual([{ event: 'gca_member_list_failed', reason: 'http', status: 401 }]);
+    listStatus = 200;
+    await check([atc()]);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('A-2: after a GCA DM 401, a public card in the same poll is deferred unsent and nothing is persisted', async () => {
+    await check([]);
+    messageStatus = 401;
+    const result = await runInDurableObject(stub(), async (_instance, ctx) => {
+      const limits = await DiscordRateLimits.load(ctx.storage);
+      await sendGcaReminders(settings(), [atc()], ctx.storage, now, policy(), [], limits);
+      const err = await postMessage(BOT_TOKEN, '900000000000000001', { title: 'Synthetic' }, undefined, undefined, limits)
+        .then(() => undefined, (e: { status?: number; requestMade?: boolean; reason?: string }) => e);
+      return {
+        err: { status: err?.status, requestMade: err?.requestMade, reason: err?.reason },
+        stored: await ctx.storage.get(['discord-rate-limits-v1', MEMBER_LIST_BACKOFF_KEY, 'gca-discord-backoff-v1']),
+      };
+    });
+    expect(result.err).toEqual({ status: 429, requestMade: false, reason: 'outage' });
+    expect([...result.stored.keys()]).toEqual([]);
+    expect(network.mock.calls.some(([url]) => String(url).includes('900000000000000001'))).toBe(false);
+    expect(await reminder('600001:123456')).toMatchObject({ status: 'pending', attempts: 0 });
+  });
+
+  it.each([[15_000, 2], [15_001, 1]])(
+    'T16-3: starts another member-list page only with a full request timeout left (first page %i ms)', async (pageMs, pages) => {
+      await check([]);
+      const fullPage: GuildMember[] = Array.from({ length: 1000 }, (_, i) =>
+        member(700000 + i, String(400000000000000000n + BigInt(i))));
+      const original = network.getMockImplementation()!;
+      let listCalls = 0;
+      network.mockImplementation(async (input, init) => {
+        if (!String(input).includes('/members?')) return original(input, init);
+        listCalls++;
+        if (listCalls > 1) return Response.json([member()]);
+        now += pageMs;
+        return Response.json(fullPage);
+      });
+      const result = check([atc()]);
+      if (pages === 2) await result;
+      else await expect(result).rejects.toThrow('Discord member lookup exceeded poll budget');
+      expect(listCalls).toBe(pages);
+      expect(sent).toHaveLength(pages === 2 ? 1 : 0);
+    });
+
+  it('A-7: ten member-list pages of one second each still complete', async () => {
+    await check([]);
+    const original = network.getMockImplementation()!;
+    let listCalls = 0;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (!url.includes('/members?')) return original(input, init);
+      listCalls++;
+      now += 1_000;
+      if (listCalls === 10) return Response.json([member()]);
+      const after = BigInt(new URL(url).searchParams.get('after')!);
+      const first = after === 0n ? 400000000000000000n : after + 1n;
+      return Response.json(Array.from({ length: 1000 }, (_, i) => ({ user: { id: String(first + BigInt(i)) }, nick: null, roles: [] })));
+    });
+    await check([atc()]);
+    expect(listCalls).toBe(10);
+    expect(sent).toHaveLength(1);
   });
 });

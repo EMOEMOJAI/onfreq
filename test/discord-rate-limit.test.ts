@@ -3,6 +3,7 @@ import { evictDurableObject, reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordRateLimitError, DiscordRateLimits, MAX_RATE_LIMIT_COOLDOWN_MS, trackPosts } from '../src/discord-rate-limit';
 import { postMessage } from '../src/discord';
+import { discordJson } from '../src/gca';
 
 const START = 1_800_000_000_000;
 const stub = () => env.POLL_COORDINATOR.getByName('discord-rate-tests');
@@ -104,6 +105,37 @@ it.each([200, 404, 503])('leaves an oversized %i response to the caller without 
   await expect(request('/channels/a/messages')).rejects.toMatchObject({ name: 'ResponseTooLargeError', status });
   await expect(request('/channels/a/messages')).resolves.toBe(200);
   expect(network).toHaveBeenCalledTimes(2);
+});
+
+// R234 T23-1 / A-1: a 401 on any caller's request (here GCA's discordJson, which
+// never goes through discordRequest) rejects the bot token for every later request.
+it.each([
+  ['a 401', () => Response.json({ message: '401: Unauthorized', code: 0 }, { status: 401 })],
+  ['an oversized 401', () => new Response('x', { status: 401, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } })],
+])('R234 T23-1: %s through discordJson defers later requests in memory only', async (_label, unauthorized) => {
+  const network = vi.fn().mockImplementationOnce(async () => unauthorized())
+    .mockImplementation(async () => Response.json({ id: 'synthetic' }));
+  vi.stubGlobal('fetch', network);
+  const status = await runInDurableObject(stub(), async (_, ctx) => {
+    const limits = await DiscordRateLimits.load(ctx.storage);
+    await expect(discordJson(limits, 'test-token', '/users/@me/channels', { recipient_id: '200000000000000001' }))
+      .rejects.toThrow('Discord status 401');
+    await expect(limits.fetch('/guilds/example/members?limit=1000&after=0', { method: 'GET' })).rejects.toMatchObject({
+      name: 'DiscordRateLimitError', reason: 'outage', requestMade: false, global: false, retryAt: START + 60_000,
+    });
+    await expect(limits.fetch('/channels/a/messages', { method: 'POST' }))
+      .rejects.toMatchObject({ reason: 'outage', requestMade: false });
+    expect(network).toHaveBeenCalledTimes(1);
+    // In memory only: nothing persisted, and it lapses after 60 s.
+    expect(await ctx.storage.get('discord-rate-limits-v1')).toBeUndefined();
+    now += 60_000;
+    return (await limits.fetch('/channels/a/messages', { method: 'POST' })).status;
+  });
+  expect(status).toBe(200);
+  expect(network).toHaveBeenCalledTimes(2);
+  // A new instance (the next poll) tries the token again at once.
+  now = START;
+  await expect(request('/channels/a/messages')).resolves.toBe(200);
 });
 
 it('does not mask the rate-limit error when persisting the cooldown fails', async () => {

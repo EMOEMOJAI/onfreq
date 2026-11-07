@@ -421,7 +421,9 @@ export async function sendShortSessionReminders(
     if (feedShrunk) continue;
     // A GCA reminder possibly delivered to this member during this presence
     // already told them about it. A failed one possibly delivered only if it
-    // kept its occurrence (GCA releases it on a definite non-delivery).
+    // kept its occurrence (GCA releases it on a definite non-delivery). A
+    // capped GCA occurrence (stored as 'sent' with no member DM, because the
+    // member already had the 24-hour maximum of GCA reminders) skips too.
     if (gcaTable && sql.exec(`SELECT 1 FROM gca_reminders r WHERE r.session_key LIKE ? AND r.last_seen >= ?
       AND (r.status IN ('sent', 'reserved') OR (r.status = 'failed' AND ${gcaOccurrences
         ? 'EXISTS (SELECT 1 FROM gca_occurrences o WHERE o.session_key = r.session_key)' : '1'})) LIMIT 1`,
@@ -486,7 +488,9 @@ export async function sendShortSessionReminders(
       const outcome = classifyDeliveryFailure(err, row.attempts, messageAttempted, Date.now());
       // As for GCA reminders: only a message POST that was made and not
       // explicitly rejected may have delivered. A definite non-delivery is
-      // 'rejected' and does not count towards the daily cap.
+      // 'rejected' and does not count towards the daily cap. A 401 (rejected
+      // bot token) is neither: the row returns to 'pending', its attempt not
+      // counted, and is retried after the token outage.
       const code = outcome.statusCode;
       const rejected = outcome.status === 'failed' && (!messageAttempted || outcome.rateLimited ||
         (typeof code === 'number' && code >= 400 && code < 500));
@@ -495,9 +499,9 @@ export async function sendShortSessionReminders(
       console.warn(JSON.stringify({
         event: 'short_session_dm_failed', status: outcome.statusCode, retry: outcome.status === 'pending',
       }));
-      if (outcome.rateLimited) {
+      if (outcome.rateLimited || outcome.unauthorized) {
         // Only a genuinely global limit widens the backoff shared with GCA DMs.
-        if ((err as DiscordRateLimitError).global) await storage.put(BACKOFF_KEY, outcome.retryAt);
+        if (outcome.rateLimited && (err as DiscordRateLimitError).global) await storage.put(BACKOFF_KEY, outcome.retryAt);
         break;
       }
     }

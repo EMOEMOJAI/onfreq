@@ -14,8 +14,13 @@ const DISCORD_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 /**
  * A request blocked only by a soft (2xx-header) cooldown waits it out when it
  * is this short, and this instance has waited no more than the total below,
- * instead of deferring to the next poll. Callers with their own deadlines (GCA
- * 25 s, short-session 15 s) may therefore overrun them by at most 5 s.
+ * instead of deferring to the next poll. That wait comes on top of a request
+ * a caller with its own deadline (GCA 25 s, short-session 15 s) has already
+ * decided to start. Member-list pages and short-session DM requests start
+ * only with REQUEST_TIMEOUT_MS of that budget left, so they overrun it by at
+ * most 5 s; GCA's DM and staff-copy requests start whenever their deadline has
+ * not yet passed, so one of them may overrun it by up to REQUEST_TIMEOUT_MS
+ * plus 5 s.
  */
 const MAX_SOFT_WAIT_MS = 5_000;
 const MAX_SOFT_WAIT_TOTAL_MS = 10_000;
@@ -28,9 +33,19 @@ function sleep(ms: number): Promise<void> {
 const UNREADABLE_RATE_LIMIT_COOLDOWN_MS = 60_000;
 
 /**
+ * How long later calls fail fast after Discord rejects the bot token (a 401,
+ * whatever its body size). Longer than a poll's whole public delivery budget,
+ * so the rest of that delivery, and every DM step sharing these limits, sends
+ * no further requests; in memory only, so the next poll (a new rate-limit
+ * instance) tries the token again.
+ */
+export const UNAUTHORIZED_COOLDOWN_MS = 60_000;
+
+/**
  * `rate_limit`: a real Discord 429. `soft`: an in-memory cooldown inferred
  * from a 2xx response's rate-limit headers. `outage`: this route/instance
- * recently exhausted its 5xx retry budget and is failing fast instead.
+ * recently exhausted its 5xx retry budget, or Discord rejected the bot token
+ * (a 401), and it is failing fast instead.
  * `deadline`: the poll's delivery time budget (`setDeadline`) has run out.
  */
 export type DiscordRateLimitReason = 'rate_limit' | 'soft' | 'outage' | 'deadline';
@@ -275,8 +290,14 @@ export class DiscordRateLimits {
         const until = await this.record(route, Date.now() + UNREADABLE_RATE_LIMIT_COOLDOWN_MS);
         throw new DiscordRateLimitError(until, true, false);
       }
+      // An oversized 401 still rejected the bot token: defer every later request too.
+      if (err instanceof ResponseTooLargeError && err.status === 401) this.markOutage(UNAUTHORIZED_COOLDOWN_MS);
       throw err;
     }
+    // A rejected bot token fails every later request the same way, whichever
+    // caller (public cards, GCA, short-session) sent it: defer them all (not
+    // sent, not charged) instead of spending a subrequest on each.
+    if (response.status === 401) this.markOutage(UNAUTHORIZED_COOLDOWN_MS);
     if (response.status !== 429) {
       // A 2xx that reports an exhausted bucket is worth a soft, in-memory-only
       // cooldown: nothing to persist (it will refill on its own), but later

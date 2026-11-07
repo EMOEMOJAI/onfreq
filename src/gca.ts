@@ -1,7 +1,9 @@
 import { EMBED_FOOTER, firOf, type FirLabel } from './config';
 import { escapeMarkdown, isSnowflake, parseChannelIds, type DiscordEmbed } from './discord';
-import { DiscordRateLimitError, DiscordRateLimits, type DiscordRateLimitReason } from './discord-rate-limit';
-import { ResponseTooLargeError } from './http';
+import {
+  DiscordRateLimitError, DiscordRateLimits, UNAUTHORIZED_COOLDOWN_MS, type DiscordRateLimitReason,
+} from './discord-rate-limit';
+import { REQUEST_TIMEOUT_MS, ResponseTooLargeError } from './http';
 import { hasFrequency } from './ivao';
 import { countryCode } from './member-country';
 import type { OnlineAtc } from './types';
@@ -519,7 +521,8 @@ async function fetchMembers(limits: DiscordRateLimits, token: string, guildId: s
   let after = '0';
   // Never use a partial list: a duplicate VID could occur on a later page.
   for (let page = 0; page < 10; page++) {
-    if (Date.now() >= deadline) throw new GcaDeadlineError('Discord member lookup exceeded poll budget');
+    // Each page may take up to REQUEST_TIMEOUT_MS: start one only if it can finish in budget.
+    if (deadline - Date.now() < REQUEST_TIMEOUT_MS) throw new GcaDeadlineError('Discord member lookup exceeded poll budget');
     const body = await discordJson(limits, token, `/guilds/${guildId}/members?limit=1000&after=${after}`);
     if (!Array.isArray(body) || !body.every(isMember)) throw new GcaMemberListError('invalid', 'Invalid Discord member list');
     members.push(...body);
@@ -545,14 +548,29 @@ interface DeliveryOutcome {
   attempts: number;
   retryAt: number;
   rateLimited: boolean;
+  /** Discord rejected the bot token (a 401): the caller stops sending this poll. */
+  unauthorized: boolean;
   statusCode: number | 'unavailable';
 }
 
 /**
- * Shared at-most-once retry classification for both member DMs and staff
- * copies, so the two paths can never drift apart on what counts as retryable.
+ * Shared at-most-once retry classification for member DMs, staff copies and
+ * short-session reminders, so the paths can never drift apart on what counts
+ * as retryable.
  */
 export function classifyDeliveryFailure(err: unknown, attempts: number, messageAttempted: boolean, now: number): DeliveryOutcome {
+  // A 401 rejected the bot token, not this message, on either request: nothing
+  // was delivered, and nothing is wrong with this member or recipient. It is
+  // retried once the token outage (UNAUTHORIZED_COOLDOWN_MS, marked by the
+  // rate limiter) is over, with the attempt not counted, so a token outage can
+  // never exhaust or reject a reminder. At most once still holds: a 401 never
+  // delivers.
+  if (err instanceof GcaDiscordError && err.status === 401) {
+    return {
+      status: 'pending', attempts, retryAt: now + UNAUTHORIZED_COOLDOWN_MS, rateLimited: false, unauthorized: true,
+      statusCode: 401,
+    };
+  }
   const rateLimited = err instanceof DiscordRateLimitError;
   const permanent = err instanceof PermanentGcaError ||
     (err instanceof GcaDiscordError && err.status >= 400 && err.status < 500 && !rateLimited);
@@ -566,6 +584,7 @@ export function classifyDeliveryFailure(err: unknown, attempts: number, messageA
     attempts: used,
     retryAt: now + delay,
     rateLimited,
+    unauthorized: false,
     statusCode: err instanceof GcaDiscordError || rateLimited ? (err as GcaDiscordError | DiscordRateLimitError).status : 'unavailable',
   };
 }
@@ -707,6 +726,17 @@ export async function fetchMembersWithBackoff(
   const guildId = env.GCA_DISCORD_GUILD_ID ?? '';
   const members = await fetchMembers(limits, env.DISCORD_BOT_TOKEN, guildId, deadline).catch(async (err: unknown) => {
     const httpError = err instanceof GcaDiscordError || err instanceof DiscordRateLimitError;
+    // Says nothing about the member list, and must not outlive this poll's
+    // in-memory limits: a rejected bot token (a 401, which marks a 60 s
+    // in-memory outage), or a request deferred locally by in-memory state only
+    // (that outage, a soft cooldown, the limiter's own deadline). The next
+    // poll, with new limits, simply tries again. A stored 429 cooldown
+    // ('rate_limit') deferred locally is still mirrored below. Nothing sets a
+    // limiter deadline on the limits the DM steps use today; a future
+    // `setDeadline` there must revisit this, as its 'deadline' deferrals would
+    // then bypass the MEMBER_LIST_DEADLINE_KEY count.
+    const exempt = (err instanceof GcaDiscordError && err.status === 401) ||
+      (err instanceof DiscordRateLimitError && !err.requestMade && err.reason !== 'rate_limit');
     // A rate-limit error reports status 429 even when this poll deferred the
     // lookup locally: its own reason and requestMade say what happened. A
     // thrown fetch (timeout, connection failure) never got an HTTP status.
@@ -716,13 +746,16 @@ export async function fetchMembersWithBackoff(
       : 'network';
     console.warn(JSON.stringify({
       event: 'gca_member_list_failed', reason, status: httpError ? err.status : 'unavailable', ...rateLimitDetail(err),
-      // Only a caller with its own deadline (short-session reminders) can make
-      // a failure that does not count towards this lookup's backoff.
-      ...(countDeadline ? {} : { counted: !(err instanceof GcaDeadlineError) }),
+      // Logged only for a caller with its own deadline (short-session
+      // reminders): whether the failure counts towards this lookup's backoff.
+      ...(countDeadline ? {} : { counted: !(err instanceof GcaDeadlineError) && !exempt }),
     }));
     // A caller with a budget of its own (short-session reminders) handles its
     // own deadline failures: they never count towards GCA's lookup backoff.
     if (err instanceof GcaDeadlineError && !countDeadline) throw err;
+    // Neither stored as a member-list backoff nor touching the deadline count
+    // (see `exempt`): the in-memory limits already defer the rest of this poll.
+    if (exempt) throw err;
     if (err instanceof GcaDeadlineError) {
       // Running out of the poll deadline is not a Discord failure: a one-off
       // slow lookup is simply retried next poll. Only a lookup that keeps
@@ -871,8 +904,9 @@ function recordSent(
 }
 
 /**
- * Record a failed member DM attempt. Returns true when it was rate-limited,
- * so no further reminders are attempted this poll.
+ * Record a failed member DM attempt. Returns true when it was rate-limited or
+ * the bot token was rejected (a 401), so no further reminders are attempted
+ * this poll.
  *
  * An occurrence exists only while a DM is reserved or once it was possibly
  * delivered: its message POST was made and not explicitly rejected (a timeout
@@ -908,7 +942,7 @@ async function recordDeliveryFailure(
   if (outcome.rateLimited && (err as DiscordRateLimitError).global) {
     await storage.put(BACKOFF_KEY, outcome.retryAt);
   }
-  return outcome.rateLimited;
+  return outcome.rateLimited || outcome.unauthorized;
 }
 
 /** Called inside the coordinator's serialized poll, before channel notifications. */
@@ -1034,8 +1068,8 @@ async function sendPendingCopies(env: Env, storage: DurableObjectStorage, limits
       console.warn(JSON.stringify({
         event: 'gca_copy_failed', status: outcome.statusCode, retry: outcome.status === 'pending', ...rateLimitDetail(err),
       }));
-      if (outcome.rateLimited) {
-        if ((err as DiscordRateLimitError).global) {
+      if (outcome.rateLimited || outcome.unauthorized) {
+        if (outcome.rateLimited && (err as DiscordRateLimitError).global) {
           await storage.put(BACKOFF_KEY, outcome.retryAt);
         }
         break;
