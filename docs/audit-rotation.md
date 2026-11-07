@@ -146,6 +146,7 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-23 | T1-5 | P4 | The pre-push note says which allow markers the scan applies (added lines and messages, not author names, emails or paths) | 1676363 |
 | 2026-10-23 | T3-2 | P3 | Real-Gitleaks hook tests split into four files run in parallel with a shared helper module, same tests and assertions; local script tests 136 s to 33 s (the macOS CI job had reached 9 of 20 minutes) | 69c533f |
 | 2026-10-23 | T3-2 | P4 | A test covers the GCA fallback that loads rate limits with the public channel set and the keyed hash | e5d3289 |
+| 2026-11-07 | T1-1, T1-4 | - | New: signed `/gca/records` routes let the division website publish GCA approvals and home overrides into the coordinator (HMAC with a derived key id, single-use nonces and write limits in the Durable Object, strict validation, versioned history pruned to 30 days and 20 versions, operator delete); the stored record replaces the two secrets once it exists. Pre-plan security review, three plan-check rounds, owner approval, shared vectors matched by the website | 39b5997, 2ec2b8d, 50f1e10 |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
