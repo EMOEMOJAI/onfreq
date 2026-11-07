@@ -2,7 +2,7 @@ import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  buildGcaEmbed, gcaMismatch, indexMemberVids, parseGcaPolicy, sendGcaReminders,
+  buildGcaEmbed, cappedCopyContent, gcaMismatch, indexMemberVids, parseGcaPolicy, sendGcaReminders,
   type GuildMember,
 } from '../src/gca';
 import type { OnlineAtc } from '../src/types';
@@ -467,6 +467,10 @@ describe('durable GCA delivery', () => {
     messageStatus = 200;
     // A newer connection processed first takes the next number.
     await check([atc({ sessionId: 3 }), atc({ sessionId: 2 })]);
+    // T1-4 F8: a 4th DM within 24 hours would be capped, so the next one comes a day later.
+    now += 86_400_000;
+    await check([]);
+    now += 60_000;
     await check([atc({ sessionId: 4 })]);
     const received = titles().filter((_title, i) => i !== 1);
     expect(received[0]).not.toContain('occurrence');
@@ -1019,7 +1023,8 @@ describe('durable GCA delivery', () => {
     const controllers = Array.from({ length: 5 }, (_, i) => atc({ sessionId: 100 + i }));
     await check(controllers);
     expect(sent).toHaveLength(3);
-    now += 60_000;
+    // T1-4 F8: retried once the first three leave the 24-hour cap window (a minute later they would be capped).
+    now += 86_400_000 + 60_000;
     await check(controllers);
     expect(sent).toHaveLength(5);
     await check(controllers);
@@ -1557,5 +1562,401 @@ describe('rate-limit fallback', () => {
     await runInDurableObject(stub(), (_instance, ctx) => sendGcaReminders(config, [atc()], ctx.storage, now, parseGcaPolicy(config), []));
     expect(load).not.toHaveBeenCalled();
     expect(network).not.toHaveBeenCalled();
+  });
+});
+
+// T1-4 audit fixes (plan T14, slice S1). Synthetic VIDs and Discord IDs only.
+describe('T1-4 F1: stale-row prune whatever the configuration', () => {
+  const DAY = 86_400_000;
+  const kv = () => runInDurableObject(stub(), async (_instance, ctx) => ({
+    lastActive: await ctx.storage.get('gca-last-active-v1'), initialized: await ctx.storage.get('gca-initialized-v1'),
+  }));
+  const tables = () => runInDurableObject(stub(), (_instance, ctx) => ctx.storage.sql.exec<{ name: string }>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'gca_%' ORDER BY name").toArray().map((row) => row.name));
+  /** One row of every status for VID 600009, all last seen `at`; every delivered kind keeps an occurrence. */
+  function seedEveryStatus(at: number) {
+    return runInDurableObject(stub(), (_instance, ctx) => {
+      const sql = ctx.storage.sql;
+      for (const [session, status, occurrence, capped] of [
+        [1, 'baseline', null, false], [2, 'pending', 9, false], [3, 'unmapped', null, false],
+        [4, 'sent', 1, false], [5, 'reserved', 2, false], [6, 'failed', 3, false], [7, 'sent', 4, true],
+      ] as const) {
+        sql.exec('INSERT INTO gca_reminders (session_key, status, last_seen, capped_at) VALUES (?, ?, ?, ?)',
+          `600009:${session}`, status, at, capped ? at : null);
+        // Session 2's occurrence is one an earlier version kept for a deferred DM.
+        if (occurrence !== null) {
+          sql.exec('INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, 600009, ?)', `600009:${session}`, occurrence);
+        }
+      }
+    });
+  }
+  const delivered = ['600009:4', '600009:5', '600009:6', '600009:7'];
+
+  it.each([
+    ['reminders are disabled', { GCA_DM_ENABLED: 'false' }],
+    ['the policy is invalid', { GCA_APPROVALS: '' }],
+    ['the guild ID is invalid', { GCA_DISCORD_GUILD_ID: 'not-a-guild' }],
+  ] as const)('prunes stale never-delivered rows while %s, and writes nothing else', async (_name, overrides) => {
+    await check([]);
+    await seedEveryStatus(now);
+    const before = await kv();
+    now += 8 * DAY;
+    await check([atc()], { ...settings(), ...overrides });
+    expect(network).not.toHaveBeenCalled();
+    expect((await statuses()).map((row) => row.session_key)).toEqual(delivered);
+    expect((await occurrences()).map((row) => row.session_key)).toEqual(delivered);
+    // No session row inserted or refreshed, no last-active or initialized write.
+    expect(await kv()).toEqual(before);
+  });
+
+  it('keeps rows younger than 7 days while disabled', async () => {
+    await check([]);
+    await seedEveryStatus(now);
+    now += 7 * DAY - 1;
+    await check([], { ...settings(), GCA_DM_ENABLED: 'false' });
+    expect(await statuses()).toHaveLength(7);
+  });
+
+  it('creates no GCA table while disabled or misconfigured', async () => {
+    for (const overrides of [{ GCA_DM_ENABLED: 'false' }, { GCA_APPROVALS: '' }, { GCA_DISCORD_GUILD_ID: 'x' }]) {
+      await check([atc()], { ...settings(), ...overrides });
+    }
+    expect(await tables()).toEqual([]);
+    expect(await kv()).toEqual({ lastActive: undefined, initialized: undefined });
+  });
+
+  it('re-enabling after a disabled week rebaselines a session still online, without a DM', async () => {
+    const log = vi.spyOn(console, 'log');
+    await check([atc()]); // first enabled poll: baseline
+    now += 60_000;
+    await check([atc(), atc({ sessionId: 2 })]); // a new connection is warned
+    expect(sent).toHaveLength(1);
+    await seedEveryStatus(now);
+    const off = { ...settings(), GCA_DM_ENABLED: 'false' };
+    for (let day = 1; day <= 8; day++) {
+      now += DAY;
+      await check([atc(), atc({ sessionId: 2 })], off);
+    }
+    // The baseline row of the session online throughout was pruned while disabled.
+    expect((await statuses()).map((row) => row.session_key)).toEqual(['600001:2', ...delivered]);
+    now += 60_000;
+    await check([atc(), atc({ sessionId: 2 })]);
+    expect(logged(log, 'gca_rebaselined')).toEqual([{ event: 'gca_rebaselined', sessions: 2 }]);
+    expect(sent).toHaveLength(1);
+    expect((await statuses()).map((row) => [row.session_key, row.status])).toEqual([
+      ['600001:123456', 'baseline'], ['600001:2', 'sent'],
+      ['600009:4', 'sent'], ['600009:5', 'reserved'], ['600009:6', 'failed'], ['600009:7', 'sent'],
+    ]);
+    expect(await occurrences()).toEqual([
+      { session_key: '600001:2', occurrence: 1 }, { session_key: '600009:4', occurrence: 1 },
+      { session_key: '600009:5', occurrence: 2 }, { session_key: '600009:6', occurrence: 3 },
+      { session_key: '600009:7', occurrence: 4 },
+    ]);
+  });
+});
+
+describe('T1-4 F4: a delivered DM whose recording fails', () => {
+  it('logs gca_dm_record_failed instead of gca_dm_failed, keeps the occurrence and never resends', async () => {
+    await check([]);
+    const warn = vi.spyOn(console, 'warn');
+    const error = vi.spyOn(console, 'error');
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      const sql = ctx.storage.sql;
+      const exec = sql.exec.bind(sql);
+      const spy = vi.spyOn(sql, 'exec').mockImplementation(((query: string, ...bindings: unknown[]) => {
+        if (query.startsWith("UPDATE gca_reminders SET status = 'sent' WHERE")) throw new Error('synthetic storage detail');
+        return exec(query, ...bindings);
+      }) as typeof sql.exec);
+      try {
+        await sendGcaReminders(settings(), [atc()], ctx.storage, now, policy(), []);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+    expect(sent).toHaveLength(1);
+    expect(logged(error, 'gca_dm_record_failed')).toEqual([{ event: 'gca_dm_record_failed', error: 'Error' }]);
+    expect(logged(warn, 'gca_dm_failed')).toEqual([]);
+    expect(JSON.stringify([...warn.mock.calls, ...error.mock.calls])).not.toMatch(/synthetic storage detail|600001/);
+    expect((await statuses())[0]).toMatchObject({ status: 'failed' });
+    expect(await occurrences()).toEqual([{ session_key: '600001:123456', occurrence: 1 }]);
+    now += 3_600_000;
+    await check([atc()]);
+    expect(sent).toHaveLength(1);
+  });
+});
+
+describe('T1-4 F8: at most 3 member DMs per VID per rolling 24 hours', () => {
+  const DAY = 86_400_000;
+  const COPY_USER = '111111111111111111';
+  const COPY_CHANNEL = '222222222222222222';
+  const config = () => ({ ...settings(), GCA_COPY_USER_ID: COPY_USER });
+  let copies: Record<string, unknown>[];
+  let memberOpens: string[];
+
+  beforeEach(() => {
+    copies = [];
+    memberOpens = [];
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/users/@me/channels')) {
+        // Echo the recipient, so several members can be DMed in one poll.
+        const recipient = (JSON.parse(String(init?.body)) as { recipient_id: string }).recipient_id;
+        if (recipient === COPY_USER) return Response.json({ id: COPY_CHANNEL, type: 1, recipients: [{ id: COPY_USER }] });
+        memberOpens.push(recipient);
+        return Response.json({ id: CHANNEL, type: 1, recipients: [{ id: recipient }], retry_after: 180 }, { status: openStatus });
+      }
+      if (url.endsWith(`/channels/${COPY_CHANNEL}/messages`)) {
+        copies.push(JSON.parse(String(init?.body)));
+        return Response.json({ id: '333333333333333333' });
+      }
+      return original(input, init);
+    });
+  });
+
+  const rows = () => runInDurableObject(stub(), (_instance, ctx) => ctx.storage.sql.exec(
+    'SELECT session_key, status, capped_at, dm_at FROM gca_reminders ORDER BY session_key').toArray());
+  const row = async (key: string) => (await rows()).find((r) => r.session_key === key);
+  const copyTitle = (copy: Record<string, unknown>) => (copy.embeds as DiscordEmbed[])[0]!.title!;
+
+  /** Baseline, then sessions 1..3 of VID 600001 DMed a minute apart (at START, +1 and +2 minutes). */
+  async function sendThree() {
+    await check([], config());
+    for (const sessionId of [1, 2, 3]) {
+      await check([atc({ sessionId })], config());
+      now += 60_000;
+    }
+    expect(sent).toHaveLength(3);
+  }
+
+  it('records the 4th qualifying session within 24 hours with no member DM, and copies it to staff with the capped text', async () => {
+    await sendThree();
+    const log = vi.spyOn(console, 'log');
+    const opensBefore = memberOpens.length;
+    await check([atc({ sessionId: 4 })], config());
+    expect(sent).toHaveLength(3);
+    expect(memberOpens).toHaveLength(opensBefore); // not even a DM channel open
+    expect(await row('600001:4')).toEqual({ session_key: '600001:4', status: 'sent', capped_at: now, dm_at: null });
+    expect((await occurrences()).at(-1)).toEqual({ session_key: '600001:4', occurrence: 4 });
+    expect(copies).toHaveLength(4);
+    const copy = copies[3]!;
+    expect(copy.content).toBe(`No member DM sent to <@${USER}> · VID 600001 · 24-hour cap of 3 GCA reminders reached; this occurrence is recorded only`);
+    expect(copy.content).toBe(cappedCopyContent(USER, 600001));
+    expect(String(copy.content)).not.toContain('reminder sent to');
+    // The stored embed is the one the member would have received, numbered as today.
+    expect(copyTitle(copy)).toContain('[4th occurrence]');
+    expect(copy.embeds).toEqual([buildGcaEmbed(atc({ sessionId: 4 }), gcaMismatch(atc(), policy())!, 4)]);
+    expect(copy.allowed_mentions).toEqual({ parse: [] });
+    // Sent-DM copies keep today's exact text.
+    expect(copies.slice(0, 3).map((c) => c.content)).toEqual(Array(3).fill(`Copy of reminder sent to <@${USER}> · VID 600001`));
+    expect(logged(log, 'gca_dm_capped')).toEqual([{ event: 'gca_dm_capped' }]);
+    // Terminal: the same connection is never DMed or copied again.
+    now += 3_600_000;
+    await check([atc({ sessionId: 4 })], config());
+    expect(sent).toHaveLength(3);
+    expect(copies).toHaveLength(4);
+  });
+
+  it('DMs again once the window has passed; a capped occurrence does not count towards the cap', async () => {
+    await sendThree(); // DMs at START, START + 1 min, START + 2 min
+    await check([atc({ sessionId: 4 })], config()); // capped at START + 3 min
+    now = START + DAY - 5 * 60_000;
+    await check([], config()); // keeps the gap under the rebaseline threshold
+    // START + 1 min is still inside the window: 2 counted DMs (sessions 2, 3), plus the capped one.
+    now = START + DAY + 60_000;
+    await check([atc({ sessionId: 5 })], config());
+    expect(sent).toHaveLength(4);
+    expect(titles()[3]).toContain('[5th occurrence]');
+    expect(await row('600001:5')).toMatchObject({ status: 'sent', capped_at: null, dm_at: now });
+    // Sessions 2, 3 and 5 now fill the window again.
+    await check([atc({ sessionId: 6 })], config());
+    expect(sent).toHaveLength(4);
+    expect(await row('600001:6')).toMatchObject({ status: 'sent', capped_at: now });
+    expect(copyTitle(copies.at(-1)!)).toContain('[6th occurrence]');
+  });
+
+  it('does not count a capped occurrence that had an earlier rejected attempt (its dm_at is set)', async () => {
+    await check([], config());
+    await check([atc({ sessionId: 1 })], config()); // A: DMed at START
+    now += 60_000;
+    messageStatus = 429;
+    await check([atc({ sessionId: 3 })], config()); // C: rejected at START + 1 min, retried later
+    messageStatus = 200;
+    for (const [minute, sessionId] of [[5, 2], [6, 4]] as const) { // B and D
+      now = START + minute * 60_000;
+      await check([atc({ sessionId })], config());
+    }
+    now = START + 7 * 60_000;
+    await check([atc({ sessionId: 3 })], config()); // C's retry hits the cap
+    expect(await row('600001:3')).toMatchObject({ status: 'sent', capped_at: now, dm_at: START + 60_000 });
+    now = START + DAY - 5 * 60_000;
+    await check([], config());
+    // A has left the window; B, D and the capped C are inside it. Only B and D count.
+    now = START + DAY + 30_000;
+    await check([atc({ sessionId: 5 })], config());
+    expect(await row('600001:5')).toMatchObject({ status: 'sent', capped_at: null, dm_at: now });
+    expect(titles().at(-1)).toContain('[5th occurrence]');
+  });
+
+  it('is per VID: another member is still DMed', async () => {
+    await sendThree();
+    members = [member(), member(600002, '200000000000000002')];
+    await check([atc({ userId: 600002, sessionId: 9 }), atc({ sessionId: 4 })], config());
+    expect(sent).toHaveLength(4);
+    expect(titles()[3]).not.toContain('occurrence');
+    expect(memberOpens.at(-1)).toBe('200000000000000002');
+    expect(await row('600002:9')).toMatchObject({ status: 'sent', capped_at: null });
+    expect(await row('600001:4')).toMatchObject({ status: 'sent', capped_at: now });
+  });
+
+  it('counts a retried DM once', async () => {
+    await check([], config());
+    messageStatus = 429; // rejected: the row is retried later, its occurrence released
+    await check([atc({ sessionId: 1 })], config());
+    now += 180_000;
+    messageStatus = 200;
+    await check([atc({ sessionId: 1 })], config());
+    expect(await row('600001:1')).toMatchObject({ status: 'sent', dm_at: now });
+    for (const sessionId of [2, 3]) {
+      now += 60_000;
+      await check([atc({ sessionId })], config());
+    }
+    // Two reservations of session 1, one counted DM: session 3 was the 3rd.
+    expect(titles()).toHaveLength(4);
+    expect(titles()[3]).toContain('[3rd occurrence]');
+    now += 60_000;
+    await check([atc({ sessionId: 4 })], config());
+    expect(titles()).toHaveLength(4);
+    expect(await row('600001:4')).toMatchObject({ capped_at: now });
+  });
+
+  it('counts a failed DM only while its occurrence is kept (possibly delivered)', async () => {
+    await check([], config());
+    messageStatus = 403; // definitely not delivered: occurrence released, not counted
+    await check([atc({ sessionId: 1 })], config());
+    messageStatus = 200;
+    timeoutMessage = true; // possibly delivered: counted
+    now += 60_000;
+    await check([atc({ sessionId: 2 })], config());
+    timeoutMessage = false;
+    for (const sessionId of [3, 4]) {
+      now += 60_000;
+      await check([atc({ sessionId })], config());
+    }
+    expect(sent).toHaveLength(4);
+    now += 60_000;
+    await check([atc({ sessionId: 5 })], config());
+    expect(sent).toHaveLength(4);
+    expect(await row('600001:5')).toMatchObject({ capped_at: now });
+  });
+
+  it('does not count rows recorded before dm_at existed', async () => {
+    await check([], config());
+    await runInDurableObject(stub(), (_instance, ctx) => {
+      for (const sessionId of [1, 2, 3]) {
+        ctx.storage.sql.exec("INSERT INTO gca_reminders (session_key, status, last_seen, attempts) VALUES (?, 'sent', ?, 1)",
+          `600001:${sessionId}`, now);
+        ctx.storage.sql.exec('INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, 600001, ?)',
+          `600001:${sessionId}`, sessionId);
+      }
+    });
+    await check([atc({ sessionId: 4 })], config());
+    expect(sent).toHaveLength(1);
+    expect(titles()[0]).toContain('[4th occurrence]');
+  });
+
+  it('does not use the per-poll send budget for capped occurrences', async () => {
+    await sendThree();
+    const others = [600002, 600003, 600004];
+    members = [member(), ...others.map((vid, i) => member(vid, `20000000000000001${i}`))];
+    await check([atc({ sessionId: 4 }), atc({ sessionId: 5 }), ...others.map((userId) => atc({ userId, sessionId: 1 }))], config());
+    expect(sent).toHaveLength(6);
+    expect((await rows()).filter((r) => r.capped_at !== null).map((r) => r.session_key)).toEqual(['600001:4', '600001:5']);
+    expect(memberOpens.slice(-3)).toEqual(['200000000000000010', '200000000000000011', '200000000000000012']);
+  });
+
+  it('caps without a staff copy when copies are off', async () => {
+    await sendThree();
+    await check([atc({ sessionId: 4 })], settings());
+    expect(sent).toHaveLength(3);
+    expect(await row('600001:4')).toMatchObject({ status: 'sent', capped_at: now });
+    expect(copies).toHaveLength(3);
+  });
+
+  it('upgrades an older table in place: adds dm_at and capped_at, keeping its rows', async () => {
+    await runInDurableObject(stub(), (_instance, ctx) => {
+      // The 2.3.0 / 2.2.12 shape.
+      ctx.storage.sql.exec(`CREATE TABLE gca_reminders (
+        session_key TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0)`);
+      ctx.storage.sql.exec("INSERT INTO gca_reminders (session_key, status, last_seen, attempts) VALUES ('600001:1', 'sent', ?, 1)", now);
+    });
+    await check([], config());
+    expect(await rows()).toEqual([{ session_key: '600001:1', status: 'sent', capped_at: null, dm_at: null }]);
+    await check([], config()); // idempotent
+  });
+});
+
+describe('T1-4 F8 rollback: older versions treat a capped row as terminal', () => {
+  // Verbatim from src/gca.ts of 2.3.0 (identical in 2.2.12): the stale-row
+  // prune, the session upsert with its candidate rule, and the occurrence reservation.
+  const STALE = "last_seen < ? AND status NOT IN ('sent', 'reserved', 'failed')";
+  const PRUNE_OCCURRENCES = `DELETE FROM gca_occurrences WHERE session_key IN (SELECT session_key FROM gca_reminders WHERE ${STALE})`;
+  const PRUNE_REMINDERS = `DELETE FROM gca_reminders WHERE ${STALE}`;
+  const UPSERT = `INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)
+      ON CONFLICT(session_key) DO UPDATE SET last_seen = excluded.last_seen
+      RETURNING status, attempts, retry_at`;
+  const RESERVE_OCCURRENCE = `INSERT OR IGNORE INTO gca_occurrences (session_key, user_id, occurrence)
+      SELECT ?, ?, COALESCE(MAX(occurrence), 0) + 1 FROM gca_occurrences WHERE user_id = ?`;
+  const RESERVE = "UPDATE gca_reminders SET status = 'reserved', attempts = attempts + 1 WHERE session_key = ?";
+  const oldCandidate = (r: { status: string; attempts: number; retry_at: number }, at: number) =>
+    r.status === 'pending' && r.retry_at <= at && r.attempts < 5;
+
+  it('keeps a capped row older than 7 days and its occurrence, never re-sends it, and numbers the next DM MAX+1', async () => {
+    const COPY_USER = '111111111111111111';
+    const config = { ...settings(), GCA_COPY_USER_ID: COPY_USER };
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/users/@me/channels') && JSON.parse(String(init?.body)).recipient_id === COPY_USER) {
+        return Response.json({ id: '222222222222222222', type: 1, recipients: [{ id: COPY_USER }] });
+      }
+      if (url.endsWith('/channels/222222222222222222/messages')) return Response.json({ id: '333333333333333333' });
+      return original(input, init);
+    });
+    await check([], config);
+    for (const sessionId of [1, 2, 3, 4]) {
+      await check([atc({ sessionId })], config);
+      now += 60_000;
+    }
+    expect(sent).toHaveLength(3);
+    now += 8 * 86_400_000;
+    const result = await runInDurableObject(stub(), (_instance, ctx) => {
+      const sql = ctx.storage.sql;
+      const capped = sql.exec('SELECT status, capped_at FROM gca_reminders WHERE session_key = ?', '600001:4').one();
+      sql.exec(PRUNE_OCCURRENCES, now - 7 * 86_400_000);
+      sql.exec(PRUNE_REMINDERS, now - 7 * 86_400_000);
+      const survived = sql.exec('SELECT status FROM gca_reminders WHERE session_key = ?', '600001:4').toArray();
+      const reappeared = sql.exec<{ status: string; attempts: number; retry_at: number }>(UPSERT, '600001:4', 'pending', now).one();
+      const fresh = sql.exec<{ status: string; attempts: number; retry_at: number }>(UPSERT, '600001:9', 'pending', now).one();
+      sql.exec(RESERVE_OCCURRENCE, '600001:9', 600001, 600001);
+      sql.exec(RESERVE, '600001:9');
+      return {
+        capped, survived, reappearedIsCandidate: oldCandidate(reappeared, now), freshIsCandidate: oldCandidate(fresh, now),
+        occurrences: sql.exec('SELECT session_key, occurrence FROM gca_occurrences ORDER BY occurrence').toArray(),
+      };
+    });
+    expect(result.capped).toMatchObject({ status: 'sent', capped_at: expect.any(Number) });
+    expect(result.survived).toEqual([{ status: 'sent' }]);
+    expect(result.reappearedIsCandidate).toBe(false);
+    expect(result.freshIsCandidate).toBe(true);
+    expect(result.occurrences).toEqual([
+      { session_key: '600001:1', occurrence: 1 }, { session_key: '600001:2', occurrence: 2 },
+      { session_key: '600001:3', occurrence: 3 }, { session_key: '600001:4', occurrence: 4 },
+      { session_key: '600001:9', occurrence: 5 },
+    ]);
+    // And this version's own prune keeps it too.
+    await check([], config);
+    expect((await statuses()).find((row) => row.session_key === '600001:4')).toMatchObject({ status: 'sent' });
   });
 });

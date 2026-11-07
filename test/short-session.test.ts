@@ -954,6 +954,17 @@ describe('short-session reminders: delivery', () => {
     expect(dms).toHaveLength(suppressed ? 0 : 1);
   });
 
+  it('T1-4 F8: a capped GCA occurrence (stored as sent, no member DM) during this presence suppresses', async () => {
+    await seedGca((db) => {
+      db.exec('INSERT INTO gca_reminders (session_key, status, last_seen, capped_at) VALUES (?, ?, ?, ?)', `${VID}:1`, 'sent', START, START);
+      db.exec('INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, ?, 4)', `${VID}:1`, VID);
+    });
+    await shortSession();
+    await at(15, []);
+    expect(await statuses()).toEqual(['skipped_gca']);
+    expect(dms).toHaveLength(0);
+  });
+
   it('F4: a GCA reminder to the member during this presence suppresses, an earlier one does not', async () => {
     await seedGca((db) => {
       db.exec('INSERT INTO gca_reminders (session_key, status, last_seen) VALUES (?, ?, ?)', `${VID}:999`, 'sent', ms(3));

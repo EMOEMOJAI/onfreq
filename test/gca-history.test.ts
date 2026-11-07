@@ -208,3 +208,33 @@ it('rejects invalid cursors and write methods', async () => {
   expect((await SELF.fetch('https://example.com/gca-history?after=invalid', { headers })).status).toBe(400);
   expect((await SELF.fetch('https://example.com/gca-history', { method: 'POST', headers })).status).toBe(405);
 });
+
+it('T1-4 F8: reports a capped occurrence as status "capped" (stored as sent), never as a sent DM', async () => {
+  await seedGca((sql) => {
+    sql.exec(REMINDER, '600001:1', 'sent', 1, 1000);
+    sql.exec("INSERT INTO gca_reminders (session_key, status, attempts, last_seen, capped_at) VALUES ('600001:2', 'sent', 0, 2000, 2000)");
+    sql.exec('INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, ?, ?)', '600001:1', 600001, 1);
+    sql.exec('INSERT INTO gca_occurrences (session_key, user_id, occurrence) VALUES (?, ?, ?)', '600001:2', 600001, 2);
+  });
+  const response = await SELF.fetch('https://example.com/gca-history', { headers });
+  expect(((await response.json()) as { records: unknown[] }).records).toEqual([
+    { sessionKey: '600001:1', status: 'sent', attempts: 1, lastSeenAt: 1000, occurrence: 1, capped: false },
+    { sessionKey: '600001:2', status: 'capped', attempts: 0, lastSeenAt: 2000, occurrence: 2, capped: true },
+  ]);
+});
+
+it('T1-4 F8: reads a table from before capped_at existed without changing it', async () => {
+  await runInDurableObject(env.POLL_COORDINATOR.getByName(COORDINATOR_NAME), (_instance, ctx) => {
+    ctx.storage.sql.exec(`CREATE TABLE gca_reminders (
+      session_key TEXT PRIMARY KEY, status TEXT NOT NULL, last_seen INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0)`);
+    ctx.storage.sql.exec(REMINDER, '600001:1', 'sent', 1, 1000);
+  });
+  const response = await SELF.fetch('https://example.com/gca-history', { headers });
+  expect(((await response.json()) as { records: unknown[] }).records).toEqual([
+    { sessionKey: '600001:1', status: 'sent', attempts: 1, lastSeenAt: 1000, occurrence: null, capped: false },
+  ]);
+  const columns = await runInDurableObject(env.POLL_COORDINATOR.getByName(COORDINATOR_NAME), (_instance, ctx) =>
+    ctx.storage.sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('gca_reminders')").toArray().map((row) => row.name));
+  expect(columns).not.toContain('capped_at');
+});

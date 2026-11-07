@@ -119,11 +119,11 @@ describe('versioning and response JSON types', () => {
     expect(stored.digest).toMatch(DIGEST);
     expect(stored.updatedAt).toBe(new Date(START).toISOString());
     expect(stored.digest).toBe(await sha256('{"approvals":{"100001":[{"level":3,"region":"HK"}]},"homeOverrides":{}}'));
-    // The success log: version, digest prefix and counts only.
+    // The success log: version and counts only, no part of the digest (T1-4 F9a).
     expect(infos.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual({
-      event: 'gca_records_updated', version: stored.version, digestPrefix: stored.digest.slice(0, 8),
-      counts: { approvals: 1, homeOverrides: 0 },
+      event: 'gca_records_updated', version: stored.version, counts: { approvals: 1, homeOverrides: 0 },
     });
+    expect(JSON.stringify(infos.mock.calls)).not.toContain(stored.digest.slice(0, 8));
     const retry = await publish(null);
     expect(retry.status).toBe(409);
     expect(await retry.json()).toEqual({ currentVersion: stored.version, currentDigest: stored.digest });
@@ -293,5 +293,42 @@ describe('HTTP policy: methods, OPTIONS, queries, paths, no-store', () => {
       expect(response.headers.get('cache-control')).toBe('no-store');
       expect(response.headers.get('access-control-allow-origin')).toBeNull();
     }
+  });
+});
+
+// T1-4 audit fixes (plan T14, slice S1).
+describe('T1-4 F7: the 64 KiB body cap before the VID cap', () => {
+  it('refuses a realistic, otherwise valid record of under 2,000 VIDs over 64 KiB with 413, leaving the stored record unchanged', async () => {
+    const first = await publish(null);
+    expect(first.status).toBe(200);
+    const stored = await first.json() as { version: string; digest: string };
+    const before = await (await viaWorker(await meta())).json();
+    // 1,800 synthetic VIDs with one approval each: within the VID cap, over the byte cap.
+    const approvals = Object.fromEntries(Array.from({ length: 1800 }, (_, i) => [String(1_000_001 + i), [{ level: 3, region: 'HK' }]]));
+    const body = recordBody({ approvals, baseVersion: stored.version });
+    expect(Object.keys(approvals).length).toBeLessThan(2000);
+    expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(64 * 1024);
+    for (const fetcher of [viaSelf, (r: Signed) => viaWorker(r)]) {
+      const response = await fetcher(await put(body));
+      expect(response.status).toBe(413);
+      expect(await response.json()).toEqual({ error: 'payload too large' });
+    }
+    expect(await (await viaWorker(await meta())).json()).toEqual(before);
+    expect(await recordRows()).toMatchObject({ current: 1, history: 1, writes: 1 });
+  });
+});
+
+describe('T1-4 F9b: signed meta rate limit over HTTP', () => {
+  it('answers the 121st signed meta request within an hour with 429 rate_limited', async () => {
+    for (let i = 0; i < 120; i++) {
+      now += 1000;
+      expect((await viaWorker(await meta())).status).toBe(200);
+    }
+    const refused = await viaWorker(await meta());
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get('cache-control')).toBe('no-store');
+    expect(await refused.json()).toEqual({ error: 'rate_limited' });
+    // Publishing still works.
+    expect((await publish(null)).status).toBe(200);
   });
 });

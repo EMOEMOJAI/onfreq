@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PollCoordinator } from '../src/coordinator';
 import { parseGcaPolicy } from '../src/gca';
 import {
-  canonicalGcaRecords, loadGcaPolicy, parseGcaRecordsBody, sha256Hex, writeGcaRecords,
+  canonicalGcaRecords, loadGcaPolicy, parseGcaRecordsBody, resetGcaRecordsLogForTests, sha256Hex, writeGcaRecords,
   type GcaRecords, type GcaSignedRequest,
 } from '../src/gca-records';
 
@@ -86,6 +86,8 @@ function logged(spy: { mock: { calls: unknown[][] } }): string[] {
 beforeEach(() => {
   now = START;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
+  // T1-4 F6: with reminders off the "records" line is logged once per isolate.
+  resetGcaRecordsLogForTests();
 });
 
 afterEach(async () => {
@@ -323,13 +325,14 @@ describe('write RPC', () => {
     expect(await recordsTables()).toEqual([]);
   });
 
-  it('logs only the version, a digest prefix and counts', async () => {
+  it('logs only the version and counts, no part of the digest (T1-4 F9a)', async () => {
     const log = vi.spyOn(console, 'log');
     await write(publish(null));
     expect(log).toHaveBeenCalledWith(JSON.stringify({
-      event: 'gca_records_updated', version: '1', digestPrefix: RECORD_DIGEST.slice(0, 8), counts: { approvals: 4, homeOverrides: 1 },
+      event: 'gca_records_updated', version: '1', counts: { approvals: 4, homeOverrides: 1 },
     }));
     expect(logged(log).join('\n')).not.toMatch(/100001|100002|99999|4294967297/);
+    expect(logged(log).join('\n')).not.toContain(RECORD_DIGEST.slice(0, 8));
   });
 });
 
@@ -483,5 +486,114 @@ describe('meta and the loader', () => {
   it('applies a valid write with the module function too (same transaction path)', async () => {
     const result = await runInDurableObject(stub(), (_i, ctx) => writeGcaRecords(ctx.storage, settings(), publish(null)));
     expect(result).toMatchObject({ ok: true, version: '1' });
+  });
+});
+
+// T1-4 audit fixes (plan T14, slice S1).
+describe('T1-4 F3: a damaged stored version', () => {
+  it('blocks every PUT with 409 currentVersion null until the operator delete (accepted, documented)', async () => {
+    const stored = await write(publish(null));
+    expect(stored).toMatchObject({ ok: true, version: '1' });
+    await withCoordinator((_c, ctx) => { ctx.storage.sql.exec("UPDATE gca_records_current SET version = 'one'"); });
+    for (const base of [null, '1', '2']) {
+      now += 1000;
+      expect(await write(publish(base))).toEqual({ ok: false, error: 'conflict', currentVersion: null, currentDigest: RECORD_DIGEST });
+    }
+    expect(await meta()).toMatchObject({ ok: true, source: 'invalid', version: null, digest: RECORD_DIGEST });
+    // Recovery: the operator delete, then a first publish with baseVersion null; the version still increases.
+    expect(await operatorDelete()).toMatchObject({ ok: true, deleted: 1 });
+    expect(await write(publish(null))).toMatchObject({ ok: true, version: '2' });
+  });
+});
+
+describe('T1-4 F6: an invalid stored record while reminders are off', () => {
+  const invalid = async () => {
+    await write(publish(null));
+    await withCoordinator((_c, ctx) => { ctx.storage.sql.exec(`UPDATE gca_records_current SET digest = '${'0'.repeat(64)}'`); });
+  };
+  const records = (spy: { mock: { calls: unknown[][] } }) =>
+    logged(spy).filter((line) => line === JSON.stringify({ event: 'gca_config_invalid', reason: 'records' }));
+
+  it.each([['false'], [''], ['TRUE']])('is logged at most once per isolate with GCA_DM_ENABLED=%j', async (enabled) => {
+    await invalid();
+    const error = vi.spyOn(console, 'error');
+    const config = settings({ GCA_DM_ENABLED: enabled });
+    for (let i = 0; i < 3; i++) {
+      expect(await withCoordinator((_c, ctx) => loadGcaPolicy(config, ctx.storage, now), config)).toBeNull();
+    }
+    expect(records(error)).toHaveLength(1);
+  });
+
+  it('is logged once while reminders are on but the guild or role is unusable', async () => {
+    await invalid();
+    const error = vi.spyOn(console, 'error');
+    const config = settings({ GCA_DM_ENABLED: 'true', GCA_DISCORD_GUILD_ID: 'not-a-guild' });
+    for (let i = 0; i < 3; i++) await withCoordinator((_c, ctx) => loadGcaPolicy(config, ctx.storage, now), config);
+    expect(records(error)).toHaveLength(1);
+  });
+
+  it('is logged on every poll while reminders are enabled, even after the once-per-isolate line', async () => {
+    await invalid();
+    const error = vi.spyOn(console, 'error');
+    await withCoordinator((_c, ctx) => loadGcaPolicy(settings(), ctx.storage, now));
+    const on = settings({ GCA_DM_ENABLED: 'true' });
+    for (let i = 0; i < 3; i++) {
+      expect(await withCoordinator((_c, ctx) => loadGcaPolicy(on, ctx.storage, now), on)).toBeNull();
+    }
+    expect(records(error)).toHaveLength(4);
+  });
+});
+
+describe('T1-4 F9b: signed meta has its own hourly budget', () => {
+  const metaReads = () => withCoordinator((_c, ctx) =>
+    ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM gca_records_meta_reads').one().n);
+
+  it('allows 120 signed meta requests per sliding hour, then 429 without recording, separately from writes', async () => {
+    for (let i = 0; i < 120; i++) {
+      now += 1000;
+      expect(await meta(metaRequest())).toMatchObject({ ok: true });
+    }
+    const before = await rows();
+    const refused = metaRequest();
+    expect(await meta(refused)).toEqual({ ok: false, error: 'rate_limited' });
+    expect(await rows()).toEqual(before);
+    expect(await metaReads()).toBe(120);
+    // Writes and the operator's bearer meta are unaffected.
+    expect(await write(publish(null))).toMatchObject({ ok: true, version: '1' });
+    expect(await meta()).toMatchObject({ ok: true, source: 'durable-object' });
+    // The first request leaves the window one hour after it was made; a refused nonce was not kept.
+    now = START + 1000 + 3_600_000;
+    expect(await meta(refused)).toMatchObject({ ok: true, source: 'durable-object' });
+    expect(await meta(metaRequest())).toEqual({ ok: false, error: 'rate_limited' });
+  });
+
+  it('does not let writes use the meta budget', async () => {
+    expect((await write(publish(null))).ok).toBe(true);
+    for (let i = 1; i < 30; i++) await write(put('{}'));
+    expect(await write(put('{}'))).toEqual({ ok: false, error: 'rate_limited' });
+    expect(await meta(metaRequest())).toMatchObject({ ok: true });
+    expect(await metaReads()).toBe(1);
+  });
+});
+
+describe('T1-4 F9c: history prune failure', () => {
+  it('is logged once per isolate by error class only, and the policy still loads', async () => {
+    await write(publish(null));
+    const error = vi.spyOn(console, 'error');
+    const results = await withCoordinator(async (_c, ctx) => {
+      const sql = ctx.storage.sql;
+      const exec = sql.exec.bind(sql);
+      const spy = vi.spyOn(sql, 'exec').mockImplementation(((query: string, ...bindings: unknown[]) => {
+        if (query.startsWith('DELETE FROM gca_records_history')) throw new TypeError('synthetic storage detail 100001');
+        return exec(query, ...bindings);
+      }) as typeof sql.exec);
+      try {
+        return [await loadGcaPolicy(settings(), ctx.storage, now), await loadGcaPolicy(settings(), ctx.storage, now)];
+      } finally {
+        spy.mockRestore();
+      }
+    });
+    expect(results.map((policy) => policy?.approvals[100001])).toEqual([[{ level: 3, region: 'AA' }], [{ level: 3, region: 'AA' }]]);
+    expect(logged(error)).toEqual([JSON.stringify({ event: 'gca_records_prune_failed', error: 'TypeError' })]);
   });
 });

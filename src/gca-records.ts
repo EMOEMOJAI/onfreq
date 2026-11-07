@@ -4,11 +4,11 @@
  * the GCA_APPROVALS / GCA_HOME_OVERRIDES secrets; GCA_REGIONS stays a secret
  * and every stored record is re-validated against it on each poll.
  *
- * Nothing here logs a VID, a request body or record contents: only versions,
- * an 8-character digest prefix and counts.
+ * Nothing here logs a VID, a request body, record contents or any part of a
+ * digest: only versions and counts.
  */
 import {
-  byVid, finishGcaPolicy, parseApprovals, parseGcaPolicy, parseHomeOverrides, parseJsonRejectDuplicateKeys,
+  byVid, finishGcaPolicy, gcaRemindersEnabled, parseApprovals, parseGcaPolicy, parseHomeOverrides, parseJsonRejectDuplicateKeys,
   parseRegions, validateApprovals, validateHomeOverrides, type GcaApproval, type GcaPolicy, type GcaRecordsError,
   type GcaRegions,
 } from './gca';
@@ -64,6 +64,8 @@ export const GCA_RECORDS_PURGE_PATH = '/gca/records/history/purge';
 export const GCA_MAX_BODY_BYTES = 64 * 1024;
 /** Authenticated write attempts (PUT and purge, including refused ones) per sliding hour. */
 export const GCA_WRITES_PER_HOUR = 30;
+/** Signed meta requests per sliding hour, counted separately from writes; 429 beyond. */
+export const GCA_META_READS_PER_HOUR = 120;
 /** Unexpired nonces kept at most; a request beyond it is refused (429). */
 export const GCA_NONCE_CAP = 2000;
 export const GCA_HISTORY_MAX_AGE_MS = 30 * 86_400_000;
@@ -92,6 +94,8 @@ export function ensureGcaRecordsSchema(sql: SqlStorage): void {
   sql.exec('CREATE INDEX IF NOT EXISTS gca_records_nonces_expires_idx ON gca_records_nonces (expires_at)');
   sql.exec('CREATE TABLE IF NOT EXISTS gca_records_writes (at INTEGER NOT NULL)');
   sql.exec('CREATE INDEX IF NOT EXISTS gca_records_writes_at_idx ON gca_records_writes (at)');
+  sql.exec('CREATE TABLE IF NOT EXISTS gca_records_meta_reads (at INTEGER NOT NULL)');
+  sql.exec('CREATE INDEX IF NOT EXISTS gca_records_meta_reads_at_idx ON gca_records_meta_reads (at)');
 }
 
 function existingTables(sql: SqlStorage): Set<string> {
@@ -282,10 +286,13 @@ export function pruneGcaRecordsHistory(sql: SqlStorage, now: number): void {
 }
 
 let loggedPruneFailed = false;
+/** An unusable stored record while reminders are off: logged once per isolate, not every poll. */
+let loggedRecordsInvalidWhileDisabled = false;
 
 /** Test-only: forget which once-per-isolate failures were logged. */
 export function resetGcaRecordsLogForTests(): void {
   loggedPruneFailed = false;
+  loggedRecordsInvalidWhileDisabled = false;
 }
 
 /**
@@ -293,6 +300,8 @@ export function resetGcaRecordsLogForTests(): void {
  * Never throws. A stored record wins over the secrets; an invalid stored
  * record turns GCA off (null, logged with reason "records"), with no
  * fallback to secrets that may be older. Without storage, the secrets.
+ * The "records" line repeats every poll only while reminders are enabled;
+ * otherwise (the policy is unused) it is logged once per isolate.
  */
 export async function loadGcaPolicy(env: Env, storage?: DurableObjectStorage, now = Date.now()): Promise<GcaPolicy | null> {
   try {
@@ -313,7 +322,10 @@ export async function loadGcaPolicy(env: Env, storage?: DurableObjectStorage, no
   } catch {
     // Fall through: an unexpected failure must not stop the public cards.
   }
-  console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'records' }));
+  if (gcaRemindersEnabled(env) || !loggedRecordsInvalidWhileDisabled) {
+    if (!gcaRemindersEnabled(env)) loggedRecordsInvalidWhileDisabled = true;
+    console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'records' }));
+  }
   return null;
 }
 
@@ -338,21 +350,26 @@ function admissible(request: GcaSignedRequest | undefined, method: string, path:
   return { ts, nonce, body };
 }
 
+/** Each kind of signed request has its own sliding-hour budget and table. */
+const BUDGETS = {
+  write: { table: 'gca_records_writes', limit: GCA_WRITES_PER_HOUR },
+  meta: { table: 'gca_records_meta_reads', limit: GCA_META_READS_PER_HOUR },
+} as const;
+
 /**
  * Inside the caller's transaction: refuse a replayed nonce (401), a full nonce
- * table or, for writes, a spent hourly budget (429) without recording
- * anything; otherwise record the nonce until max(now + 601 s, ts + 360 s) and,
- * for writes, the attempt. A refusal after this point (400, 409, 503) keeps them.
+ * table or a spent hourly budget of this kind (429) without recording
+ * anything; otherwise record the nonce until max(now + 601 s, ts + 360 s) and
+ * the attempt. A refusal after this point (400, 409, 503) keeps them.
  */
-function admit(sql: SqlStorage, request: Admitted, now: number, countsAsWrite: boolean): GcaAdmissionError | null {
+function admit(sql: SqlStorage, request: Admitted, now: number, kind: keyof typeof BUDGETS): GcaAdmissionError | null {
   sql.exec('DELETE FROM gca_records_nonces WHERE expires_at <= ?', now);
   if (sql.exec('SELECT 1 FROM gca_records_nonces WHERE nonce = ?', request.nonce).toArray().length) return 'replay';
   if (sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM gca_records_nonces').one().n >= GCA_NONCE_CAP) return 'rate_limited';
-  if (countsAsWrite) {
-    sql.exec('DELETE FROM gca_records_writes WHERE at <= ?', now - HOUR_MS);
-    if (sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM gca_records_writes').one().n >= GCA_WRITES_PER_HOUR) return 'rate_limited';
-    sql.exec('INSERT INTO gca_records_writes (at) VALUES (?)', now);
-  }
+  const { table, limit } = BUDGETS[kind];
+  sql.exec(`DELETE FROM ${table} WHERE at <= ?`, now - HOUR_MS);
+  if (sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).one().n >= limit) return 'rate_limited';
+  sql.exec(`INSERT INTO ${table} (at) VALUES (?)`, now);
   sql.exec('INSERT INTO gca_records_nonces (nonce, expires_at) VALUES (?, ?)', request.nonce,
     Math.max(now + 601_000, request.ts + 360_000));
   return null;
@@ -382,7 +399,7 @@ export async function writeGcaRecords(
   const sql = storage.sql;
   const result = storage.transactionSync((): GcaWriteResult => {
     ensureGcaRecordsSchema(sql);
-    const refused = admit(sql, admitted, now, true);
+    const refused = admit(sql, admitted, now, 'write');
     if (refused) return { ok: false, error: refused };
     if (!parsed) return { ok: false, error: 'regions_invalid' };
     if (!parsed.ok) return parsed;
@@ -410,7 +427,7 @@ export async function writeGcaRecords(
   });
   if (result.ok && parsed?.ok) {
     console.log(JSON.stringify({
-      event: 'gca_records_updated', version: result.version, digestPrefix: digest.slice(0, 8),
+      event: 'gca_records_updated', version: result.version,
       counts: { approvals: Object.keys(parsed.records.approvals).length, homeOverrides: Object.keys(parsed.records.homeOverrides).length },
     }));
   }
@@ -418,9 +435,10 @@ export async function writeGcaRecords(
 }
 
 /**
- * GET /gca/records/meta when signed (the nonce is consumed, not counted as a
- * write), or the operator's bearer route when `request` is omitted. The
- * source comes from resolveGcaRecords, the same function the poll uses.
+ * GET /gca/records/meta when signed (the nonce is consumed, and the request
+ * counts towards the signed-meta hourly budget, not the writes'), or the
+ * operator's bearer route when `request` is omitted (no budget). The source
+ * comes from resolveGcaRecords, the same function the poll uses.
  */
 export async function gcaRecordsMeta(
   storage: DurableObjectStorage, env: Env, request?: GcaSignedRequest,
@@ -431,7 +449,7 @@ export async function gcaRecordsMeta(
     const now = Date.now();
     const refused = storage.transactionSync(() => {
       ensureGcaRecordsSchema(storage.sql);
-      return admit(storage.sql, admitted, now, false);
+      return admit(storage.sql, admitted, now, 'meta');
     });
     if (refused) return { ok: false, error: refused };
   }
@@ -471,7 +489,7 @@ export function purgeGcaRecordsHistory(storage: DurableObjectStorage, request: G
   const sql = storage.sql;
   const result = storage.transactionSync((): GcaPurgeResult => {
     ensureGcaRecordsSchema(sql);
-    const refused = admit(sql, admitted, now, true);
+    const refused = admit(sql, admitted, now, 'write');
     if (refused) return { ok: false, error: refused };
     sql.exec('DELETE FROM gca_records_history WHERE version NOT IN (SELECT version FROM gca_records_current)');
     const kept = sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM gca_records_history').one().n;

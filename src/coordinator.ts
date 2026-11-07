@@ -281,18 +281,26 @@ export class PollCoordinator extends DurableObject<Env> {
     ).toArray().map((row) => row.name));
     if (!tables.has('gca_reminders')) return { records: [], nextCursor: null };
     const hasOccurrences = tables.has('gca_occurrences');
+    // Read-only: before the first poll of this version adds the column, nothing is capped.
+    const hasCapped = sql.exec("SELECT 1 FROM pragma_table_info('gca_reminders') WHERE name = 'capped_at'").toArray().length > 0;
     // `after` is an opaque cursor: the rowid of the last returned row. It never
     // carries member ids, because request URLs reach Workers invocation logs.
     // Upserts keep a row's rowid, so pages follow first-detection order.
+    // A capped occurrence is stored as 'sent' but no member DM was sent: it is
+    // reported as status "capped", so history never claims a DM that was not sent.
     const rows = sql.exec<{
       cursor: number; sessionKey: string; status: string; attempts: number; lastSeenAt: number; occurrence: number | null;
-    }>(`SELECT r.rowid AS cursor, r.session_key AS sessionKey, r.status, r.attempts, r.last_seen AS lastSeenAt,
-      ${hasOccurrences ? 'o.occurrence' : 'NULL'} AS occurrence
+      capped: number;
+    }>(`SELECT r.rowid AS cursor, r.session_key AS sessionKey,
+      ${hasCapped ? "CASE WHEN r.capped_at IS NOT NULL THEN 'capped' ELSE r.status END" : 'r.status'} AS status,
+      r.attempts, r.last_seen AS lastSeenAt,
+      ${hasOccurrences ? 'o.occurrence' : 'NULL'} AS occurrence,
+      ${hasCapped ? '(r.capped_at IS NOT NULL)' : '0'} AS capped
       FROM gca_reminders r
       ${hasOccurrences ? 'LEFT JOIN gca_occurrences o ON o.session_key = r.session_key' : ''}
       WHERE r.rowid > ? AND (r.attempts > 0 OR r.status IN ('sent', 'reserved', 'failed'))
       ORDER BY r.rowid LIMIT 101`, after).toArray();
-    const records = rows.slice(0, 100).map(({ cursor: _cursor, ...record }) => record);
+    const records = rows.slice(0, 100).map(({ cursor: _cursor, capped, ...record }) => ({ ...record, capped: capped === 1 }));
     return { records, nextCursor: rows.length > 100 ? String(rows[99]!.cursor) : null };
   }
 

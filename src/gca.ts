@@ -28,6 +28,13 @@ const LAST_ACTIVE_KEY = 'gca-last-active-v1';
 const RETENTION_MS = 7 * 86_400_000;
 const MAX_SENDS_PER_POLL = 3;
 const MAX_ATTEMPTS = 5;
+/**
+ * At most this many member DMs per VID in any rolling DM_CAP_WINDOW_MS. A
+ * further qualifying connection is still recorded, numbered and copied to
+ * staff, but the member gets no DM.
+ */
+export const MAX_MEMBER_DMS_PER_WINDOW = 3;
+export const DM_CAP_WINDOW_MS = 24 * 60 * 60_000;
 const OCCURRENCE_MIGRATION = 'gca-occurrences-migrated-v1';
 // A gap since the last poll that actually ran reminders (valid configuration,
 // tables ready) wider than this, or no record of one at all (an upgrade from a
@@ -578,6 +585,15 @@ export function ensureGcaSchema(sql: SqlStorage): void {
     attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
   )`);
   sql.exec('CREATE INDEX IF NOT EXISTS gca_reminders_last_seen_idx ON gca_reminders (last_seen)');
+  // Added in place, nullable: older rows (and older versions, which never set
+  // them) read as NULL. `dm_at` is when the member DM was last reserved;
+  // `capped_at` marks an occurrence recorded as 'sent' without a member DM
+  // because of the per-VID cap ('sent' keeps it terminal for older versions).
+  for (const column of ['dm_at', 'capped_at']) {
+    if (!sql.exec("SELECT 1 FROM pragma_table_info('gca_reminders') WHERE name = ?", column).toArray().length) {
+      sql.exec(`ALTER TABLE gca_reminders ADD COLUMN ${column} INTEGER`);
+    }
+  }
   sql.exec(`CREATE TABLE IF NOT EXISTS gca_occurrences (
     session_key TEXT PRIMARY KEY, user_id INTEGER NOT NULL, occurrence INTEGER NOT NULL,
     UNIQUE(user_id, occurrence)
@@ -633,19 +649,36 @@ function updateSessionsAndCollectCandidates(
       candidates.set(key, { atc, key, mismatch });
     }
   }
-  // Keep every possible delivery permanently: even a very old connection ID
-  // reappearing after a feed outage must not receive another notification.
-  // A pruned row was never delivered. A deferred DM no longer keeps an
-  // occurrence, but a pending or unmapped row left by an earlier version may:
-  // it goes with the row, so a later warning is not numbered past it.
-  // Occurrences of sent, reserved or failed reminders are never touched.
+  pruneStaleReminders(storage, now);
+  return candidates;
+}
+
+/**
+ * Deletes long-settled rows that were never delivered. Runs on every poll
+ * once the tables exist, whether or not reminders are enabled or the policy
+ * is valid: it only ever deletes, never creates a table or writes anything else.
+ *
+ * Keep every possible delivery permanently: even a very old connection ID
+ * reappearing after a feed outage must not receive another notification.
+ * A pruned row was never delivered. A deferred DM no longer keeps an
+ * occurrence, but a pending or unmapped row left by an earlier version may:
+ * it goes with the row, so a later warning is not numbered past it.
+ * Occurrences of sent (capped included), reserved or failed reminders are never touched.
+ */
+function pruneStaleReminders(storage: DurableObjectStorage, now: number): void {
+  const sql = storage.sql;
+  const tables = new Set(sql.exec<{ name: string }>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('gca_reminders', 'gca_occurrences')",
+  ).toArray().map((row) => row.name));
+  if (!tables.has('gca_reminders')) return;
   const stale = "last_seen < ? AND status NOT IN ('sent', 'reserved', 'failed')";
   storage.transactionSync(() => {
-    sql.exec(`DELETE FROM gca_occurrences WHERE session_key IN (SELECT session_key FROM gca_reminders WHERE ${stale})`,
-      now - RETENTION_MS);
+    if (tables.has('gca_occurrences')) {
+      sql.exec(`DELETE FROM gca_occurrences WHERE session_key IN (SELECT session_key FROM gca_reminders WHERE ${stale})`,
+        now - RETENTION_MS);
+    }
     sql.exec(`DELETE FROM gca_reminders WHERE ${stale}`, now - RETENTION_MS);
   });
-  return candidates;
 }
 
 function validGuildAndRole(env: Env): boolean {
@@ -751,15 +784,74 @@ export async function sharedMembers(
 async function reserveOccurrence(storage: DurableObjectStorage, key: string, userId: number): Promise<number> {
   const sql = storage.sql;
   storage.transactionSync(() => {
-    sql.exec(`INSERT OR IGNORE INTO gca_occurrences (session_key, user_id, occurrence)
-      SELECT ?, ?, COALESCE(MAX(occurrence), 0) + 1 FROM gca_occurrences WHERE user_id = ?`,
-    key, userId, userId);
-    sql.exec("UPDATE gca_reminders SET status = 'reserved', attempts = attempts + 1 WHERE session_key = ?", key);
+    assignOccurrence(sql, key, userId);
+    // A retry of the same connection only moves its dm_at: one row, counted once.
+    sql.exec("UPDATE gca_reminders SET status = 'reserved', attempts = attempts + 1, dm_at = ? WHERE session_key = ?",
+      Date.now(), key);
   });
-  const { occurrence } = sql.exec<{ occurrence: number }>(
-    'SELECT occurrence FROM gca_occurrences WHERE session_key = ?', key).one();
+  const occurrence = occurrenceOf(sql, key);
   await storage.sync();
   return occurrence;
+}
+
+/** The connection's durable ordinal: the VID's highest so far plus one, kept if it already has one. */
+function assignOccurrence(sql: SqlStorage, key: string, userId: number): void {
+  sql.exec(`INSERT OR IGNORE INTO gca_occurrences (session_key, user_id, occurrence)
+    SELECT ?, ?, COALESCE(MAX(occurrence), 0) + 1 FROM gca_occurrences WHERE user_id = ?`,
+  key, userId, userId);
+}
+
+function occurrenceOf(sql: SqlStorage, key: string): number {
+  return sql.exec<{ occurrence: number }>('SELECT occurrence FROM gca_occurrences WHERE session_key = ?', key).one().occurrence;
+}
+
+/**
+ * Member DMs counted towards the per-VID cap: reserved or sent, or failed but
+ * possibly delivered (its occurrence kept), reserved within the window. A
+ * capped occurrence sent no DM, and a row without `dm_at` (recorded by an
+ * earlier version) is outside the window. Each connection counts once,
+ * however often it was retried.
+ */
+function memberDmsInWindow(sql: SqlStorage, userId: number, now: number): number {
+  return sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM gca_occurrences o
+    JOIN gca_reminders r ON r.session_key = o.session_key
+    WHERE o.user_id = ? AND r.dm_at >= ? AND r.capped_at IS NULL AND r.status IN ('reserved', 'sent', 'failed')`,
+  userId, now - DM_CAP_WINDOW_MS).one().n;
+}
+
+/** Queue a staff copy of `payload` (the exact member embed) unless copies are off or would go to the member. */
+function queueCopy(
+  env: Env, sql: SqlStorage, key: string, recipient: string, payload: Record<string, unknown>, content: string,
+): void {
+  if (!isSnowflake(env.GCA_COPY_USER_ID) || env.GCA_COPY_USER_ID === recipient) return;
+  sql.exec(`INSERT OR IGNORE INTO gca_copies (session_key, recipient_id, payload, status)
+    VALUES (?, ?, ?, 'pending')`, key, env.GCA_COPY_USER_ID, JSON.stringify({ ...payload, content }));
+}
+
+/** The staff copy's text for an occurrence that reached the cap: it must never claim a DM was sent. */
+export function cappedCopyContent(recipient: string, userId: number): string {
+  return `No member DM sent to <@${recipient}> · VID ${userId} · 24-hour cap of ${MAX_MEMBER_DMS_PER_WINDOW} ` +
+    'GCA reminders reached; this occurrence is recorded only';
+}
+
+/**
+ * The VID already had the maximum member DMs in the window: record this
+ * connection as a delivered occurrence (status 'sent', so it is never retried
+ * or pruned, by this version or an older one) marked `capped_at`, and queue
+ * the staff copy of the embed the member would have received, with the
+ * capped text. No member DM is sent.
+ */
+function recordCapped(
+  env: Env, storage: DurableObjectStorage, key: string, recipient: string, userId: number,
+  buildPayload: (occurrence: number) => Record<string, unknown>,
+): void {
+  const sql = storage.sql;
+  storage.transactionSync(() => {
+    assignOccurrence(sql, key, userId);
+    sql.exec("UPDATE gca_reminders SET status = 'sent', capped_at = ? WHERE session_key = ?", Date.now(), key);
+    queueCopy(env, sql, key, recipient, buildPayload(occurrenceOf(sql, key)), cappedCopyContent(recipient, userId));
+  });
+  console.log(JSON.stringify({ event: 'gca_dm_capped' }));
 }
 
 /**
@@ -773,12 +865,8 @@ function recordSent(
   const sql = storage.sql;
   storage.transactionSync(() => {
     sql.exec("UPDATE gca_reminders SET status = 'sent' WHERE session_key = ?", key);
-    if (isSnowflake(env.GCA_COPY_USER_ID) && env.GCA_COPY_USER_ID !== recipient) {
-      // Save the exact sent embed: later retries must not rebuild it from a new feed/profile.
-      sql.exec(`INSERT OR IGNORE INTO gca_copies (session_key, recipient_id, payload, status)
-        VALUES (?, ?, ?, 'pending')`, key, env.GCA_COPY_USER_ID,
-      JSON.stringify({ ...payload, content: `Copy of reminder sent to <@${recipient}> · VID ${userId}` }));
-    }
+    // Save the exact sent embed: later retries must not rebuild it from a new feed/profile.
+    queueCopy(env, sql, key, recipient, payload, `Copy of reminder sent to <@${recipient}> · VID ${userId}`);
   });
 }
 
@@ -797,6 +885,7 @@ function recordSent(
  */
 async function recordDeliveryFailure(
   storage: DurableObjectStorage, key: string, err: unknown, attempts: number, messageAttempted: boolean,
+  { log = true }: { log?: boolean } = {},
 ): Promise<boolean> {
   const sql = storage.sql;
   const outcome = classifyDeliveryFailure(err, attempts, messageAttempted, Date.now());
@@ -807,9 +896,11 @@ async function recordDeliveryFailure(
       outcome.status, outcome.attempts, outcome.retryAt, key);
     if (!possiblyDelivered) sql.exec('DELETE FROM gca_occurrences WHERE session_key = ?', key);
   });
-  console.warn(JSON.stringify({
-    event: 'gca_dm_failed', status: outcome.statusCode, retry: outcome.status === 'pending', ...rateLimitDetail(err),
-  }));
+  if (log) {
+    console.warn(JSON.stringify({
+      event: 'gca_dm_failed', status: outcome.statusCode, retry: outcome.status === 'pending', ...rateLimitDetail(err),
+    }));
+  }
   // Only a genuinely global limit should widen the shared backoff: one
   // recipient's DM-channel cooldown must not block unrelated members'
   // reminders. That cooldown stays per DM channel, persisted under a keyed
@@ -827,12 +918,15 @@ async function sendMemberReminders(
 ): Promise<void> {
   // Missing or unusable configuration disables reminders for this poll; it
   // must never throw, or one bad setting would stop the online cards too.
+  // Stale never-delivered rows are still pruned (see pruneStaleReminders).
   if (!validGuildAndRole(env)) {
     console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'guild_or_role' }));
+    pruneStaleReminders(storage, now);
     return;
   }
   if (!policy) {
     console.error(JSON.stringify({ event: 'gca_config_invalid', reason: 'policy' }));
+    pruneStaleReminders(storage, now);
     return;
   }
   const sql = storage.sql;
@@ -873,18 +967,37 @@ async function sendMemberReminders(
       console.log(JSON.stringify({ event: 'gca_skipped_unmapped' }));
       continue;
     }
+    const buildPayload = (occurrence: number) =>
+      ({ embeds: [buildGcaEmbed(atc, mismatch, occurrence, policy.policyUrl, labels)], allowed_mentions: { parse: [] } });
+    // Capped: recorded and copied to staff without a member DM. It makes no
+    // Discord request, so it does not use this poll's send budget.
+    if (memberDmsInWindow(sql, atc.userId, Date.now()) >= MAX_MEMBER_DMS_PER_WINDOW) {
+      recordCapped(env, storage, key, recipient, atc.userId, buildPayload);
+      continue;
+    }
     attemptsThisPoll++;
     let messageAttempted = false;
+    let delivered = false;
     try {
       const channelId = await openDm(limits, env.DISCORD_BOT_TOKEN, recipient);
       if (Date.now() >= deadline) break;
       const occurrence = await reserveOccurrence(storage, key, atc.userId);
       messageAttempted = true;
-      const payload = { embeds: [buildGcaEmbed(atc, mismatch, occurrence, policy.policyUrl, labels)], allowed_mentions: { parse: [] } };
+      const payload = buildPayload(occurrence);
       const message = await discordJson(limits, env.DISCORD_BOT_TOKEN, `/channels/${channelId}/messages`, payload) as { id?: string } | null;
+      delivered = true;
       recordSent(env, storage, key, recipient, atc.userId, payload);
       console.log(JSON.stringify({ event: message?.id ? 'gca_dm_sent' : 'gca_dm_sent_unconfirmed' }));
     } catch (err) {
+      if (delivered) {
+        // Discord accepted the DM but recording it failed: not a delivery
+        // failure. The row stays reserved, or becomes failed with its
+        // occurrence kept below, so it is never sent again; its staff copy is
+        // lost. Only the error class is logged.
+        console.error(JSON.stringify({ event: 'gca_dm_record_failed', error: err instanceof Error ? err.name : typeof err }));
+        await recordDeliveryFailure(storage, key, err, fresh.attempts, messageAttempted, { log: false });
+        continue;
+      }
       if (await recordDeliveryFailure(storage, key, err, fresh.attempts, messageAttempted)) break;
     }
   }
@@ -943,7 +1056,11 @@ export async function sendGcaReminders(
   policy: GcaPolicy | null, labels: FirLabel[] = [], rateLimits?: DiscordRateLimits,
   deadline = Date.now() + DM_BUDGET_MS, memberCache?: MemberListCache,
 ): Promise<void> {
-  if (env.GCA_DM_ENABLED !== 'true') return;
+  if (env.GCA_DM_ENABLED !== 'true') {
+    // Disabled: no Discord work and no new state, only the stale-row prune.
+    pruneStaleReminders(storage, now);
+    return;
+  }
   const limits = rateLimits ??
     await DiscordRateLimits.load(storage, new Set(parseChannelIds(env.DISCORD_CHANNEL_IDS)), env.DISCORD_BOT_TOKEN);
   try {

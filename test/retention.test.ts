@@ -102,3 +102,22 @@ it('limits each cleanup to 500 records and supports repeated calls', async () =>
 it('is safe before GCA has ever run', async () => {
   expect(await stub().cleanupGcaHistory(true)).toMatchObject({ deleted: 0, eligible: 0 });
 });
+
+it('T1-4 F8: age-cleans the staff copy of a capped occurrence like any sent one, keeping the ledgers', async () => {
+  await seedGca((sql) => {
+    sql.exec('INSERT INTO gca_reminders (session_key, status, last_seen, attempts, capped_at) VALUES (?, ?, ?, ?, ?)',
+      '600001:1', 'sent', now - 31 * 86_400_000, 0, now - 31 * 86_400_000);
+    sql.exec(OCCURRENCE, '600001:1', 600001, 1);
+    sql.exec(COPY, '600001:1', 'synthetic message', 'synthetic recipient', 'sent');
+    sql.exec('INSERT INTO gca_reminders (session_key, status, last_seen, attempts, capped_at) VALUES (?, ?, ?, ?, ?)',
+      '600001:2', 'sent', now - 29 * 86_400_000, 0, now - 29 * 86_400_000);
+    sql.exec(OCCURRENCE, '600001:2', 600001, 2);
+    sql.exec(COPY, '600001:2', 'synthetic message', 'synthetic recipient', 'pending');
+  });
+  expect(await stub().cleanupGcaHistory(true)).toMatchObject({ busy: false, deleted: 1 });
+  await runInDurableObject(stub(), (_, ctx) => {
+    expect(ctx.storage.sql.exec('SELECT session_key FROM gca_copies').toArray()).toEqual([{ session_key: '600001:2' }]);
+    expect(ctx.storage.sql.exec('SELECT * FROM gca_reminders').toArray()).toHaveLength(2);
+    expect(ctx.storage.sql.exec('SELECT * FROM gca_occurrences').toArray()).toHaveLength(2);
+  });
+});
