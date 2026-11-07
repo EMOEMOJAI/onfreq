@@ -16,6 +16,13 @@ import { diffState } from '../src/state';
 import { fakeKv, ivaoAuth as auth } from './helpers';
 import type { IvaoAtcSummaryEntry, StateMap } from '../src/types';
 
+/**
+ * hex(HMAC-SHA-256(key 'secret', 'onfreq-ivao-token:v1\n' + 'id'))[0:32], the
+ * fingerprint of the synthetic `ivaoAuth` credentials, computed independently
+ * with Node's crypto.createHmac.
+ */
+const FP = '172b641e9819fd3e529c7c494f9b4092';
+
 describe('parsePrefixes', () => {
   it.each([undefined, '', ' , ,', '*', 'AA,bad-prefix', 'ABCDE', '12'])('rejects absent or malformed coverage: %s', (raw) => {
     expect(() => parsePrefixes(raw)).toThrow('FIR_PREFIXES');
@@ -138,7 +145,7 @@ describe('getAccessToken', () => {
     const kv = fakeKv();
     kv.store.set(
       'ivao-token-v1',
-      JSON.stringify({ token: 'from-kv', expiresAt: Date.now() + 600_000 }),
+      JSON.stringify({ token: 'from-kv', expiresAt: Date.now() + 600_000, fingerprint: FP }),
     );
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
@@ -151,7 +158,7 @@ describe('getAccessToken', () => {
     const kv = fakeKv();
     kv.store.set(
       'ivao-token-v1',
-      JSON.stringify({ token: 'stale', expiresAt: Date.now() - 1000 }),
+      JSON.stringify({ token: 'stale', expiresAt: Date.now() - 1000, fingerprint: FP }),
     );
     const fetchMock = vi.fn().mockResolvedValue(tokenResponse('fresh'));
     vi.stubGlobal('fetch', fetchMock);
@@ -228,7 +235,7 @@ describe('getAccessToken', () => {
 
   it('re-mints instead of trusting a cached token that fails the access-token pattern', async () => {
     const kv = fakeKv();
-    kv.store.set('ivao-token-v1', JSON.stringify({ token: 'bad token\r\nx', expiresAt: Date.now() + 600_000 }));
+    kv.store.set('ivao-token-v1', JSON.stringify({ token: 'bad token\r\nx', expiresAt: Date.now() + 600_000, fingerprint: FP }));
     const fetchMock = vi.fn().mockResolvedValue(tokenResponse('fresh'));
     vi.stubGlobal('fetch', fetchMock);
 
@@ -301,6 +308,242 @@ describe('invalidateCachedToken', () => {
     expect(invalidateCachedToken()).toBe(false);
     clock += 60_000; // now past the 30-minute window
     expect(invalidateCachedToken()).toBe(true);
+  });
+});
+
+describe('token mint failures, credential binding and cache logs (R234 B)', () => {
+  const tokenUrl = 'https://api.ivao.aero/v2/oauth/token';
+  const feedUrl = 'https://api.ivao.aero/v2/tracker/now/atc/summary';
+  const MIN = 60_000;
+  let now: number;
+  let errorLog: ReturnType<typeof vi.spyOn>;
+  let warnLog: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    resetTokenCache();
+    now = Date.parse('2026-10-01T10:00:00Z');
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    warnLog = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const tokenOk = (token = 'synthetic-minted-token') => Response.json({ access_token: token, expires_in: 1800 });
+  const authLines = () => errorLog.mock.calls.map((call: unknown[]) => String(call[0]))
+    .filter((line: string) => line.includes('ivao_auth_failed'));
+  const allLogs = () => JSON.stringify([...errorLog.mock.calls, ...warnLog.mock.calls]);
+  /** True when this call reached the token endpoint, false when it was skipped by the backoff. */
+  async function attempt(kv: ReturnType<typeof fakeKv>, response: () => Response | Promise<Response>): Promise<boolean> {
+    const fetchMock = vi.fn(async () => response());
+    vi.stubGlobal('fetch', fetchMock);
+    await getAccessToken(auth(kv)).catch(() => undefined);
+    return fetchMock.mock.calls.length > 0;
+  }
+
+  describe('T13-1 / B-1: classified mint backoff', () => {
+    it.each([400, 401, 403])('a %s from the token endpoint pauses minting for 30 minutes, logged once with its status only', async (status) => {
+      const kv = fakeKv();
+      expect(await attempt(kv, () => new Response('synthetic-token-body-zzz', { status }))).toBe(true);
+      now += MIN + 1_000; // +61 s: a transient failure would be retried here
+      expect(await attempt(kv, () => tokenOk())).toBe(false);
+      now += 28 * MIN - 1_000; // +29 min
+      expect(await attempt(kv, () => tokenOk())).toBe(false);
+      now += MIN; // +30 min
+      expect(await attempt(kv, () => tokenOk())).toBe(true);
+      expect(authLines()).toEqual([JSON.stringify({ event: 'ivao_auth_failed', status, backoffMs: 30 * MIN })]);
+      expect(allLogs()).not.toContain('synthetic-token-body-zzz');
+    });
+
+    it('a 503 is retried after 1 minute, then 2, 4, 8 and at most 15, and a success resets the backoff', async () => {
+      const kv = fakeKv();
+      const unavailable = () => new Response('unavailable', { status: 503 });
+      expect(await attempt(kv, unavailable)).toBe(true);
+      for (const backoff of [1, 2, 4, 8, 15, 15]) {
+        now += backoff * MIN - 1_000;
+        expect(await attempt(kv, unavailable)).toBe(false);
+        now += 1_000;
+        expect(await attempt(kv, unavailable)).toBe(true);
+      }
+      expect(authLines().map((line: string) => JSON.parse(line).backoffMs / MIN)).toEqual([1, 2, 4, 8, 15, 15, 15]);
+      now += 15 * MIN;
+      expect(await attempt(kv, () => tokenOk())).toBe(true);
+      // After the success the next failure starts again at one minute.
+      resetMemoryOnly(kv);
+      expect(await attempt(kv, unavailable)).toBe(true);
+      now += MIN + 1_000; // +61 s
+      expect(await attempt(kv, unavailable)).toBe(true);
+      expect(authLines().slice(-2).map((line: string) => JSON.parse(line).backoffMs / MIN)).toEqual([1, 2]);
+    });
+
+    /** Forget the minted token (memory and KV) without touching the backoff state. */
+    function resetMemoryOnly(kv: ReturnType<typeof fakeKv>) {
+      kv.store.clear();
+      now += 31 * MIN; // past the 30-minute invalidation rate limit
+      expect(invalidateCachedToken()).toBe(true);
+    }
+
+    it.each<[string, () => Response | Promise<Response>, Record<string, unknown>]>([
+      ['429', () => new Response('slow down', { status: 429 }), { status: 429 }],
+      ['500', () => new Response('oops', { status: 500 }), { status: 500 }],
+      ['other 4xx (404)', () => new Response('missing', { status: 404 }), { status: 404 }],
+      ['non-JSON 200', () => new Response('synthetic-token-body-zzz', { status: 200 }), { error: 'invalid_json' }],
+      ['200 without access_token', () => Response.json({ token_type: 'Bearer', note: 'synthetic-token-body-zzz' }), { error: 'no_access_token' }],
+      ['timeout', () => Promise.reject(new Error('upstream request timed out')), { error: 'timeout' }],
+      ['network error', () => Promise.reject(new TypeError('synthetic-token-body-zzz')), { error: 'TypeError' }],
+    ])('%s backs off exponentially from one minute, not for 30 minutes', async (_label, response, detail) => {
+      const kv = fakeKv();
+      expect(await attempt(kv, response)).toBe(true);
+      now += MIN - 1_000;
+      expect(await attempt(kv, response)).toBe(false);
+      now += 2_000; // +61 s
+      expect(await attempt(kv, response)).toBe(true);
+      expect(authLines()).toEqual([
+        JSON.stringify({ event: 'ivao_auth_failed', ...detail, backoffMs: MIN }),
+        JSON.stringify({ event: 'ivao_auth_failed', ...detail, backoffMs: 2 * MIN }),
+      ]);
+      expect(allLogs()).not.toContain('synthetic-token-body-zzz');
+    });
+
+    it('two polls skipped by the backoff log nothing: one line per window', async () => {
+      const kv = fakeKv();
+      const entry = {
+        id: 1, userId: 100, callsign: 'QCTT_TWR', atcSession: { frequency: 118.1, position: 'TWR' },
+        atcPosition: null, subcenter: null,
+      };
+      const fetchMock = vi.fn(async (url: string) =>
+        url === tokenUrl ? new Response('synthetic-token-body-zzz', { status: 401 }) : Response.json([entry]));
+      vi.stubGlobal('fetch', fetchMock);
+      for (let poll = 0; poll < 3; poll++) {
+        await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+        now += MIN;
+      }
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([tokenUrl, feedUrl, feedUrl, feedUrl]);
+      expect(authLines()).toEqual([JSON.stringify({ event: 'ivao_auth_failed', status: 401, backoffMs: 30 * MIN })]);
+      expect(allLogs()).not.toContain('synthetic-token-body-zzz');
+    });
+  });
+
+  describe('T13-5 / B-2: cached token bound to the credentials', () => {
+    /** v2.3.3's own validator for a cached entry, copied verbatim (src/ivao.ts at 0658fc4). */
+    function v233IsCachedToken(value: unknown): value is { token: string; expiresAt: number } {
+      return !!value && typeof value === 'object' &&
+        typeof (value as { token?: unknown }).token === 'string' &&
+        /^[\x21-\x7e]+$/.test((value as { token: string }).token) &&
+        Number.isFinite((value as { expiresAt?: unknown }).expiresAt);
+    }
+
+    it('stores the HMAC fingerprint of the credentials under the same KV key, in a shape v2.3.3 still reads', async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => tokenOk('new-token')));
+      const kv = fakeKv();
+      await expect(getAccessToken(auth(kv))).resolves.toBe('new-token');
+      expect([...kv.store.keys()]).toEqual(['ivao-token-v1']);
+      const stored = JSON.parse(kv.store.get('ivao-token-v1') ?? 'null');
+      // Rollback: v2.3.3 accepts the entry and uses its token until expiresAt.
+      expect(v233IsCachedToken(stored)).toBe(true);
+      expect(stored).toEqual({ token: 'new-token', expiresAt: now + 1800_000 - 120_000, fingerprint: FP });
+    });
+
+    it('treats a v2.3.3 entry (no fingerprint) as a miss, re-mints and overwrites it', async () => {
+      const fetchMock = vi.fn(async (_url: string) => tokenOk('new-token'));
+      vi.stubGlobal('fetch', fetchMock);
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'old-format-token', expiresAt: now + 600_000 } });
+      await expect(getAccessToken(auth(kv))).resolves.toBe('new-token');
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([tokenUrl]);
+      expect(JSON.parse(kv.store.get('ivao-token-v1') ?? 'null')).toMatchObject({ token: 'new-token', fingerprint: FP });
+      // The overwritten entry is then reused, with no further mint.
+      resetTokenCache();
+      await expect(getAccessToken(auth(kv))).resolves.toBe('new-token');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['the same client id with a rotated secret', { clientId: 'id', clientSecret: 'other-secret' }, '77301bbb80a33b5005fc6507228216dd'],
+      ['another client id with the same secret', { clientId: 'other-id', clientSecret: 'secret' }, '0d591a63af54910b2dcd20ee74a74578'],
+    ])('re-mints a KV token cached under other credentials: %s', async (_label, creds, expectedFp) => {
+      const fetchMock = vi.fn(async () => tokenOk('rotated-token'));
+      vi.stubGlobal('fetch', fetchMock);
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'old-cred-token', expiresAt: now + 600_000, fingerprint: FP } });
+      await expect(getAccessToken({ ...creds, kv: kv as unknown as KVNamespace })).resolves.toBe('rotated-token');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(kv.store.get('ivao-token-v1') ?? 'null')).toMatchObject({ token: 'rotated-token', fingerprint: expectedFp });
+    });
+
+    it('checks the fingerprint on the in-memory path too', async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => tokenOk('old-cred-token')));
+      await getAccessToken(auth(fakeKv()));
+      const fetchMock = vi.fn(async () => tokenOk('unexpected-mint'));
+      vi.stubGlobal('fetch', fetchMock);
+      const rotatedKv = fakeKv({
+        'ivao-token-v1': { token: 'rotated-kv-token', expiresAt: now + 600_000, fingerprint: '77301bbb80a33b5005fc6507228216dd' },
+      });
+      // The in-memory token belongs to the old secret; the KV entry to the new one.
+      await expect(getAccessToken({ clientId: 'id', clientSecret: 'other-secret', kv: rotatedKv as unknown as KVNamespace }))
+        .resolves.toBe('rotated-kv-token');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('caps a stored expiry beyond the longest token lifetime', async () => {
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'long-lived', expiresAt: now + 10 * 86_400_000, fingerprint: FP } });
+      const fetchMock = vi.fn(async () => tokenOk('fresh-after-cap'));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(getAccessToken(auth(kv))).resolves.toBe('long-lived');
+      kv.store.clear();
+      now += 86_400_000 - 1;
+      await expect(getAccessToken(auth(kv))).resolves.toBe('long-lived');
+      now += 2;
+      await expect(getAccessToken(auth(kv))).resolves.toBe('fresh-after-cap');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('computes the fingerprint once per isolate', async () => {
+      const sign = vi.spyOn(crypto.subtle, 'sign');
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'from-kv', expiresAt: now + 600_000, fingerprint: FP } });
+      vi.stubGlobal('fetch', vi.fn());
+      for (let i = 0; i < 3; i++) await expect(getAccessToken(auth(kv))).resolves.toBe('from-kv');
+      expect(sign).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('T13-6 / B-4: KV failures log the error name only', () => {
+    it('a failed token cache write logs no part of the error message', async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => tokenOk()));
+      const kv = fakeKv();
+      kv.put.mockRejectedValueOnce(new Error('synthetic-token-zzz'));
+      await getAccessToken(auth(kv));
+      expect(warnLog.mock.calls).toEqual([[JSON.stringify({ event: 'ivao_token_cache_write_failed', error: 'Error' })]]);
+      expect(allLogs()).not.toContain('synthetic-token-zzz');
+    });
+
+    it('a failed token delete after a tracker 401 logs no part of the error message', async () => {
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: now + 600_000, fingerprint: FP } });
+      kv.delete.mockRejectedValueOnce(new Error('synthetic-token-zzz'));
+      const entry = {
+        id: 1, userId: 100, callsign: 'QCTT_TWR', atcSession: { frequency: 118.1, position: 'TWR' },
+        atcPosition: null, subcenter: null,
+      };
+      vi.stubGlobal('fetch', vi.fn()
+        .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+        .mockResolvedValueOnce(tokenOk('fresh'))
+        .mockResolvedValueOnce(Response.json([entry])));
+      await expect(fetchDivisionAtc(['QC'], auth(kv))).resolves.toHaveLength(1);
+      expect(warnLog.mock.calls).toEqual([[JSON.stringify({ event: 'ivao_token_delete_failed', error: 'Error' })]]);
+      expect(allLogs()).not.toContain('synthetic-token-zzz');
+    });
+  });
+
+  describe('T13-7: expires_in clamping', () => {
+    it.each<[unknown, number]>([
+      [10_000_000, 86_400], [86_401, 86_400], [86_400, 86_400],
+      ['3600', 1800], [null, 1800], [undefined, 1800], [true, 1800], [{ seconds: 3600 }, 1800],
+    ])('expires_in %j is cached for %j seconds', async (expiresIn, ttl) => {
+      vi.stubGlobal('fetch', vi.fn(async () => Response.json({ access_token: 'tok', expires_in: expiresIn })));
+      const kv = fakeKv();
+      await getAccessToken(auth(kv));
+      expect(kv.put).toHaveBeenCalledWith('ivao-token-v1', expect.any(String), { expirationTtl: ttl });
+      expect(JSON.parse(kv.store.get('ivao-token-v1') ?? 'null').expiresAt).toBe(now + ttl * 1000 - 120_000);
+    });
   });
 });
 
@@ -714,6 +957,57 @@ describe('fetchDivisionAtc', () => {
     expect(lone.test(`${atc?.position}${atc?.station}${atc?.location}`)).toBe(false);
   });
 
+  describe('T13-3 / B-3: required text is cleaned before it is trimmed and checked', () => {
+    it('keeps the real position after leading characters that clean to spaces', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([rawEntry({
+        atcSession: { frequency: 118.1, position: `${'\u0001'.repeat(128)}TWR` },
+        atcPosition: { atcCallsign: `${'\u0007'.repeat(128)}Example Tower`, airport: null },
+      })])));
+      const [atc] = await fetchDivisionAtc(['QC']);
+      expect(atc?.position).toBe('TWR');
+      expect(atc?.station).toBe('Example Tower');
+    });
+
+    it('trims the end again after the cut', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([rawEntry({
+        atcSession: { frequency: 118.1, position: `A${' '.repeat(130)}B` },
+      })])));
+      const [atc] = await fetchDivisionAtc(['QC']);
+      expect(atc?.position).toBe('A');
+    });
+
+    it.each(['​‮', '\u0001\u0002', '   '])('drops an entry whose position is empty after cleaning: %j', async (position) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
+        rawEntry({ atcSession: { frequency: 118.1, position } }), ...filler(2),
+      ])));
+      await expect(fetchDivisionAtc(['QC'])).resolves.toEqual([]);
+      expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'ivao_entry_skipped', count: 1 }));
+    });
+
+    it('an airport station empty after cleaning reads as absent and falls back to the subcenter', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([
+        rawEntry({ id: 1, callsign: 'QCTT_TWR', atcPosition: { atcCallsign: '​‮', airport: null }, subcenter: null }),
+        rawEntry({
+          id: 2, callsign: 'QCTT_CTR', atcPosition: { atcCallsign: '\u0001', airport: null },
+          subcenter: { atcCallsign: 'Example Control', centerId: 'QCTT' },
+        }),
+        rawEntry({ id: 3, callsign: 'QCTT_APP', atcPosition: null, subcenter: { atcCallsign: '​', centerId: 'QCTT' } }),
+      ])));
+      const byCallsign = Object.fromEntries((await fetchDivisionAtc(['QC'])).map((atc) => [atc.callsign, atc.station]));
+      expect(byCallsign).toEqual({ QCTT_TWR: null, QCTT_CTR: 'Example Control', QCTT_APP: null });
+    });
+
+    it('normalizeAtc falls back past an empty station name', () => {
+      const entry: IvaoAtcSummaryEntry = {
+        id: 1, userId: 1, callsign: 'QCTT_CTR', atcSession: { frequency: 132.3, position: 'CTR' },
+        atcPosition: { atcCallsign: '', airport: null }, subcenter: { atcCallsign: 'Example Control', centerId: 'QCTT' },
+      };
+      expect(normalizeAtc(entry).station).toBe('Example Control');
+      expect(normalizeAtc({ ...entry, subcenter: { atcCallsign: '', centerId: null } }).station).toBeNull();
+    });
+  });
+
   it('strips control and invisible format characters from feed text at ingest', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([rawEntry({
       atcSession: { frequency: 118.1, position: 'TW\u200BR' },
@@ -723,7 +1017,7 @@ describe('fetchDivisionAtc', () => {
       },
     })])));
     const [atc] = await fetchDivisionAtc(['QC']);
-    expect(atc?.station).toBe('Example  QXXX_TWR  Fake Tower  118.100 ');
+    expect(atc?.station).toBe('Example  QXXX_TWR  Fake Tower  118.100');
     expect(atc?.location).toBe('Safeevil Airport');
     expect(atc?.position).toBe('TWR');
     expect(atc?.airport?.icao).toBe('QCTT');
@@ -793,7 +1087,7 @@ describe('fetchDivisionAtc', () => {
   });
 
   it('remints and retries exactly once after a 401 on an authenticated request', async () => {
-    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
+    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000, fingerprint: FP } });
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
       .mockResolvedValueOnce(Response.json({ access_token: 'fresh', expires_in: 1800 }))
@@ -808,7 +1102,7 @@ describe('fetchDivisionAtc', () => {
   });
 
   it('does not let a profile 401 discard the token just reminted after a tracker 401', async () => {
-    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
+    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000, fingerprint: FP } });
     vi.stubGlobal('fetch', vi.fn()
       .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
       .mockResolvedValueOnce(Response.json({ access_token: 'fresh', expires_in: 1800 }))
@@ -819,7 +1113,7 @@ describe('fetchDivisionAtc', () => {
 
   it('falls back to one anonymous request when a freshly minted token is also rejected, instead of retrying forever', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
+    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000, fingerprint: FP } });
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
       .mockResolvedValueOnce(Response.json({ access_token: 'fresh', expires_in: 1800 }))
@@ -864,7 +1158,7 @@ describe('fetchDivisionAtc', () => {
   });
 
   it('tolerates a KV delete failure on the 401 path instead of failing the whole poll', async () => {
-    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000 } });
+    const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: Date.now() + 600_000, fingerprint: FP } });
     kv.delete.mockRejectedValueOnce(new Error('KV unavailable'));
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
@@ -941,7 +1235,7 @@ describe('fetchDivisionAtc', () => {
     });
 
     it('a profile 401 does not make the tracker go anonymous', async () => {
-      const kv = fakeKv({ 'ivao-token-v1': { token: 'cached', expiresAt: now + 600_000 } });
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'cached', expiresAt: now + 600_000, fingerprint: FP } });
       expect(invalidateCachedToken()).toBe(true);
       const fetchMock = vi.fn().mockResolvedValue(Response.json([rawEntry()]));
       vi.stubGlobal('fetch', fetchMock);
@@ -951,7 +1245,7 @@ describe('fetchDivisionAtc', () => {
     });
 
     it('a 403 with a cached token makes one anonymous retry and keeps the KV token', async () => {
-      const kv = fakeKv({ 'ivao-token-v1': { token: 'cached', expiresAt: now + 600_000 } });
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'cached', expiresAt: now + 600_000, fingerprint: FP } });
       const fetchMock = vi.fn()
         .mockResolvedValueOnce(new Response('forbidden', { status: 403 }))
         .mockResolvedValueOnce(Response.json([rawEntry()]));
@@ -988,7 +1282,7 @@ describe('fetchDivisionAtc', () => {
     });
 
     it('makes at most five subrequests in the worst case', async () => {
-      const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: now + 600_000 } });
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: now + 600_000, fingerprint: FP } });
       const fetchMock = vi.fn()
         .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
         .mockResolvedValueOnce(Response.json({ access_token: 'fresh-token-value', expires_in: 1800 }))
@@ -1001,7 +1295,7 @@ describe('fetchDivisionAtc', () => {
     });
 
     it('an anonymous retry after a tracker 401 when the re-mint fails stands, without opening a window', async () => {
-      const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: now + 600_000 } });
+      const kv = fakeKv({ 'ivao-token-v1': { token: 'stale', expiresAt: now + 600_000, fingerprint: FP } });
       const fetchMock = vi.fn()
         .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
         .mockResolvedValueOnce(new Response('mint failed', { status: 500 }))

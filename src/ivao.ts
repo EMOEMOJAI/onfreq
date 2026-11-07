@@ -70,7 +70,8 @@ export function normalizeAtc(entry: IvaoAtcSummaryEntry): OnlineAtc {
     callsign: entry.callsign,
     frequency: entry.atcSession.frequency,
     position: entry.atcSession.position,
-    station: entry.atcPosition?.atcCallsign ?? entry.subcenter?.atcCallsign ?? null,
+    // `||`, not `??`: an empty station name falls through to the next source.
+    station: entry.atcPosition?.atcCallsign || entry.subcenter?.atcCallsign || null,
     location: entry.atcPosition?.airport?.name ?? null,
     airport: airport?.icao ? {
       icao: airport.icao.trim().toUpperCase(),
@@ -158,9 +159,24 @@ export function sliceCodePoints(text: string, maxUnits: number): string {
  * reorder what Discord displays, or make a payload invalid text. The cut
  * never splits a surrogate pair.
  */
+function cleanText(value: string): string {
+  return value.replace(/[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/gu, ' ').replace(/\p{Cf}/gu, '');
+}
+
 function truncate(value: string, max: number): string {
-  const clean = value.replace(/[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/gu, ' ').replace(/\p{Cf}/gu, '');
-  return sliceCodePoints(clean, max);
+  return sliceCodePoints(cleanText(value), max);
+}
+
+/**
+ * Required feed text (a position or station name): cleaned first, then
+ * trimmed, cut to `max` and trimmed again, so text that is empty only after
+ * cleaning (control or invisible characters) reads as absent, and leading
+ * characters that clean to spaces cannot push the real text past the cut.
+ * `null` when nothing visible remains.
+ */
+function requiredText(value: unknown, max: number): string | null {
+  if (typeof value !== 'string') return null;
+  return sliceCodePoints(cleanText(value).trim(), max).trimEnd() || null;
 }
 
 function sanitizeAirport(raw: unknown): NonNullable<IvaoAtcSummaryEntry['atcPosition']>['airport'] {
@@ -180,9 +196,10 @@ function sanitizeAirport(raw: unknown): NonNullable<IvaoAtcSummaryEntry['atcPosi
 function sanitizeAtcPosition(raw: unknown): IvaoAtcSummaryEntry['atcPosition'] {
   if (!raw || typeof raw !== 'object') return null;
   const pos = raw as Record<string, unknown>;
-  if (typeof pos.atcCallsign !== 'string' || !pos.atcCallsign.trim()) return null;
+  const atcCallsign = requiredText(pos.atcCallsign, MAX_TEXT_LENGTH);
+  if (!atcCallsign) return null;
   return {
-    atcCallsign: truncate(pos.atcCallsign.trim(), MAX_TEXT_LENGTH),
+    atcCallsign,
     airport: sanitizeAirport(pos.airport),
   };
 }
@@ -190,9 +207,10 @@ function sanitizeAtcPosition(raw: unknown): IvaoAtcSummaryEntry['atcPosition'] {
 function sanitizeSubcenter(raw: unknown): IvaoAtcSummaryEntry['subcenter'] {
   if (!raw || typeof raw !== 'object') return null;
   const sub = raw as Record<string, unknown>;
-  if (typeof sub.atcCallsign !== 'string' || !sub.atcCallsign.trim()) return null;
+  const atcCallsign = requiredText(sub.atcCallsign, MAX_TEXT_LENGTH);
+  if (!atcCallsign) return null;
   return {
-    atcCallsign: truncate(sub.atcCallsign.trim(), MAX_TEXT_LENGTH),
+    atcCallsign,
     centerId: typeof sub.centerId === 'string' ? truncate(sub.centerId, MAX_TEXT_LENGTH) : null,
   };
 }
@@ -218,7 +236,8 @@ function sanitizeEntry(raw: unknown, stats: SanitizeStats): IvaoAtcSummaryEntry 
   const session = entry.atcSession;
   if (!session || typeof session !== 'object') return null;
   const sessionRecord = session as Record<string, unknown>;
-  if (typeof sessionRecord.position !== 'string' || !sessionRecord.position.trim()) return null;
+  const position = requiredText(sessionRecord.position, MAX_TEXT_LENGTH);
+  if (!position) return null;
   const { frequency, coerced } = coerceFrequency(sessionRecord.frequency);
   if (coerced) stats.frequencyCoerced++;
 
@@ -226,7 +245,7 @@ function sanitizeEntry(raw: unknown, stats: SanitizeStats): IvaoAtcSummaryEntry 
     id: entry.id,
     userId: entry.userId,
     callsign: truncate(entry.callsign.trim().toUpperCase(), MAX_CALLSIGN_LENGTH),
-    atcSession: { frequency, position: truncate(sessionRecord.position.trim(), MAX_TEXT_LENGTH) },
+    atcSession: { frequency, position },
     atcPosition: sanitizeAtcPosition(entry.atcPosition),
     subcenter: sanitizeSubcenter(entry.subcenter),
   };
@@ -269,8 +288,23 @@ const TOKEN_SAFETY_MARGIN_MS = 120_000;
 const MIN_TOKEN_TTL_SECONDS = 180;
 const MAX_TOKEN_TTL_SECONDS = 86_400;
 
-/** Skip re-minting for a while after a failure, instead of retrying every call. */
-const TOKEN_FAIL_BACKOFF_MS = 60_000;
+/**
+ * After a transient mint failure (5xx, 429, other 4xx, timeout, network error,
+ * or a 2xx without a usable token) skip re-minting for 1, 2, 4, 8 and then at
+ * most 15 minutes, instead of retrying every call. Reset by a successful mint.
+ */
+const TOKEN_FAIL_BACKOFF_BASE_MS = 60_000;
+const TOKEN_FAIL_BACKOFF_MAX_MS = 15 * 60_000;
+
+/**
+ * The token endpoint rejected the client credentials themselves (400, 401 or
+ * 403): retrying cannot help until an operator fixes them, so minting pauses
+ * for TRACKER_ANONYMOUS_MS.
+ */
+const TOKEN_REJECTED_STATUSES = new Set([400, 401, 403]);
+
+/** Domain label of the token-to-credentials binding; bump it to orphan every cached token. */
+const TOKEN_FINGERPRINT_LABEL = 'onfreq-ivao-token:v1\n';
 
 /** access_token must be a non-empty run of printable ASCII (RFC 6750 b64token-ish). */
 const ACCESS_TOKEN_PATTERN = /^[\x21-\x7e]+$/;
@@ -279,10 +313,27 @@ const ACCESS_TOKEN_PATTERN = /^[\x21-\x7e]+$/;
  * Per-isolate cache, so warm invocations skip the KV read entirely. KV is the
  * cross-isolate cache — tokens live 30 minutes, so this is ~50 writes a day.
  */
-let memoryToken: CachedToken | null = null;
+let memoryToken: BoundToken | null = null;
+
+/**
+ * A cached token bound to the credentials that minted it. `fingerprint` is
+ * hex(HMAC-SHA-256(client secret, label + client id)) cut to 32 characters:
+ * a token cached under other credentials (a rotated id or secret) is a miss.
+ * v2.3.3 reads `token` and `expiresAt` and ignores the extra field, so a
+ * rollback keeps using entries written by this version.
+ */
+interface BoundToken extends CachedToken {
+  fingerprint: string;
+}
 
 /** Epoch ms until which a fresh mint attempt is skipped after a recent failure. */
 let tokenFailedUntil = 0;
+
+/** Consecutive transient mint failures, for the exponential backoff. */
+let tokenFailures = 0;
+
+/** The fingerprint of the current credentials, computed once per isolate. */
+let fingerprintMemo: { clientId: string; clientSecret: string; value: Promise<string> } | null = null;
 
 /**
  * Minimum time between production cache invalidations triggered by
@@ -336,6 +387,8 @@ export function invalidateCachedToken(): boolean {
 export function resetTokenCache(): void {
   memoryToken = null;
   tokenFailedUntil = 0;
+  tokenFailures = 0;
+  fingerprintMemo = null;
   lastInvalidatedAt = 0;
   trackerAnonymousUntil = 0;
 }
@@ -345,6 +398,63 @@ function isCachedToken(value: unknown): value is CachedToken {
     typeof (value as Partial<CachedToken>).token === 'string' &&
     ACCESS_TOKEN_PATTERN.test((value as CachedToken).token) &&
     Number.isFinite((value as Partial<CachedToken>).expiresAt);
+}
+
+/** The credentials fingerprint a cached token must carry to be used. */
+function tokenFingerprint(auth: IvaoAuth): Promise<string> {
+  if (fingerprintMemo?.clientId !== auth.clientId || fingerprintMemo.clientSecret !== auth.clientSecret) {
+    const value = (async () => {
+      const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(auth.clientSecret),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(TOKEN_FINGERPRINT_LABEL + auth.clientId));
+      return [...new Uint8Array(mac, 0, 16)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    })();
+    fingerprintMemo = { clientId: auth.clientId, clientSecret: auth.clientSecret, value };
+    // A failed computation is retried by the next call instead of cached.
+    value.catch(() => {
+      if (fingerprintMemo?.value === value) fingerprintMemo = null;
+    });
+  }
+  return fingerprintMemo.value;
+}
+
+/**
+ * A mint failure, already logged once for its backoff window, or a mint
+ * skipped inside that window (silent). Fixed messages only: never a response
+ * body, which carries the token on success.
+ */
+class TokenUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TokenUnavailableError';
+  }
+}
+
+/** Why a mint attempt failed, safe to log: an HTTP status or a fixed category. */
+class TokenMintFailure extends Error {
+  constructor(message: string, readonly status: number | undefined, readonly category: string) {
+    super(message);
+    this.name = 'TokenMintFailure';
+  }
+}
+
+/** Start the backoff window for a failed mint and log it once, with status or category only. */
+function recordMintFailure(err: unknown, now: number): void {
+  const status = err instanceof TokenMintFailure ? err.status : undefined;
+  let backoffMs: number;
+  if (status !== undefined && TOKEN_REJECTED_STATUSES.has(status)) {
+    backoffMs = TRACKER_ANONYMOUS_MS;
+  } else {
+    tokenFailures++;
+    backoffMs = Math.min(TOKEN_FAIL_BACKOFF_MAX_MS, TOKEN_FAIL_BACKOFF_BASE_MS * 2 ** Math.min(tokenFailures - 1, 30));
+  }
+  tokenFailedUntil = now + backoffMs;
+  let detail: { status: number } | { error: string };
+  if (status !== undefined) detail = { status };
+  else if (err instanceof TokenMintFailure) detail = { error: err.category };
+  else if (err instanceof Error && err.message === 'upstream request timed out') detail = { error: 'timeout' };
+  else detail = { error: err instanceof Error ? err.name : typeof err };
+  console.error(JSON.stringify({ event: 'ivao_auth_failed', ...detail, backoffMs }));
 }
 
 /**
@@ -388,22 +498,33 @@ async function obtainToken(
   opts: { forceRefresh?: boolean } = {},
 ): Promise<{ token: string; minted: boolean }> {
   const now = Date.now();
+  const fingerprint = await tokenFingerprint(auth);
   if (!opts.forceRefresh) {
-    if (memoryToken && memoryToken.expiresAt > now) return { token: memoryToken.token, minted: false };
+    if (memoryToken && memoryToken.fingerprint === fingerprint && memoryToken.expiresAt > now) {
+      return { token: memoryToken.token, minted: false };
+    }
 
+    // An entry without the current fingerprint (written by v2.3.3, or under
+    // other credentials) is a miss, and the mint below overwrites it.
     const stored = await readCachedToken(auth.kv);
-    if (isCachedToken(stored) && stored.expiresAt > now) {
-      memoryToken = stored;
+    if (isCachedToken(stored) && (stored as Partial<BoundToken>).fingerprint === fingerprint && stored.expiresAt > now) {
+      // Never trust a stored expiry beyond the longest token lifetime.
+      memoryToken = {
+        token: stored.token, expiresAt: Math.min(stored.expiresAt, now + MAX_TOKEN_TTL_SECONDS * 1000), fingerprint,
+      };
       return { token: stored.token, minted: false };
     }
   }
 
   // A recent mint failure means credentials or the IVAO endpoint are down;
-  // skip wasting more subrequests on it until the backoff expires.
+  // skip wasting more subrequests on it until the backoff expires. Silent:
+  // the failure itself was logged once for this window.
   if (tokenFailedUntil > now) {
-    throw new Error('IVAO token mint skipped: recent failure backoff in effect');
+    throw new TokenUnavailableError('IVAO token mint skipped: recent failure backoff in effect');
   }
 
+  let accessToken: string;
+  let expiresIn: unknown;
   try {
     const res = await fetchBuffered(IVAO_TOKEN_URL, {
       method: 'POST',
@@ -416,40 +537,47 @@ async function obtainToken(
       }),
     });
     // Deliberately not echoing the body: it carries the token on success.
-    if (!res.ok) throw new Error(`IVAO token request failed with ${res.status}`);
+    if (!res.ok) throw new TokenMintFailure(`IVAO token request failed with ${res.status}`, res.status, 'status');
 
     // A JSON parse error message can quote the body, which carries the token.
     let body: { access_token?: unknown; expires_in?: unknown } | null;
     try {
       body = (await res.json()) as typeof body;
     } catch {
-      throw new Error('IVAO token response was not valid JSON');
+      throw new TokenMintFailure('IVAO token response was not valid JSON', undefined, 'invalid_json');
     }
     if (typeof body?.access_token !== 'string' || !ACCESS_TOKEN_PATTERN.test(body.access_token)) {
-      throw new Error('IVAO token response contained no usable access_token');
+      throw new TokenMintFailure('IVAO token response contained no usable access_token', undefined, 'no_access_token');
     }
-
-    const ttlSeconds = clampTtlSeconds(body.expires_in);
-    const entry: CachedToken = {
-      token: body.access_token,
-      expiresAt: now + ttlSeconds * 1000 - TOKEN_SAFETY_MARGIN_MS,
-    };
-    memoryToken = entry;
-    tokenFailedUntil = 0;
-    try {
-      await auth.kv.put(TOKEN_KEY, JSON.stringify(entry), {
-        expirationTtl: Math.floor(ttlSeconds),
-      });
-    } catch (err) {
-      // The in-memory cache above still serves this isolate for the token's
-      // lifetime; only cross-isolate reuse is lost.
-      console.warn(JSON.stringify({ event: 'ivao_token_cache_write_failed', error: String(err) }));
-    }
-    return { token: entry.token, minted: true };
+    accessToken = body.access_token;
+    expiresIn = body.expires_in;
   } catch (err) {
-    tokenFailedUntil = now + TOKEN_FAIL_BACKOFF_MS;
-    throw err;
+    recordMintFailure(err, now);
+    throw new TokenUnavailableError(err instanceof TokenMintFailure ? err.message : 'IVAO token request failed');
   }
+
+  const ttlSeconds = clampTtlSeconds(expiresIn);
+  const entry: BoundToken = {
+    token: accessToken,
+    expiresAt: now + ttlSeconds * 1000 - TOKEN_SAFETY_MARGIN_MS,
+    fingerprint,
+  };
+  memoryToken = entry;
+  tokenFailedUntil = 0;
+  tokenFailures = 0;
+  try {
+    await auth.kv.put(TOKEN_KEY, JSON.stringify(entry), {
+      expirationTtl: Math.floor(ttlSeconds),
+    });
+  } catch (err) {
+    // The in-memory cache above still serves this isolate for the token's
+    // lifetime; only cross-isolate reuse is lost. The error's name only: its
+    // message could quote the value being written.
+    console.warn(JSON.stringify({
+      event: 'ivao_token_cache_write_failed', error: err instanceof Error ? err.name : typeof err,
+    }));
+  }
+  return { token: entry.token, minted: true };
 }
 
 /** Build the auth config from the environment, or undefined when unset. */
@@ -472,8 +600,12 @@ async function authHeaders(
     return { headers, minted };
   } catch (err) {
     // Bad or temporarily unavailable credentials must not take the bot down:
-    // the tracker endpoint still serves unauthenticated callers.
-    console.error(JSON.stringify({ event: 'ivao_auth_failed', error: String(err) }));
+    // the tracker endpoint still serves unauthenticated callers. A failed
+    // mint was already logged once for its backoff window; a skipped one is
+    // silent. Anything else logs its name only.
+    if (!(err instanceof TokenUnavailableError)) {
+      console.error(JSON.stringify({ event: 'ivao_auth_failed', error: err instanceof Error ? err.name : typeof err }));
+    }
   }
   return { headers, minted: false };
 }
@@ -520,7 +652,9 @@ export async function fetchDivisionAtc(
     } catch (err) {
       // A transient KV error here must not fail the whole poll; forceRefresh
       // below skips reading a possibly-still-present stale KV entry anyway.
-      console.warn(JSON.stringify({ event: 'ivao_token_delete_failed', error: String(err) }));
+      console.warn(JSON.stringify({
+        event: 'ivao_token_delete_failed', error: err instanceof Error ? err.name : typeof err,
+      }));
     }
     const retry = await authHeaders(auth, { forceRefresh: true });
     res = await feed(retry.headers);

@@ -36,6 +36,14 @@ class LookupFailure extends Error {
   }
 }
 
+/** The lookup deadline elapsed before this id's profile request started. */
+class LookupDeadline extends Error {
+  constructor() {
+    super('IVAO member country lookup deadline elapsed');
+    this.name = 'LookupDeadline';
+  }
+}
+
 function fetchFailureReason(err: unknown): LookupFailureReason {
   if (err instanceof ResponseTooLargeError) return 'too_large';
   return err instanceof Error && err.message === TIMEOUT_MESSAGE ? 'timeout' : 'network';
@@ -54,8 +62,13 @@ export async function enrichMemberCountries(
   const now = Date.now();
   const cached = new Map<number, MemberCountry>();
   for (const atc of Object.values(previous)) {
-    if (atc.memberCountry && atc.memberCountry.expiresAt > (cached.get(atc.userId)?.expiresAt ?? 0)) {
-      cached.set(atc.userId, atc.memberCountry);
+    // The snapshot gets the same checks as the KV cache: a finite expiry no
+    // more than one TTL from now, and a well-formed country code.
+    const prior = atc.memberCountry as Partial<MemberCountry> | null | undefined;
+    if (!prior || typeof prior !== 'object' || typeof prior.expiresAt !== 'number' || !Number.isFinite(prior.expiresAt)) continue;
+    const expiresAt = Math.min(prior.expiresAt, now + COUNTRY_TTL_MS);
+    if (expiresAt > (cached.get(atc.userId)?.expiresAt ?? 0)) {
+      cached.set(atc.userId, { countryId: countryCode(prior.countryId), expiresAt });
     }
   }
   // Explicit null prevents a callsign reused by another VID inheriting its country.
@@ -97,6 +110,9 @@ export async function enrichMemberCountries(
         const bearer = await token.catch(() => {
           throw new LookupFailure('token');
         });
+        // The KV read or a token mint above can take most of the budget: no
+        // profile request starts once the deadline has elapsed.
+        if (Date.now() - start >= LOOKUP_DEADLINE_MS) throw new LookupDeadline();
         res = await fetchBuffered(`https://api.ivao.aero/v2/users/${id}`, {
           headers: { accept: 'application/json', authorization: `Bearer ${bearer}` },
         }).catch((err: unknown) => {
@@ -119,7 +135,9 @@ export async function enrichMemberCountries(
           try {
             await auth.kv.delete(TOKEN_KEY);
           } catch (err) {
-            console.warn(JSON.stringify({ event: 'ivao_token_delete_failed', error: String(err) }));
+            console.warn(JSON.stringify({
+              event: 'ivao_token_delete_failed', error: err instanceof Error ? err.name : typeof err,
+            }));
           }
         }
         if (STOP_RUN_STATUSES.has(res.status) || res.status >= 500) stopRun = true;
@@ -130,13 +148,18 @@ export async function enrichMemberCountries(
       }) as { countryId?: unknown } | null;
       value = { countryId: countryCode(body?.countryId), expiresAt: now + COUNTRY_TTL_MS };
     } catch (err) {
+      if (err instanceof LookupDeadline) {
+        // Not attempted after all: the skip backoff below applies to it.
+        attempted.delete(id);
+        break;
+      }
       // Keep a previously known country during transient failures; retry
       // later. Not written to KV below: a failing lookup must not consume
       // the KV write quota on every poll, only this run's in-memory map and
       // the session snapshot (via `previous`) carry the backoff forward.
-      // Only the classified reason is logged, never the error itself.
+      // Only the classified reason is logged, never the error itself or the VID.
       const reason = err instanceof LookupFailure ? err.reason : 'unknown';
-      console.warn(JSON.stringify({ event: 'member_country_unavailable', userId: id, reason }));
+      console.warn(JSON.stringify({ event: 'member_country_unavailable', reason }));
       value = { countryId: cached.get(id)?.countryId ?? null, expiresAt: now + RETRY_MS };
       persist = false;
     }
@@ -149,7 +172,7 @@ export async function enrichMemberCountries(
         });
       } catch {
         // The coordinator snapshot still retains this cache entry for the session.
-        console.warn(JSON.stringify({ event: 'member_country_cache_failed', userId: id }));
+        console.warn(JSON.stringify({ event: 'member_country_cache_failed' }));
       }
     }
   }

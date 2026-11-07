@@ -5,6 +5,12 @@ import { TOKEN_KEY } from '../src/config';
 import type { IvaoAuth, OnlineAtc, StateMap } from '../src/types';
 
 const NOW = 1_800_000_000_000;
+/**
+ * hex(HMAC-SHA-256(key 'test', 'onfreq-ivao-token:v1\n' + 'test'))[0:32]: the
+ * token-cache fingerprint of the synthetic credentials below, computed
+ * independently with Node's crypto.createHmac.
+ */
+const FP = 'f8d7bee612a7355d8cde0b5da6eddfda';
 let values: Map<string, unknown>;
 let auth: IvaoAuth;
 let network: ReturnType<typeof vi.fn<typeof fetch>>;
@@ -21,7 +27,7 @@ function previous(countryId: string | null, expiresAt = NOW + 60_000): StateMap 
 beforeEach(() => {
   resetTokenCache();
   vi.spyOn(Date, 'now').mockReturnValue(NOW);
-  values = new Map([['ivao-token-v1', { token: 'test-token', expiresAt: NOW + 600_000 }]]);
+  values = new Map([['ivao-token-v1', { token: 'test-token', expiresAt: NOW + 600_000, fingerprint: FP }]]);
   auth = { clientId: 'test', clientSecret: 'test', kv: {
     get: vi.fn(async (key: string) => values.get(key) ?? null),
     put: vi.fn(async (key: string, raw: string) => { values.set(key, JSON.parse(raw)); }),
@@ -99,7 +105,7 @@ describe('member profile country enrichment', () => {
 
   it('stops the rest of the batch after a 401/403/429/5xx, but not after a 404', async () => {
     for (const status of [401, 403, 429, 500]) {
-      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000, fingerprint: FP });
       network.mockClear();
       network.mockImplementation(async () => new Response(null, { status }));
       const current = Array.from({ length: 3 }, (_, i) => controller(300 + i, `QCTT_${i}_TWR`));
@@ -107,7 +113,7 @@ describe('member profile country enrichment', () => {
       expect(network).toHaveBeenCalledTimes(1);
     }
     for (const status of [404]) {
-      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000, fingerprint: FP });
       network.mockClear();
       network.mockImplementation(async () => new Response(null, { status }));
       const current = Array.from({ length: 3 }, (_, i) => controller(400 + i, `QDTT_${i}_TWR`));
@@ -134,7 +140,7 @@ describe('member profile country enrichment', () => {
     // Immediately after, the skipped ids must not be retried again: their
     // in-memory backoff keeps them out of the next lookup batch.
     network.mockClear();
-    values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+    values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000, fingerprint: FP });
     network.mockImplementation(async () => Response.json({ countryId: 'ca' }));
     const state: StateMap = Object.fromEntries(current.map((atc) => [atc.callsign, {
       ...atc, since: new Date(NOW).toISOString(), missed: 0,
@@ -198,7 +204,7 @@ describe('member profile country enrichment', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation((line: unknown) => { lines.push(String(line)); });
     const reasons = async (setup: () => void, userId: number) => {
       resetTokenCache();
-      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+      values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000, fingerprint: FP });
       warn.mockClear();
       setup();
       await enrichMemberCountries([controller(userId, `QCTT_${userId}_TWR`)], {}, auth);
@@ -207,24 +213,24 @@ describe('member profile country enrichment', () => {
     };
     const secret = 'synthetic-private-detail';
     expect(await reasons(() => network.mockImplementation(async () => new Response(secret, { status: 404 })), 1001))
-      .toEqual([{ event: 'member_country_unavailable', userId: 1001, reason: 404 }]);
+      .toEqual([{ event: 'member_country_unavailable', reason: 404 }]);
     expect(await reasons(() => network.mockImplementation(async () => {
       throw new Error('upstream request timed out');
-    }), 1002)).toEqual([{ event: 'member_country_unavailable', userId: 1002, reason: 'timeout' }]);
+    }), 1002)).toEqual([{ event: 'member_country_unavailable', reason: 'timeout' }]);
     expect(await reasons(() => network.mockImplementation(async () => {
       throw new TypeError(`${secret} https://api.ivao.aero/v2/users/1003`);
-    }), 1003)).toEqual([{ event: 'member_country_unavailable', userId: 1003, reason: 'network' }]);
+    }), 1003)).toEqual([{ event: 'member_country_unavailable', reason: 'network' }]);
     expect(await reasons(() => network.mockImplementation(async () => new Response(`{"countryId":"${secret}`)), 1004))
-      .toEqual([{ event: 'member_country_unavailable', userId: 1004, reason: 'parse' }]);
+      .toEqual([{ event: 'member_country_unavailable', reason: 'parse' }]);
     expect(await reasons(() => vi.mocked(auth.kv.get).mockRejectedValueOnce(new Error(secret)), 1005))
-      .toEqual([{ event: 'member_country_unavailable', userId: 1005, reason: 'kv' }]);
+      .toEqual([{ event: 'member_country_unavailable', reason: 'kv' }]);
     expect(await reasons(() => {
       values.delete(TOKEN_KEY);
       network.mockImplementation(async () => new Response(secret, { status: 500 }));
-    }, 1006)).toEqual([{ event: 'member_country_unavailable', userId: 1006, reason: 'token' }]);
+    }, 1006)).toEqual([{ event: 'member_country_unavailable', reason: 'token' }]);
     expect(await reasons(() => network.mockImplementation(async () => new Response('x', {
       headers: { 'content-length': String(4 * 1024 * 1024) },
-    })), 1007)).toEqual([{ event: 'member_country_unavailable', userId: 1007, reason: 'too_large' }]);
+    })), 1007)).toEqual([{ event: 'member_country_unavailable', reason: 'too_large' }]);
     expect(lines.join('\n')).not.toMatch(/synthetic-private-detail|test-token|api\.ivao\.aero/);
   });
 
@@ -274,7 +280,7 @@ describe('member profile country enrichment', () => {
     expect(auth.kv.delete).toHaveBeenCalledWith(TOKEN_KEY);
     expect(values.has(TOKEN_KEY)).toBe(false);
 
-    values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000 });
+    values.set(TOKEN_KEY, { token: 'test-token', expiresAt: NOW + 600_000, fingerprint: FP });
     vi.mocked(auth.kv.delete).mockClear();
     network.mockImplementation(async () => new Response(null, { status: 500 }));
     await enrichMemberCountries([controller(101, 'QCTT_2_TWR')], {}, auth);
@@ -312,5 +318,84 @@ describe('member profile country enrichment', () => {
     const current = [controller()];
     await expect(enrichMemberCountries(current, {}, auth)).resolves.toBeUndefined();
     expect(current[0]?.memberCountry?.countryId).toBe('CA');
+  });
+});
+
+describe('R234 B: snapshot checks, lookup deadline and log contents', () => {
+  it.each([Number.POSITIVE_INFINITY, Number.NaN, '1800000060000', null])(
+    'T13-4: ignores a snapshot country whose expiry %s is not a finite number, and looks it up', async (expiresAt) => {
+      const current = [controller()];
+      await enrichMemberCountries(current, previous('BR', expiresAt as number), auth);
+      expect(network).toHaveBeenCalledTimes(1);
+      expect(current[0]?.memberCountry).toEqual({ countryId: 'CA', expiresAt: NOW + 86_400_000 });
+    });
+
+  it('T13-4: caps a snapshot expiry at one TTL from now', async () => {
+    const current = [controller()];
+    await enrichMemberCountries(current, previous('BR', NOW + 365 * 86_400_000), auth);
+    expect(network).not.toHaveBeenCalled();
+    expect(current[0]?.memberCountry).toEqual({ countryId: 'BR', expiresAt: NOW + 86_400_000 });
+  });
+
+  it.each<[unknown, string | null]>([['<@&1>', null], ['ZZ', null], ['br', 'BR'], [42, null], ['BRA', null]])(
+    'T13-4: passes the snapshot country %j through countryCode() as %j', async (countryId, expected) => {
+      const current = [controller()];
+      await enrichMemberCountries(current, previous(countryId as string, NOW + 60_000), auth);
+      expect(network).not.toHaveBeenCalled();
+      expect(current[0]?.memberCountry).toEqual({ countryId: expected, expiresAt: NOW + 60_000 });
+    });
+
+  it.each(['token mint', 'KV read'])('T13-8: no profile request starts once a slow %s has used up the lookup deadline', async (slow) => {
+    let clock = NOW;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    if (slow === 'token mint') values.delete(TOKEN_KEY);
+    const kvGet = auth.kv.get as unknown as ReturnType<typeof vi.fn<(key: string) => Promise<unknown>>>;
+    const get = kvGet.getMockImplementation()!;
+    kvGet.mockImplementation(async (key: string) => {
+      if (slow === 'KV read' && key.startsWith('ivao-member-country-v1:')) clock += 11_000;
+      return get(key);
+    });
+    network.mockImplementation(async (input) => {
+      if (String(input).includes('/oauth/token')) {
+        clock += 11_000;
+        return Response.json({ access_token: 'synthetic-slow-token', expires_in: 1800 });
+      }
+      return Response.json({ countryId: 'ca' });
+    });
+    const current = [controller(720, 'QCTT_0_DLN'), controller(721, 'QCTT_1_DLN')];
+    await enrichMemberCountries(current, {}, auth);
+    expect(network.mock.calls.some(([url]) => String(url).includes('/v2/users/'))).toBe(false);
+    // Treated as never attempted: the skip backoff, no failure log, nothing stored.
+    expect(current.map((atc) => atc.memberCountry)).toEqual([
+      { countryId: null, expiresAt: NOW + 300_000 }, { countryId: null, expiresAt: NOW + 300_000 },
+    ]);
+    expect(warn.mock.calls.map(([line]) => String(line)).filter((line) => line.includes('member_country'))).toEqual([]);
+    expect([...values.keys()].some((key) => key.startsWith('ivao-member-country-v1:'))).toBe(false);
+  });
+
+  it('T13-9 / B-5: no member-country log line carries the VID', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    network.mockImplementation(async () => new Response(null, { status: 404 }));
+    await enrichMemberCountries([controller(987654, 'QCTT_0_VID')], {}, auth);
+    network.mockImplementation(async () => Response.json({ countryId: 'ca' }));
+    vi.mocked(auth.kv.put).mockRejectedValueOnce(new Error('KV unavailable'));
+    await enrichMemberCountries([controller(987655, 'QCTT_1_VID')], {}, auth);
+    const lines = warn.mock.calls.map(([line]) => String(line));
+    expect(lines).toEqual([
+      JSON.stringify({ event: 'member_country_unavailable', reason: 404 }),
+      JSON.stringify({ event: 'member_country_cache_failed' }),
+    ]);
+    expect(lines.join('\n')).not.toMatch(/userId|98765/);
+  });
+
+  it('T13-6 / B-4: a failed token delete after a profile 401 logs the error name only', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    network.mockImplementation(async () => new Response(null, { status: 401 }));
+    vi.mocked(auth.kv.delete).mockRejectedValueOnce(new Error('synthetic-token-zzz'));
+    await enrichMemberCountries([controller()], {}, auth);
+    const lines = warn.mock.calls.map(([line]) => String(line));
+    expect(lines).toContain(JSON.stringify({ event: 'ivao_token_delete_failed', error: 'Error' }));
+    expect(lines.join('\n')).not.toContain('synthetic-token-zzz');
   });
 });
