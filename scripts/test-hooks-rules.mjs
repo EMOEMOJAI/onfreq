@@ -67,8 +67,15 @@ test('the repository Gitleaks rule blocks GCA records signing keys and passes sy
     const value = 'cd'.repeat(17);
     const nextLine = `${next}=${value}\n`;
     const rules = repoRules().toString();
-    const withoutGca = rules.replace(`|${primary}(?:_NEXT)?`, '').replace(', "gca_admin_hmac_key"', '');
-    assert.notEqual(withoutGca, rules);
+    // Each fragment must occur exactly once, so removing it removes the GCA keys
+    // from the secret-assignment rule and nothing else (T1-5 P4-3).
+    const removeOnce = (text, fragment) => {
+      assert.equal(text.split(fragment).length, 2, `${fragment} occurs exactly once`);
+      return text.replace(fragment, '');
+    };
+    const fragments = [`|${primary}(?:_NEXT)?`, ', "gca_admin_hmac_key"'];
+    for (const fragment of fragments) assert.throws(() => removeOnce(`${rules}${fragment}`, fragment), /occurs exactly once/);
+    const withoutGca = fragments.reduce(removeOnce, rules);
     for (const before of ['[extend]\nuseDefault = true\n', withoutGca]) {
       commitRules(f, before);
       const { hook, scan } = scanAssignment(f, nextLine);

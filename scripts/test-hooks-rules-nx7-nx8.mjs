@@ -1,12 +1,14 @@
 // Real-Gitleaks tests of the NX-7 and NX-8 changes to the repository rules in
-// .gitleaks.toml: each blocks or passes its cases and is needed. The shared
-// fixtures and helpers are in scripts/hook-test-helpers.mjs.
+// .gitleaks.toml, and the P232 (2.3.2) quoted-join follow-ups H and H2: each
+// blocks or passes its cases and is needed. The shared fixtures and helpers are
+// in scripts/hook-test-helpers.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   gitleaksSkip, fixture, repoRules, commitRules, scanAssignment, callsignRegexNx7, callsignAllowNx7, callsignRegexNx8,
   callsignAllowNx8, callsignRule, quotedJoinRule, editRule, settingsText, withoutRule, scanCommit, nx7Texts, as2210,
-  nx7Cases, nx8Cases,
+  nx7Cases, nx8Cases, quotedJoinRegex231, quotedJoinRegexH, quotedJoinRegex, quotedJoinAllow231, quotedJoinAllowH,
+  quotedJoinAllow, quotedJoinAs, p232Cases,
 } from './hook-test-helpers.mjs';
 
 test('the repository Gitleaks rules block NX-7 callsign, coordinator name and FIR prefix forms, redacted (NX-7)',
@@ -108,4 +110,53 @@ test('each NX-8 callsign change is needed: its cases pass with the 2.2.11 texts 
     // The NX-8 regex with the 2.2.11 allowlist flags synthetic lists with empty quotes.
     commitRules(f, editRule(repoRules(), callsignRule, [allow2211]));
     for (const [line, label] of needsAllow) assert.equal(scanCommit(f, settingsText(line)).status, 1, `${label}: 2.2.11 allowlist`);
+  });
+
+test('the repository Gitleaks rules block callsign lists with several quotes or blanks among quotes around a comma, redacted (P232 H, H2)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    commitRules(f, repoRules());
+    const { tower, h, h2 } = p232Cases();
+    for (const [line, label] of [...h.block, ...h2.block]) {
+      const { hook, scan } = scanAssignment(f, settingsText(line));
+      for (const result of [...hook, scan]) {
+        assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+        assert.ok(!(result.stderr + result.stdout).includes(tower), `${label}: ${tower.length} characters shown`);
+      }
+    }
+  });
+
+test('the repository Gitleaks rules pass the same synthetic callsign lists (P232 H, H2)', { skip: gitleaksSkip }, (t) => {
+  const f = fixture(t, { gitleaks: 'real' });
+  commitRules(f, repoRules());
+  const { h, h2 } = p232Cases();
+  for (const [line, label] of [...h.pass, ...h2.pass]) {
+    const { hook, scan } = scanAssignment(f, settingsText(line));
+    for (const result of [...hook, scan]) assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+  }
+});
+
+test('each P232 quoted-join change is needed: its cases pass with the 2.3.1 or the H-only texts (P232 H, H2)',
+  { skip: gitleaksSkip }, (t) => {
+    const f = fixture(t, { gitleaks: 'real' });
+    const { h, h2 } = p232Cases();
+    const text = (cases) => cases.map(([line]) => settingsText(line)).join('');
+    const blocks = (cases) => { for (const [line, label] of cases) assert.equal(scanCommit(f, settingsText(line)).status, 1, label); };
+    assert.ok(h.pass.some((item) => item[2]) && h2.pass.some((item) => item[2]));
+    // As released in 2.3.1, every H and H2 block case passes.
+    commitRules(f, quotedJoinAs(quotedJoinRegex231, quotedJoinAllow231));
+    let scan = scanCommit(f, text([...h.block, ...h2.block]));
+    assert.equal(scan.status, 0, `quoted-join rule as in 2.3.1: ${scan.stderr}`);
+    // H alone blocks each H case and passes the H2 ones, which need H2's branch.
+    commitRules(f, quotedJoinAs(quotedJoinRegexH, quotedJoinAllowH));
+    blocks(h.block);
+    scan = scanCommit(f, text(h2.block));
+    assert.equal(scan.status, 0, `quoted-join rule with H only: ${scan.stderr}`);
+    scan = scanCommit(f, text([...h.pass, ...h2.pass]));
+    assert.equal(scan.status, 0, `synthetic lists with H only: ${scan.stderr}`);
+    // Each regex change with the previous allowlist flags the synthetic lists that need the allowlist change.
+    commitRules(f, quotedJoinAs(quotedJoinRegexH, quotedJoinAllow231));
+    blocks(h.pass.filter((item) => item[2]));
+    commitRules(f, quotedJoinAs(quotedJoinRegex, quotedJoinAllowH));
+    blocks(h2.pass.filter((item) => item[2]));
   });

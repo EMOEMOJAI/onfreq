@@ -222,21 +222,25 @@ regexes = ['''(?i)^[QX][^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*(?:[\t\v\f\r \p{Zs
 
 # The same callsign lists with the exact uppercase name right before the = or
 # :, as in dotenv and shell lines and `wrangler dev --var NAME:list`, where the
-# shell also joins quoted items to each other: one or more quotes, a comma and
-# at most one quote between two items ("<item>","<item>" or "<item>"",<item>).
-# JSON and code put a quote or a blank between the name and the value, so they
-# pass. The allowlist is the one above.
+# shell also joins quoted items to each other: quotes on either side of a comma
+# between two items, any number of them and with blanks among them
+# ("<item>","<item>", "<item>"",<item>, "<item>"",""<item>", "<item>"','"<item>",
+# "<item>"", ""<item>", "<item> ","<item>" or <item>," <item>"). The bot trims
+# the ends of each item, so a blank kept inside the quotes still leaves a
+# working item. JSON and code put a quote or a blank between the name and the
+# value, so they pass. The allowlist is the one above with the same quotes and
+# blanks allowed around each comma.
 [[rules]]
 id = "onfreq-excluded-callsigns-quoted-join"
 description = "onfreq EXCLUDED_CALLSIGNS with quoted items the shell joins"
-regex = '''\bEXCLUDED_CALLSIGNS[=:](?:\$'|["'`])?(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]|\\[ tvfrn]|\\x(?:0[9a-dA-D]|20|[aA]0)|\\u(?:00(?:0[9a-dA-D]|20|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000|[fF][eE][fF][fF]))*((?:[A-Za-z0-9\x{DF}\x{131}\x{17F}\x{FB00}-\x{FB06}-]+|[A-Z0-9-]+(?:\.[A-Z0-9-]*)+)_[^\s,"'`;)}\]]*(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*(?:""|''|``)*(?:["'`][^\s,"'`;)}\]]+|[^\s,"'`;)}\]]*)|["'`]+,["'`]?[^\s,"'`;)}\]]+)*)'''
+regex = '''\bEXCLUDED_CALLSIGNS[=:](?:\$'|["'`])?(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]|\\[ tvfrn]|\\x(?:0[9a-dA-D]|20|[aA]0)|\\u(?:00(?:0[9a-dA-D]|20|[aA]0)|1680|200[0-9aA]|202[89fF]|205[fF]|3000|[fF][eE][fF][fF]))*((?:[A-Za-z0-9\x{DF}\x{131}\x{17F}\x{FB00}-\x{FB06}-]+|[A-Z0-9-]+(?:\.[A-Z0-9-]*)+)_[^\s,"'`;)}\]]*(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}"'`]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}"'`]*[^\s,"'`;)}\]]+|[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*(?:""|''|``)*(?:["'`][^\s,"'`;)}\]]+|[^\s,"'`;)}\]]*)|["'`]+,["'`]*[^\s,"'`;)}\]]+)*)'''
 secretGroup = 1
 keywords = ["excluded_callsigns"]
 
 [[rules.allowlists]]
 description = "Synthetic callsigns only, across the whole list"
 regexTarget = "secret"
-regexes = ['''(?i)^[QX][^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*(?:""|''|``)*(?:["'`]?[QX][^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*)?)*[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*$''']
+regexes = ['''(?i)^[QX][^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*(?:[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}"'`]*,[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}"'`]*(?:""|''|``)*(?:["'`]*[QX][^,\s\v\p{Zs}\x{FEFF}\x{2028}\x{2029}]*)?)*[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}]*$''']
 
 # The GCA policy link: any scheme://URL. Only hosts under the reserved .test,
 # .example and .invalid domains pass, ending the URL or followed by a path,

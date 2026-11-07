@@ -9,7 +9,7 @@ import { diffTreeRows, fileErrors, imagePrivacy, privateCommitEmails, privatePat
   wranglerConfigErrors } from './check-privacy.mjs';
 import { checkExternalLinks, checkLocalLinks, documentLinks } from './check-links.mjs';
 import { isolatedEnv, optionalSecretNames, testDeployGuard, validateGitleaksConfig, validateHooks, validateOptionalSecrets,
-  validateSetup, validateTestBindings, validateWranglerSecretNames } from './check-setup.mjs';
+  validateSecretRule, validateSetup, validateTestBindings, validateWranglerSecretNames } from './check-setup.mjs';
 import { isMain, jsonc } from './repo-files.mjs';
 import { CONFIG, lintDocs } from './lint-docs.mjs';
 
@@ -41,15 +41,17 @@ test('.gitignore ignores the config/, local-settings and key paths exactly as pr
     ['.envrc.example/x', true], ['CLAUDE.local.md', true], ['notes.local.md', true], ['nested/x.local.md', true],
     ['settings.local.json', true], ['.claude/settings.local.json', true], ['nested/settings.local.json', true],
     ['x.local.json', true], ['x.local.jsonc', true], ['nested/x.local.jsonc', true],
-    ['x.local.json.bak', false], ['local.json', false], ['x.local.txt', false],
+    // Any path segment holding .local., with any ending or in a directory (T1-5 P4-1).
+    ['x.local.json.bak', true], ['x.local.txt', true], ['x.local.d/f', true], ['nested/x.Local.cfg', true],
+    ['.local.x', true], ['local.json', false], ['local.d/f', false], ['x.localx.md', false], ['xlocal.md', false],
     // privatePath matches these endings in any case (NX3-S1 F12).
     ['KEY.PEM', true], ['nested/Cert.Pem', true], ['id.KEY', true], ['store.P12', true], ['store.PfX', true],
     ['TRACE.LOG', true], ['nested/run.Log', true], ['set.LOCAL.SH', true], ['set.Local.Sh', true],
     ['NOTES.LOCAL.MD', true], ['settings.Local.Json', true], ['x.LOCAL.JSONC', true], ['db-SECRET', true],
     ['nested/db-Secret.TXT', true], ['POLL-SECRET', true],
     ['x.pem.bak', false], ['x.PEMS', false], ['xpem', false], ['x.keys', false], ['x.KEY.txt', false],
-    ['x.p12x', false], ['x.P13', false], ['trace.LOGS', false], ['x.LOCAL.SHX', false], ['x.LOCAL.TXT', false],
-    ['LOCAL.MD', false], ['x.local.MDX', false], ['xSECRET', false], ['x-SECRETS', false], ['x-Secret.md', false],
+    ['x.p12x', false], ['x.P13', false], ['trace.LOGS', false], ['x.LOCAL.SHX', true], ['x.LOCAL.TXT', true],
+    ['LOCAL.MD', false], ['x.local.MDX', true], ['xSECRET', false], ['x-SECRETS', false], ['x-Secret.md', false],
     ['x-secret.TXT.bak', false]]) {
     for (const ignorecase of ['false', 'true']) {
       const status = spawnSync('git', ['-c', `core.ignorecase=${ignorecase}`, 'check-ignore', '--no-index', '-q', file],
@@ -461,6 +463,36 @@ test('vitest bindings cover every optional and first-run setting (T2-4)', () => 
   assert.throws(() => validateTestBindings(vitest, envTypes.replace('  COORDINATOR_NAME?: string;',
     '  COORDINATOR_NAME?: string;\n  SYNTHETIC_SETTING?: string;')), /SYNTHETIC_SETTING/);
   assert.throws(() => validateTestBindings('export default {};', envTypes), /Missing vitest miniflare bindings/);
+});
+
+test('the Gitleaks secret-assignment rule and its keywords cover every secret, token and key name (T1-5 P4-2)', () => {
+  const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  const rules = read('../.gitleaks.toml');
+  const envTypes = read('../src/env.d.ts');
+  validateSecretRule(rules, envTypes);
+  // Each fragment occurs exactly once, so each edit below removes exactly one name or keyword.
+  const replaceOnce = (text, from, to = '') => {
+    assert.equal(text.split(from).length, 2, from);
+    return text.replace(from, to);
+  };
+  for (const [from, name] of [['|HISTORY_SECRET', 'HISTORY_SECRET'], ['(?:POLL_SECRET|', 'POLL_SECRET'],
+    ['|DISCORD_BOT_TOKEN', 'DISCORD_BOT_TOKEN'], ['(?:_NEXT)?', 'GCA_ADMIN_HMAC_KEY_NEXT'],
+    [', "history_secret"', 'HISTORY_SECRET'], [', "gca_admin_hmac_key"', 'GCA_ADMIN_HMAC_KEY']]) {
+    const changed = replaceOnce(rules, from, from === '(?:POLL_SECRET|' ? '(?:' : '');
+    // The reviewed grammar alone accepts the narrowed rule.
+    validateGitleaksConfig(changed);
+    assert.throws(() => validateSecretRule(changed, envTypes), new RegExp(`(?:misses|no keyword for) ${name}$`), from);
+  }
+  // A new secret name in src/env.d.ts needs a rule update.
+  for (const added of ['SYNTHETIC_TOKEN', 'SYNTHETIC_API_KEY', 'SYNTHETIC_KEY_NEXT', 'SYNTHETIC_SECRET']) {
+    assert.throws(() => validateSecretRule(rules, replaceOnce(envTypes, '  COORDINATOR_NAME?: string;',
+      `  COORDINATOR_NAME?: string;\n  ${added}?: string;`)), new RegExp(`misses ${added}$`));
+  }
+  // Other names are not secrets under this rule.
+  validateSecretRule(rules, replaceOnce(envTypes, '  COORDINATOR_NAME?: string;', '  COORDINATOR_NAME?: string;\n  SYNTHETIC_KEYS?: string;'));
+  assert.throws(() => validateSecretRule(replaceOnce(rules, 'id = "onfreq-secret-assignment"', 'id = "onfreq-other"'), envTypes),
+    /Missing Gitleaks rule/);
+  assert.throws(() => validateSecretRule(replaceOnce(rules, '[^\\s"\'`]{16,}', '(['), envTypes), /could not be read/);
 });
 
 test('public deploy permits a fresh template and blocks private configuration, even with ignore-scripts', () => {

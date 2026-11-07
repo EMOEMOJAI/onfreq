@@ -826,6 +826,51 @@ function nx8Cases() {
   };
 }
 
+// P232 (H, H2): the quoted-join rule's 2.3.1 texts are pinned, so the necessity
+// test can restore them. H lets one or more quotes follow the comma between
+// joined items (<item>",""<item>, <item>"','"<item>), and its allowlist one or
+// more quotes before an item. H2 adds a first branch that also takes blanks
+// among the quotes on either side of the comma (<item>"", ""<item>,
+// <item> ","<item>, <item>," <item>), and the same quote and blank class around
+// the allowlist's comma; it covers every H form as well. Flagged lines are
+// assembled at runtime from the joined name and a J tower, so this file never
+// holds one.
+const quoteBlank = String.raw`[\t\v\f\r \p{Zs}\x{FEFF}\x{2028}\x{2029}"'${tick}]`;
+const quotedJoinHead = String.raw`regex = '''\bEXCLUDED_CALLSIGNS[=:](?:\$'|["'${tick}])?(?:${blankClass}|${blankEscape})*((?:[A-Za-z0-9\x{DF}\x{131}\x{17F}\x{FB00}-\x{FB06}-]+|[A-Z0-9-]+(?:\.[A-Z0-9-]*)+)_${itemClass}(?:`;
+const quotedJoinBranches = (after) => String.raw`${blankClass}*,${blankClass}*${emptyPairs}(?:["'${tick}]${someItem}|${itemClass})|["'${tick}]+,["'${tick}]${after}${someItem})*)'''`;
+const quotedJoinRegex231 = quotedJoinHead + quotedJoinBranches('?');
+const quotedJoinRegexH = quotedJoinHead + quotedJoinBranches('*');
+const quotedJoinRegex = `${quotedJoinHead}${quoteBlank}*,${quoteBlank}*${someItem}|${quotedJoinBranches('*')}`;
+const quotedJoinAllow231 = callsignAllowNx8;
+const quotedJoinAllowH = callsignAllow(String.raw`["'${tick}]*`, emptyPairs);
+const quotedJoinAllow = String.raw`regexes = ['''(?i)^[QX]${callsignItem}(?:${quoteBlank}*,${quoteBlank}*${emptyPairs}(?:["'${tick}]*[QX]${callsignItem})?)*${blankClass}*$''']`;
+// The configuration with the quoted-join rule's regex and allowlist replaced.
+const quotedJoinAs = (regex, allow) => editRule(repoRules(), quotedJoinRule,
+  [['regex', quotedJoinRegex, regex], ['regexes', quotedJoinAllow, allow]]);
+// { h, h2: { block: [line, label][], pass: [line, label, needs the change's allowlist][] } }
+function p232Cases() {
+  const tower = jsonName('JDDD', 'TWR');
+  const cs = (rest) => `${callsignsName}${rest}\n`;
+  const h = (item) => [
+    [cs(`="QCXX_CTR",""${item}`), 'empty quotes after a quote and a comma'],
+    [cs(`="QCXX_CTR"",""${item}"`), 'empty quotes on both sides of a comma'],
+    [cs(`="QCXX_CTR"','"${item}"`), 'double and single quotes on both sides of a comma'],
+    [`wrangler dev --var ${cs(`:"QCXX_CTR"",""${item}"`)}`, 'wrangler --var NAME:list with empty quotes around a comma'],
+  ];
+  const h2 = (item) => [
+    [cs(`="QCXX_CTR"", ""${item}"`), 'a blank between a comma and empty quotes'],
+    [cs(`="QCXX_CTR ","${item}"`), 'a blank inside the quotes before a comma'],
+    [cs(`=QCXX_CTR," ${item}"`), 'a blank inside the quotes after a comma, unquoted first item'],
+    [cs(`="QCXX_CTR"," ${item}"`), 'a blank inside the quotes after a comma'],
+  ];
+  const passing = (cases, needs) => cases.map(([line, label], index) => [line, `synthetic: ${label}`, needs.includes(index)]);
+  return {
+    tower,
+    h: { block: h(tower), pass: passing(h('QDXX_TWR'), [2]) },
+    h2: { block: h2(tower), pass: passing(h2('QDXX_TWR'), [1, 2, 3]) },
+  };
+}
+
 export {
   hook,
   hooksDir,
@@ -930,4 +975,13 @@ export {
   as2210,
   nx7Cases,
   nx8Cases,
+  quoteBlank,
+  quotedJoinRegex231,
+  quotedJoinRegexH,
+  quotedJoinRegex,
+  quotedJoinAllow231,
+  quotedJoinAllowH,
+  quotedJoinAllow,
+  quotedJoinAs,
+  p232Cases,
 };

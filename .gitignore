@@ -32,8 +32,10 @@ secrets.json
 poll-secret
 poll-endpoint
 
-# Local, operator-specific helper scripts (may contain real IDs)
-*.[lL][oO][cC][aA][lL].[sS][hH]
+# Local, operator-specific files in any directory, in any case and with any
+# ending (helper scripts, settings, notes and their backups; they may contain
+# real IDs), as check:privacy rejects any path segment holding ".local.".
+*.[lL][oO][cC][aA][lL].*
 wrangler.local.*
 
 # npm registry credentials
@@ -42,12 +44,6 @@ wrangler.local.*
 # Local logs and privacy/secret scan reports can contain sensitive matches.
 *.[lL][oO][gG]
 gitleaks-report.*
-
-# Private agent preferences, local tool permissions and other local-only
-# settings or notes, in any directory, as check:privacy rejects them.
-*.[lL][oO][cC][aA][lL].[mM][dD]
-*.[lL][oO][cC][aA][lL].[jJ][sS][oO][nN]
-*.[lL][oO][cC][aA][lL].[jJ][sS][oO][nN][cC]
 
 # Local audit notes and original image-generation downloads.
 .local/

@@ -129,6 +129,39 @@ export function validateGitleaksConfig(text) {
   if (inArray || extend !== 1 || !text.includes('\n[extend]\nuseDefault = true\n')) fail();
 }
 
+/**
+ * Every optional or first-run secret name ending in _SECRET, _TOKEN, _KEY or
+ * _KEY_NEXT is flagged by the onfreq-secret-assignment rule: its regex, compiled
+ * here, matches NAME= and 16 characters, and Gitleaks' keyword prefilter passes
+ * the line, as the lowercase name contains one of the rule's keywords. A secret
+ * added without a rule update fails. Errors name the setting, never a value.
+ */
+export function validateSecretRule(gitleaks, envTypes) {
+  const lines = gitleaks.split('\n');
+  const start = lines.indexOf('id = "onfreq-secret-assignment"');
+  assert.ok(start > 0, 'Missing Gitleaks rule onfreq-secret-assignment');
+  const end = lines.indexOf('[[rules]]', start);
+  const rule = lines.slice(start, end < 0 ? lines.length : end);
+  const regexLine = rule.find((line) => /^regex = '''.*'''$/.test(line));
+  const keywordsLine = rule.find((line) => line.startsWith('keywords = '));
+  assert.ok(regexLine && keywordsLine, 'Gitleaks rule onfreq-secret-assignment needs a regex and keywords');
+  let regex;
+  let keywords;
+  try {
+    regex = new RegExp(regexLine.slice("regex = '''".length, -3));
+    keywords = JSON.parse(keywordsLine.slice('keywords = '.length));
+  } catch { assert.fail('Gitleaks rule onfreq-secret-assignment could not be read'); }
+  const names = [...new Set([...optionalSecretNames(envTypes), ...FIRST_RUN])]
+    .filter((name) => /_(?:SECRET|TOKEN|KEY|KEY_NEXT)$/.test(name));
+  assert.ok(names.length, 'No secret names to check');
+  for (const name of names) {
+    assert.ok(regex.test(`${name}=${'x'.repeat(16)}`), `Gitleaks rule onfreq-secret-assignment misses ${name}`);
+    const lower = name.toLowerCase();
+    assert.ok(Array.isArray(keywords) && keywords.some((keyword) => typeof keyword === 'string' && keyword && lower.includes(keyword)),
+      `Gitleaks rule onfreq-secret-assignment has no keyword for ${name}`);
+  }
+}
+
 /** The secret-name comment in wrangler.jsonc lists exactly the optional and first-run secrets. */
 export function validateWranglerSecretNames(text, envTypes) {
   const lines = text.split('\n').filter((line) => /^ {2}\/\/ {3}[A-Z]/.test(line));
@@ -230,6 +263,7 @@ if (isMain(import.meta.url)) {
     validateTestBindings(readIndexed('vitest.config.ts').toString(), envTypes);
     validateWranglerSecretNames(readIndexed('wrangler.jsonc').toString(), envTypes);
     validateGitleaksConfig(readIndexed('.gitleaks.toml').toString());
+    validateSecretRule(readIndexed('.gitleaks.toml').toString(), envTypes);
     testDeployGuard(readIndexed('scripts/check-deploy.mjs'), pkg.scripts.deploy);
     console.log('Deployment setup checks passed');
   } catch {

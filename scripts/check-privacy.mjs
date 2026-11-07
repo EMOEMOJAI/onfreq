@@ -8,7 +8,10 @@ export function privatePath(file) {
     // Any .envrc or .envrc.* path segment, as .gitignore ignores, except a file named exactly .envrc.example.
     file.split('/').some((part, index, parts) => /^\.envrc(?:\..*)?$/.test(part) &&
       !(index === parts.length - 1 && part === '.envrc.example')) ||
-    /(?:\.local\.(?:sh|jsonc?|md)|\.(?:pem|key|p12|pfx|log)|-secret(?:\.txt)?)$/i.test(name) ||
+    // Any path segment holding .local. in any case (x.local.sh, x.LOCAL.txt.bak,
+    // x.local.d/f), as .gitignore ignores *.[lL][oO][cC][aA][lL].*.
+    file.split('/').some((part) => /\.local\./i.test(part)) ||
+    /(?:\.(?:pem|key|p12|pfx|log)|-secret(?:\.txt)?)$/i.test(name) ||
     /^(?:secrets\.json|poll-secret|poll-endpoint|settings\.local\.json|gitleaks-report\..*)$/.test(name) ||
     /^(?:wrangler\.local\..*|\.npmrc|\.DS_Store)$/.test(name) ||
     /^docs\/pr-audit-[^/]*\.md$/.test(file) ||
