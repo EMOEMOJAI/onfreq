@@ -2820,3 +2820,218 @@ describe('polling through the Durable Object', () => {
     expect(network).not.toHaveBeenCalled();
   });
 });
+
+describe('R233 slice B: public delivery under a bot-token outage and the poll time budget', () => {
+  const channel = '900000000000000001';
+  const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
+    ...env, DISCORD_CHANNEL_IDS: channel, DISCORD_BOT_TOKEN: BOT_TOKEN,
+  }).poll());
+  const discordCalls = () => network.mock.calls.filter(([input]) => String(input).startsWith('https://discord.com/')).length;
+  const lookups = () => network.mock.calls.filter(([input]) => String(input).includes('/messages?after=')).length;
+  /** Discord rejects the bot token (401) for requests whose method this matches. */
+  let rejectToken: (method: string) => boolean;
+  /** Mocked milliseconds each Discord request takes. */
+  let discordLatency: number;
+  /** Mocked milliseconds the division feed fetch takes. */
+  let feedLatency: number;
+  /** Channel scans (recovery lookups) return no messages. */
+  let emptyScans: boolean;
+
+  beforeEach(() => {
+    rejectToken = () => false;
+    discordLatency = 0;
+    feedLatency = 0;
+    emptyScans = false;
+    const original = network.getMockImplementation()!;
+    network.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === IVAO_ATC_SUMMARY_URL) now += feedLatency;
+      if (!url.startsWith('https://discord.com/')) return original(input, init);
+      now += discordLatency;
+      if (rejectToken(init?.method ?? 'GET')) return Response.json({ message: '401: Unauthorized', code: 0 }, { status: 401 });
+      if (emptyScans && (init?.method ?? 'GET') === 'GET' && url.includes('/messages?after=')) return Response.json([]);
+      return original(input, init);
+    });
+  });
+
+  function closeout(callsign: string, extra: Partial<PendingOffline> = {}): PendingOffline {
+    return {
+      event: { ...session(callsign), endedAt: new Date(START - 60_000).toISOString(), durationSeconds: 3600 },
+      messages: [{ channelId: channel, messageId: mid(callsign) }], channelIds: [], ...extra,
+    };
+  }
+
+  async function seedSnapshot(value: PollSnapshot): Promise<void> {
+    await runInDurableObject(stub(), async (_, ctx) => { await ctx.storage.put(POLL_SNAPSHOT_KEY, value); });
+  }
+
+  it('D1: never charges or abandons closeouts during a long 401 outage, sends one request per poll, then delivers', async () => {
+    await seedSnapshot({ state: {}, pendingOffline: [closeout('QGLL_TWR'), closeout('QHEL_TWR')] });
+    feed = [entry(a)];
+    rejectToken = () => true;
+    for (let i = 0; i < 12; i++) {
+      const before = discordCalls();
+      await expect(run()).rejects.toThrow('all Discord notifications failed');
+      // The first request is refused; the rest of the poll's delivery is deferred unsent.
+      expect(discordCalls() - before).toBe(1);
+      now += 60_000;
+    }
+    const stored = (await snapshot())!;
+    expect(stored.pendingOffline?.map((job) => [job.event.callsign, job.attemptsByChannel]))
+      .toEqual([['QGLL_TWR', { [channel]: 0 }], ['QHEL_TWR', { [channel]: 0 }]]);
+    expect(stored.state?.[a]).toMatchObject({ pendingChannelIds: [channel], onlineAttemptsByChannel: { [channel]: 0 } });
+    expect(stored.state?.[a]?.uncertainPosts).toBeUndefined();
+
+    rejectToken = () => false;
+    await expect(run()).resolves.toEqual({ skipped: false });
+    expect(cards.get(mid('QGLL_TWR'))?.title).toContain('OFFLINE');
+    expect(cards.get(mid('QHEL_TWR'))?.title).toContain('OFFLINE');
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    expect((await snapshot())?.state?.[a]?.messages).toHaveLength(1);
+  });
+
+  it('D1: never abandons a first card refused with a 401 for more polls than its budget, then posts it', async () => {
+    await seed({});
+    feed = [entry(a)];
+    rejectToken = () => true;
+    for (let i = 0; i < 12; i++) {
+      await expect(run()).rejects.toThrow('all Discord notifications failed');
+      now += 60_000;
+    }
+    expect(discordCalls()).toBe(12);
+    const state = (await snapshot())!.state!;
+    expect(state[a]).toMatchObject({ pendingChannelIds: [channel], onlineAttemptsByChannel: { [channel]: 0 } });
+    expect(state[a]?.uncertainPosts).toBeUndefined();
+    rejectToken = () => false;
+    await expect(run()).resolves.toEqual({ skipped: false });
+    expect(sent.filter((item) => item.method === 'POST' && item.embed.title?.includes(`${a} is now ONLINE`))).toHaveLength(1);
+    expect((await snapshot())?.state?.[a]?.pendingChannelIds).toBeUndefined();
+  });
+
+  it('D1: records no maybe-posted window for a first card refused with a 401, so its end re-posts nothing', async () => {
+    await seed({});
+    feed = [entry(a)];
+    rejectToken = () => true;
+    await expect(run()).rejects.toThrow('all Discord notifications failed');
+    expect(discordCalls()).toBe(1);
+    expect((await snapshot())?.state?.[a]?.uncertainPosts).toBeUndefined();
+    // The session ends and the token works again.
+    feed = [];
+    rejectToken = () => false;
+    for (let i = 0; i < 4; i++) {
+      now += 60_000;
+      await expect(run()).resolves.toEqual({ skipped: false });
+    }
+    expect((await snapshot())?.state?.[a]).toBeUndefined();
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+    // No recovery lookup, no ONLINE re-post, and no fallback OFFLINE notice.
+    expect(lookups()).toBe(0);
+    expect(sent).toEqual([]);
+  });
+
+  it('D1: never charges or abandons a roster page refused with a 401 and leaves no maybe-posted window', async () => {
+    const many = Array.from({ length: 120 }, (_, i) => {
+      const atc = entry(`QE${String(i).padStart(3, '0')}_TWR`);
+      atc.atcPosition!.atcCallsign = 'Regional Approach Area';
+      return atc;
+    });
+    feed = [entry(a), entry(b), ...many];
+    const state: StateMap = { [a]: session(a, START - 30_000), [b]: session(b) };
+    for (const atc of many) state[atc.callsign] = { ...session(atc.callsign), messages: [] };
+    await seed(state);
+    // The cards are brought up to date; only the continuation page's POST is refused.
+    rejectToken = (method) => method === 'POST';
+    await expect(run()).rejects.toThrow('some Discord roster updates failed');
+    rejectToken = () => true;
+    for (let i = 0; i < 11; i++) {
+      now += 60_000;
+      const before = discordCalls();
+      await expect(run()).rejects.toThrow('some Discord roster updates failed');
+      expect(discordCalls() - before).toBe(1);
+    }
+    const stored = (await snapshot())!;
+    expect(stored.rosterMessages ?? []).toEqual([]);
+    expect(stored.rosterPostAttempts).toEqual([{
+      channelId: channel, parentMessageId: mid(a), page: 0, attempts: 0, nonceKey: expect.any(String),
+    }]);
+    rejectToken = () => false;
+    now += 60_000;
+    await expect(run()).resolves.toEqual({ skipped: false });
+    expect((await snapshot())?.rosterMessages).toHaveLength(1);
+    expect((await snapshot())?.rosterPostAttempts ?? []).toEqual([]);
+  });
+
+  it.each([
+    // Delivery starts 20 s into the poll: it may run to 45 s after the poll start.
+    { feedMs: 20_000, requests: 2 },
+    // Delivery starts 40 s into the poll: it still gets 15 s.
+    { feedMs: 40_000, requests: 1 },
+  ])('D2: counts the 45 s delivery budget from the poll start, with at least 15 s for delivery ($feedMs ms feed)',
+    async ({ feedMs, requests }) => {
+      const callsigns = ['QGLL_TWR', 'QHEL_TWR', 'QIST_TWR', 'QJFK_TWR'];
+      await seedSnapshot({ state: {}, pendingOffline: callsigns.map((callsign) => closeout(callsign)) });
+      feedLatency = feedMs;
+      // Each request takes 12 s and must be able to finish (10 s) by the deadline.
+      discordLatency = 12_000;
+      await expect(run()).rejects.toThrow('some Discord notifications failed');
+      expect(discordCalls()).toBe(requests);
+      const pending = (await snapshot())!.pendingOffline!;
+      expect(pending.map((job) => job.event.callsign)).toEqual(callsigns.slice(requests));
+      expect(pending.every((job) => Object.values(job.attemptsByChannel ?? {}).every((used) => used === 0))).toBe(true);
+    });
+
+  it('D4: keeps an online-card edit and a recovery lookup deferred by the time budget, charging neither', async () => {
+    const window = { from: START - 120_000, to: START - 60_000 };
+    const recovering = closeout('QKEF_TWR', { messages: [], recoverPosts: { [channel]: window } });
+    await seedSnapshot({
+      state: { [a]: session(a) },
+      pendingOffline: [closeout('QGLL_TWR'), closeout('QHEL_TWR'), closeout('QIST_TWR'), recovering],
+    });
+    feed = [entry(a)];
+    emptyScans = true;
+    // Three 12 s closeout edits use the 45 s budget: the lookup and the card edit wait.
+    discordLatency = 12_000;
+    await expect(run()).rejects.toThrow('some Discord notifications failed');
+    expect(discordCalls()).toBe(3);
+    expect(lookups()).toBe(0);
+    let stored = (await snapshot())!;
+    expect(stored.pendingOffline).toEqual([{ ...recovering, attemptsByChannel: { [channel]: 0 }, attempts: 0 }]);
+    // The card keeps its reference, unchanged and not marked rejected or uncertain.
+    expect(stored.state?.[a]?.messages).toEqual([{ channelId: channel, messageId: mid(a) }]);
+    expect(stored.state?.[a]?.uncertainPosts).toBeUndefined();
+
+    discordLatency = 0;
+    now += 60_000;
+    await expect(run()).resolves.toEqual({ skipped: false });
+    expect(lookups()).toBe(1);
+    stored = (await snapshot())!;
+    expect(stored.pendingOffline).toBeUndefined();
+    expect(stored.state?.[a]?.messages?.[0]?.onlineEmbed).toBeDefined();
+    expect(cards.get(mid(a))?.title).toContain(`${a} is now ONLINE`);
+    const repost = sent.find((item) => item.method === 'POST')!;
+    expect(cards.get(repost.id!)?.title).toContain('QKEF_TWR is OFFLINE');
+  });
+
+  it('D5: re-posts a card for recovery only with room left to close it in the same poll', async () => {
+    const window = { from: START - 120_000, to: START - 60_000 };
+    const recovering = closeout('QKEF_TWR', { messages: [], recoverPosts: { [channel]: window } });
+    await seedSnapshot({ state: {}, pendingOffline: [closeout('QGLL_TWR'), recovering] });
+    emptyScans = true;
+    // The closeout edit (0-15 s) and the lookup (15-30 s) fit; a re-post at 30 s
+    // could finish (by 40 s), but its closing edit could not (by 50 s > 45 s).
+    discordLatency = 15_000;
+    await expect(run()).rejects.toThrow('some Discord notifications failed');
+    expect(lookups()).toBe(1);
+    expect(sent.filter((item) => item.method === 'POST')).toEqual([]);
+    expect([...cards.values()].some((card) => card.title?.includes('QKEF_TWR is now ONLINE'))).toBe(false);
+    expect((await snapshot())?.pendingOffline).toEqual([{ ...recovering, attemptsByChannel: { [channel]: 0 }, attempts: 0 }]);
+
+    discordLatency = 0;
+    now += 60_000;
+    await expect(run()).resolves.toEqual({ skipped: false });
+    const posts = sent.filter((item) => item.method === 'POST');
+    expect(posts).toHaveLength(1);
+    expect(cards.get(posts[0]!.id!)?.title).toContain('QKEF_TWR is OFFLINE');
+    expect((await snapshot())?.pendingOffline).toBeUndefined();
+  });
+});

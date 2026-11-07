@@ -416,15 +416,27 @@ export class DiscordApiError extends Error {
 }
 
 /**
- * A definite Discord-side rejection (a 4xx `DiscordApiError`; a 429 throws a
- * `DiscordRateLimitError` instead) counts against a bounded retry budget.
- * A 5xx (a `DiscordApiError` with status 500 or above), a timeout/network
- * error, or a rate-limit deferral is transient and retried indefinitely.
- * Shared by the online first-card budget, the offline closeout budget, and
- * the roster page budgets so they agree on what "permanent" means.
+ * Discord rejected the bot token itself (a 401): nothing was posted, edited or
+ * deleted, and no destination is at fault. Every request needs the same
+ * token, so it is an outage of all delivery until the token works again.
+ */
+export function isUnauthorized(err: unknown): boolean {
+  return err instanceof DiscordApiError && err.status === 401;
+}
+
+/**
+ * A definite Discord-side rejection of one destination (a 4xx
+ * `DiscordApiError`; a 429 throws a `DiscordRateLimitError` instead) counts
+ * against a bounded retry budget. A 5xx (a `DiscordApiError` with status 500
+ * or above), a timeout/network error, or a rate-limit deferral is transient
+ * and retried indefinitely. A 401 (`isUnauthorized`) is a definite "not
+ * posted" too, but says nothing about the destination: it is never charged,
+ * so a bot-token outage cannot abandon anything. Shared by the online
+ * first-card budget, the offline closeout budget, and the roster page budgets
+ * so they agree on what "permanent" means.
  */
 export function countsAgainstBudget(err: unknown): boolean {
-  return err instanceof DiscordApiError && err.status >= 400 && err.status <= 499;
+  return err instanceof DiscordApiError && err.status >= 400 && err.status <= 499 && !isUnauthorized(err);
 }
 
 /**
@@ -488,6 +500,13 @@ const MAX_ATTEMPTS = 4;
 
 /** How long later calls in the same poll fail fast after a request exhausts its 5xx retries. */
 const OUTAGE_COOLDOWN_MS = 30_000;
+/**
+ * How long later calls fail fast after Discord rejects the bot token (a 401).
+ * Longer than a poll's whole public delivery budget, so the rest of that
+ * delivery sends no further requests; in memory only, so the next poll (a
+ * new rate-limit instance) tries the token again.
+ */
+const UNAUTHORIZED_COOLDOWN_MS = 60_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -568,6 +587,9 @@ async function discordRequest(
         // 5xx/timeout before an outage is declared.
         if (method !== 'POST' || limits.notePostFailure()) limits.markOutage(OUTAGE_COOLDOWN_MS);
       }
+      // A rejected bot token fails every later request the same way: defer
+      // them all (not sent, not charged) instead of spending a subrequest on each.
+      if (status === 401) limits.markOutage(UNAUTHORIZED_COOLDOWN_MS);
       throw new DiscordApiError(status, body);
     }
     const backoff = 500 * 2 ** (attempt - 1);

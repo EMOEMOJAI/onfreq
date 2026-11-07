@@ -78,7 +78,30 @@ export function loadSessions(stored: StateMap): StateMap {
   if (valid.length < entries.length) {
     console.error(JSON.stringify({ event: 'sessions_dropped', reason: 'invalid', count: entries.length - valid.length }));
   }
-  return Object.fromEntries(valid.map(([callsign, session]) => [callsign, stripLegacyRoster(session)]));
+  return Object.fromEntries(valid.map(([callsign, session]) =>
+    [callsign, sanitizeOnlineAttempts(stripLegacyRoster(session))]));
+}
+
+/** A stored retry counter: a whole, non-negative number. */
+const isAttemptCount: Guard<number> = (value): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+
+/**
+ * Keep only valid first-card retry counters. An invalid one (NaN, negative,
+ * fractional, or a string such as '3') would make the budget check abandon
+ * its destination at the next rejection, or store a string count; it is
+ * dropped (that destination's budget restarts) and the session is kept.
+ * Logged by count only.
+ */
+function sanitizeOnlineAttempts(session: TrackedAtc): TrackedAtc {
+  const stored: unknown = session.onlineAttemptsByChannel;
+  if (stored === undefined) return session;
+  const entries = isRecord(stored) ? Object.entries(stored) : [];
+  const valid = entries.filter(([, used]) => isAttemptCount(used)) as [string, number][];
+  const dropped = isRecord(stored) ? entries.length - valid.length : 1;
+  if (!dropped) return session;
+  console.error(JSON.stringify({ event: 'online_attempts_dropped', reason: 'invalid', count: dropped }));
+  const { onlineAttemptsByChannel: _invalid, ...rest } = session;
+  return valid.length ? { ...rest, onlineAttemptsByChannel: Object.fromEntries(valid) } : rest;
 }
 
 /**

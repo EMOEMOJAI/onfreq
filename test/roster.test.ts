@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { findBotReplies } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
 import { syncRosterMessages } from '../src/roster';
-import type { RosterPostAttempt } from '../src/types';
+import type { RosterMessage, RosterPostAttempt } from '../src/types';
 import { BOT_ID, BOT_TOKEN as TOKEN, snowflakeAt as idAt } from './helpers';
 
 const NOW = 1_800_000_000_000;
@@ -148,4 +148,86 @@ it('logs roster failures by configured channel index, never channel or message I
   expect(logs).toContainEqual(expect.stringContaining('"event":"roster_continuation_failed","operation":"delete","channelIndex":1'));
   expect(logs).toContainEqual(expect.stringContaining('"event":"roster_orphan_sweep_failed","channelIndex":1'));
   expect(logs.filter((line) => ['100000000000000321', 'old-parent', pageId].some((id) => line.includes(id)))).toEqual([]);
+});
+
+describe('R233: roster pages under a bot-token outage or the poll time budget', () => {
+  const channelId = '100000000000000321';
+  const page = (extra: Partial<RosterMessage> = {}): RosterMessage =>
+    ({ channelId, parentMessageId: 'parent', page: 0, messageId: idAt(NOW, 1), onlineEmbed: 'stale', ...extra });
+  const unauthorized = () => Response.json({ message: '401: Unauthorized', code: 0 }, { status: 401 });
+
+  it.each(['edit', 'post', 'delete'] as const)(
+    'D1: never charges or abandons a roster %s rejected with a 401, then completes it once the token works', async (op) => {
+      let rejected = true;
+      const requests = stubDiscord((method) => rejected ? unauthorized()
+        : method === 'DELETE' ? new Response(null, { status: 204 }) : Response.json({ id: idAt(NOW, 9) }));
+      const embed = { title: 'Synthetic page 0' };
+      // A delete removes page 0 (the target has no pages); an edit replaces its
+      // stale content; a post creates a page that was never sent.
+      const target = { channelId, parentMessageId: 'parent', embeds: op === 'delete' ? [] : [embed] };
+      let messages: RosterMessage[] = op === 'post' ? [] : [page()];
+      let attempts: RosterPostAttempt[] = [];
+      // More polls than the rejection budget (REJECTION_RETRY_POLLS + 1) allows.
+      for (let poll = 0; poll < 12; poll++) {
+        const result = await syncRosterMessages(TOKEN, messages, [target], new DiscordRateLimits(), attempts);
+        expect(result.failed).toBe(true);
+        ({ messages, postAttempts: attempts } = result);
+      }
+      // One real request per poll, each refused: nothing charged or abandoned.
+      expect(requests).toHaveLength(12);
+      if (op === 'post') {
+        expect(messages).toEqual([]);
+        // No uncertain-post window either: a 401 certainly posted nothing.
+        expect(attempts).toEqual([{ channelId, parentMessageId: 'parent', page: 0, attempts: 0, nonceKey: expect.any(String) }]);
+      } else {
+        expect(messages).toEqual([page({ [op === 'delete' ? 'deleteAttempts' : 'pageAttempts']: 0 })]);
+        expect(attempts).toEqual([]);
+      }
+
+      rejected = false;
+      const done = await syncRosterMessages(TOKEN, messages, [target], new DiscordRateLimits(), attempts);
+      expect(done.failed).toBe(false);
+      expect(done.postAttempts).toEqual([]);
+      expect(done.messages).toEqual({
+        edit: [page({ onlineEmbed: JSON.stringify(embed) })],
+        // A retried post leaves its content unknown: its nonce may have returned an earlier copy.
+        post: [{ channelId, parentMessageId: 'parent', page: 0, messageId: idAt(NOW, 9) }],
+        delete: [],
+      }[op]);
+      expect(requests).toHaveLength(13);
+    });
+
+  it('D1: a 401 defers every later roster request in the same poll without sending it', async () => {
+    const requests = stubDiscord(() => unauthorized());
+    const result = await syncRosterMessages(TOKEN, [page({ page: 1, messageId: idAt(NOW, 2) })],
+      [{ channelId, parentMessageId: 'parent', embeds: [{ title: 'Synthetic page 0' }] }],
+      new DiscordRateLimits(), [dropped()]);
+    // Only the delete of page 1 reached Discord; the post and the orphan sweep did not.
+    expect(requests).toEqual([`DELETE /channels/${channelId}/messages/${idAt(NOW, 2)}`]);
+    expect(result.messages).toEqual([page({ page: 1, messageId: idAt(NOW, 2), deleteAttempts: 0 })]);
+    const { nonceKey: _nonceKey, ...sweepWindow } = dropped();
+    expect(result.postAttempts).toEqual([
+      { channelId, parentMessageId: 'parent', page: 0, attempts: 0, nonceKey: expect.any(String) }, sweepWindow,
+    ]);
+  });
+
+  it('D4: keeps an edit, post, delete and orphan sweep deferred by the poll time budget, charging none', async () => {
+    const requests = stubDiscord(() => Response.json({ id: idAt(NOW, 9) }));
+    const limits = new DiscordRateLimits();
+    // No request can finish in time any more.
+    limits.setDeadline(NOW);
+    const target = { channelId, parentMessageId: 'parent', embeds: [{ title: 'Synthetic page 0' }, { title: 'Synthetic page 1' }] };
+    const previous = [
+      page({ pageAttempts: 3 }),
+      page({ page: 2, messageId: idAt(NOW, 3), onlineEmbed: undefined, deleteAttempts: 4 }),
+    ];
+    const neverPosted: RosterPostAttempt = { channelId, parentMessageId: 'parent', page: 1, attempts: 5, nonceKey: 'roster:parent:1:x' };
+    const result = await syncRosterMessages(TOKEN, previous, [target], limits, [neverPosted, dropped()]);
+    expect(requests).toEqual([]);
+    expect(result.failed).toBe(true);
+    // Every counter is unchanged, nothing is abandoned, and no window is invented.
+    expect(result.messages).toEqual(previous);
+    const { nonceKey: _nonceKey, ...sweepWindow } = dropped();
+    expect(result.postAttempts).toEqual([neverPosted, sweepWindow]);
+  });
 });

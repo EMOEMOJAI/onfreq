@@ -1,6 +1,6 @@
 import {
   countsAgainstBudget, deleteMessage, DiscordApiError, DiscordUnconfirmedPostError, editMessage, findBotReplies,
-  messageNonce, postMessage, type DiscordEmbed,
+  isUnauthorized, messageNonce, postMessage, type DiscordEmbed,
 } from './discord';
 import type { RosterMessage, RosterPostAttempt } from './types';
 import { DiscordRateLimitError, type DiscordRateLimits } from './discord-rate-limit';
@@ -30,10 +30,14 @@ export function nextBudget(previous: number, err: unknown, charge = true): { use
   return { used, keep: !counts || used <= REJECTION_RETRY_POLLS };
 }
 
-/** A failed POST that may still have created its message (a 5xx, a timeout, or a 2xx without an id). */
+/**
+ * A failed POST that may still have created its message (a 5xx, a timeout, or
+ * a 2xx without an id). A 401 is a definite "not posted", like any other 4xx,
+ * even though it is not charged to a budget.
+ */
 export function mayHavePosted(err: unknown): boolean {
   return err instanceof DiscordUnconfirmedPostError ||
-    (!(err instanceof DiscordRateLimitError) && !countsAgainstBudget(err));
+    (!(err instanceof DiscordRateLimitError) && !countsAgainstBudget(err) && !isUnauthorized(err));
 }
 
 function markMaybePosted(entry: RosterPostAttempt, previous: RosterPostAttempt | undefined, err: unknown): RosterPostAttempt {
@@ -223,8 +227,9 @@ export async function syncRosterMessages(
     }
   }
   // Remove this bot's untracked replies to parents no longer shown. A
-  // transient failure keeps the markers for the next poll; a 4xx (such as a
-  // missing Read Message History permission) gives up.
+  // transient failure or a 401 (bot token rejected) keeps the markers for the
+  // next poll; any other 4xx (such as a missing Read Message History
+  // permission) gives up.
   const tracked = new Set(messages.map((ref) => ref.messageId));
   for (const entries of orphans.values()) {
     const { channelId, parentMessageId } = entries[0]!;

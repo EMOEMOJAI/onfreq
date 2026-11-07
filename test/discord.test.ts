@@ -20,6 +20,7 @@ import {
   formatDuration,
   formatFrequency,
   isSnowflake,
+  isUnauthorized,
   messageNonce,
   parseChannelIds,
   postMessage,
@@ -27,6 +28,7 @@ import {
   SNOWFLAKE_PATTERN,
 } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
+import { mayHavePosted, nextBudget } from '../src/roster';
 import type { OfflineEvent, OnlineAtc, TrackedAtc } from '../src/types';
 import { BOT_ID, BOT_TOKEN, snowflakeAt } from './helpers';
 
@@ -960,6 +962,42 @@ describe('REST calls', () => {
     await expect(findBotMessages(token, '100000000000000123', { from: at, to: at }, new DiscordRateLimits(), () => true))
       .resolves.toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(21);
+  });
+
+  it('R233 D1: a 401 is a definite non-delivery that is never charged, and defers the rest of the poll unsent', async () => {
+    const unauthorized = () => Response.json({ message: '401: Unauthorized', code: 0 }, { status: 401 });
+    const fetchMock = stubFetch(unauthorized());
+    const limits = new DiscordRateLimits();
+    const err = await postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, limits)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DiscordApiError);
+    expect(err).toMatchObject({ status: 401 });
+    expect(isUnauthorized(err)).toBe(true);
+    // Not charged to any retry budget, and not a POST that may have landed unseen.
+    expect(countsAgainstBudget(err)).toBe(false);
+    expect(nextBudget(3, err)).toEqual({ used: 3, keep: true });
+    expect(mayHavePosted(err)).toBe(false);
+    // Every later request with these limits is deferred without a subrequest.
+    const deferred = { status: 429, requestMade: false, reason: 'outage' };
+    await expect(editMessage('token', '100000000000000123', '100000000000000999', { title: 'Synthetic' }, limits))
+      .rejects.toMatchObject(deferred);
+    await expect(deleteMessage('token', '100000000000000123', '100000000000000999', limits)).rejects.toMatchObject(deferred);
+    await expect(findBotMessages(BOT_TOKEN, '100000000000000456', { from: 1_800_000_000_000, to: 1_800_000_000_000 },
+      limits, () => true)).rejects.toMatchObject(deferred);
+    await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, limits))
+      .rejects.toMatchObject(deferred);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Any other 4xx stays a charged rejection of that destination only.
+    const forbidden = stubFetch(Response.json({ code: 50013 }, { status: 403 }), Response.json({ id: '100000000000000999' }));
+    const fresh = new DiscordRateLimits();
+    const rejected = await postMessage('token', '100000000000000123', { title: 'Synthetic' }, undefined, undefined, fresh)
+      .catch((e: unknown) => e);
+    expect(isUnauthorized(rejected)).toBe(false);
+    expect(countsAgainstBudget(rejected)).toBe(true);
+    await expect(postMessage('token', '100000000000000456', { title: 'Synthetic' }, undefined, undefined, fresh))
+      .resolves.toBe('100000000000000999');
+    expect(forbidden).toHaveBeenCalledTimes(2);
   });
 
   it('does not shrink a channel scan page for a failure other than an oversized response', async () => {

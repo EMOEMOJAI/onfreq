@@ -360,6 +360,38 @@ describe('loading stored state', () => {
     vi.restoreAllMocks();
   });
 
+  it('R233 D3: drops invalid first-card retry counters on load but keeps the session', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pending = { pendingChannelIds: ['900000000000000001', '900000000000000002'] };
+    const stored = {
+      QCTT_TWR: tracked('QCTT_TWR', { ...pending, onlineAttemptsByChannel: {
+        '900000000000000001': Number.NaN, '900000000000000002': '3', '900000000000000003': 2,
+        '900000000000000004': -1, '900000000000000005': 1.5, '900000000000000006': Number.POSITIVE_INFINITY,
+        '900000000000000007': null, '900000000000000008': 0,
+      } as unknown as Record<string, number> }),
+      // Every counter invalid: the field goes, the session stays.
+      QESS_APP: tracked('QESS_APP', { ...pending,
+        onlineAttemptsByChannel: { '900000000000000001': Number.NaN } }),
+      // Not a record at all.
+      QFRA_TWR: tracked('QFRA_TWR', { ...pending, onlineAttemptsByChannel: [3] as unknown as Record<string, number> }),
+      QGLL_TWR: tracked('QGLL_TWR', { ...pending, onlineAttemptsByChannel: { '900000000000000001': 4 } }),
+    } as StateMap;
+    expect(loadSessions(stored)).toEqual({
+      QCTT_TWR: tracked('QCTT_TWR', { ...pending,
+        onlineAttemptsByChannel: { '900000000000000003': 2, '900000000000000008': 0 } }),
+      QESS_APP: tracked('QESS_APP', pending),
+      QFRA_TWR: tracked('QFRA_TWR', pending),
+      QGLL_TWR: tracked('QGLL_TWR', { ...pending, onlineAttemptsByChannel: { '900000000000000001': 4 } }),
+    });
+    expect(error.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      { event: 'online_attempts_dropped', reason: 'invalid', count: 6 },
+      { event: 'online_attempts_dropped', reason: 'invalid', count: 1 },
+      { event: 'online_attempts_dropped', reason: 'invalid', count: 1 },
+    ]);
+    expect(error.mock.calls.flat().join('')).not.toMatch(/9000/);
+    vi.restoreAllMocks();
+  });
+
   it('accepts a legacy session with neither messages nor pending markers', () => {
     const legacy = { QCTT_TWR: tracked('QCTT_TWR', { station: null, location: null }) };
     expect(loadSessions(legacy)).toEqual(legacy);

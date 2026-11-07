@@ -40,6 +40,7 @@ import {
 } from './short-session';
 import { channelIndex, mayHavePosted, nextBudget, syncRosterMessages, type RosterTarget } from './roster';
 import { DiscordRateLimitError, DiscordRateLimits, trackPosts } from './discord-rate-limit';
+import { REQUEST_TIMEOUT_MS } from './http';
 import type {
   OfflineEvent, PendingOffline, OnlineAtc, PostedMessage, PostWindow, RosterMessage, RosterPostAttempt, StateMap,
   TrackedAtc,
@@ -63,11 +64,27 @@ const MAX_OFFLINE_JOBS = 200;
  */
 const MAX_NEW_SESSIONS_PER_POLL = 50;
 /**
- * How long public delivery (closeouts, first cards, edits, roster pages) may
- * keep sending requests in one poll. Requests after it are deferred to the
- * next poll without being sent or charged to any retry budget.
+ * How long after the poll starts public delivery (closeouts, first cards,
+ * edits, roster pages) may keep sending requests. Requests after it are
+ * deferred to the next poll without being sent or charged to any retry budget.
  */
 export const PUBLIC_DELIVERY_BUDGET_MS = 45_000;
+/**
+ * Public delivery always gets at least this long, however much of the poll
+ * budget the feed, profile and GCA steps before it used, so it still makes
+ * progress on a slow poll.
+ */
+export const MIN_PUBLIC_DELIVERY_MS = 15_000;
+
+/**
+ * The public delivery deadline: PUBLIC_DELIVERY_BUDGET_MS after the poll
+ * started (and never more than that after delivery starts), but at least
+ * MIN_PUBLIC_DELIVERY_MS after delivery starts.
+ */
+export function publicDeliveryDeadline(pollStartMs: number, deliveryStartMs: number): number {
+  return Math.max(deliveryStartMs + MIN_PUBLIC_DELIVERY_MS,
+    Math.min(pollStartMs + PUBLIC_DELIVERY_BUDGET_MS, deliveryStartMs + PUBLIC_DELIVERY_BUDGET_MS));
+}
 
 /** Closeout destinations in channels removed from DISCORD_CHANNEL_IDS, kept untouched. */
 interface ParkedDestinations {
@@ -432,7 +449,8 @@ async function announceOffline(
             // Every first card carries its session's start time.
             Date.parse(message.embeds[0].timestamp ?? '') === Date.parse(job.event.since));
       } catch (err) {
-        // Without message history access (a 4xx), a channel without a tracked
+        // Without message history access (a 4xx; a 401 is thrown on, as a
+        // token outage, and retried next poll), a channel without a tracked
         // card falls back to the re-post below; one with a tracked card has
         // nothing more to try.
         if (!countsAgainstBudget(err)) throw err;
@@ -445,6 +463,10 @@ async function announceOffline(
         continue;
       }
       if (!found.length) {
+        // The re-post is useful only if the closing edit below can follow it
+        // this poll: without room for both, a fresh ONLINE card would stay up
+        // for an ended session until the next poll. Deferred, not charged.
+        if (!limits.canStartBy(REQUEST_TIMEOUT_MS)) throw limits.deadlineDeferral();
         found = [await postMessage(env.DISCORD_BOT_TOKEN, channelId,
           buildOnlineEmbed(job.event, undefined, labels), undefined, undefined, limits, onlineNonce(job.event, channelId))];
       }
@@ -657,9 +679,10 @@ function recordFirstCardOutcome(
   // A destination that keeps failing to receive the first card is dropped
   // after the same retry budget as an offline closeout's fallback post
   // (which likewise has no message to discover "gone"). Only a definite
-  // Discord-side rejection (4xx, excluding the 429 rate-limit deferral)
-  // counts towards that budget; a 5xx outage, a timeout/network error, or
-  // a rate-limit deferral is transient and retried indefinitely instead.
+  // Discord-side rejection (4xx, excluding the 429 rate-limit deferral and a
+  // 401 bot-token rejection) counts towards that budget; a 5xx outage, a
+  // timeout/network error, or a rate-limit deferral is transient and retried
+  // indefinitely instead.
   // Rebuilt from `targets` only (not copied wholesale) so a destination
   // that fell out of `targets` (channel removed, or its card finally
   // landed) never leaves a stale counter behind.
@@ -739,6 +762,9 @@ export async function runPoll(
   env: Env, stored: StateMap | null, nowIso: string, options: RunPollOptions = {},
 ): Promise<PollOutcome> {
   const { storage } = options;
+  // The poll start for the public delivery budget: measured here, on the same
+  // clock as the request checks, rather than parsed from `nowIso`.
+  const pollStartMs = Date.now();
   const channelIds = [...new Set(parseChannelIds(env.DISCORD_CHANNEL_IDS))];
   if (!channelIds.length || !env.DISCORD_BOT_TOKEN?.trim()) {
     throw new Error('Discord bot token and notification channels are required');
@@ -889,10 +915,14 @@ export async function runPoll(
     newlyOnline = [];
   }
 
-  // Public delivery gets a time budget so a slow Discord cannot stretch one poll
-  // past the next cron. GCA (own budget) ran above and short-session runs after
-  // the snapshot is saved on this same instance, so both stay unbounded.
-  limits.setDeadline(Date.now() + PUBLIC_DELIVERY_BUDGET_MS);
+  // Public delivery gets a time budget counted from the poll start, so a slow
+  // Discord cannot stretch one poll much past 45 s: every request must be able
+  // to finish by the deadline. When the steps above (feed, member profiles,
+  // GCA's own 25 s budget) used more than 30 s, delivery still gets 15 s, so
+  // the poll can run to that point instead. GCA ran above and short-session
+  // runs after the snapshot is saved on this same instance, each with its own
+  // budget, so neither is bounded by this deadline.
+  limits.setDeadline(publicDeliveryDeadline(pollStartMs, Date.now()));
   try {
     // Close out sessions that ended before announcing any that just started,
     // so a callsign that goes offline and a replacement taking it over the
