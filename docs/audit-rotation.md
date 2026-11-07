@@ -39,13 +39,13 @@ Each of these changes makes the named chunk due at once, whatever its date:
 
 ## Next up
 
-**T1-1**: HTTP surface and bearer auth (quarterly, due 2027-01-18)
+**T1-4**: GCA reminders and member data (due now: `src/gca.ts` changed with the GCA records release)
 
 ## Tier 1 (quarterly; due 2027-01-18)
 
 | ID | Chunk | Paths | Focus | Baseline | Last pass | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| T1-1 | HTTP surface and bearer auth | `src/index.ts`, `src/auth.ts`, `src/http.ts` | Route auth and secret separation, fixed error bodies, no-store, bounded upstream reads, no redirects | 04af6c6 | 2026-10-18 | clean |
+| T1-1 | HTTP surface and bearer auth | `src/index.ts`, `src/auth.ts`, `src/http.ts`, `src/gca-records-http.ts` | Route auth and secret separation, fixed error bodies, no-store, bounded upstream reads, no redirects | 5215d11 | 2026-11-07 | clean |
 | T1-2 | IVAO webhook | `src/webhook.ts` | HMAC verification order, replay cache, body cap, no Durable Object call before verification, log privacy | 08d76ed | 2026-10-18 | clean |
 | T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | b0bcc2a | 2026-10-19 | clean |
 | T1-4 | GCA reminders and member data | `src/gca.ts`, `src/retention.ts` | Policy parsing fails closed, DM reservations and dedup ledgers, history privacy, cleanup vs polling | b0bcc2a | 2026-10-19 | clean |
@@ -147,6 +147,8 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-10-23 | T3-2 | P3 | Real-Gitleaks hook tests split into four files run in parallel with a shared helper module, same tests and assertions; local script tests 136 s to 33 s (the macOS CI job had reached 9 of 20 minutes) | 69c533f |
 | 2026-10-23 | T3-2 | P4 | A test covers the GCA fallback that loads rate limits with the public channel set and the keyed hash | e5d3289 |
 | 2026-11-07 | T1-1, T1-4 | - | New: signed `/gca/records` routes let the division website publish GCA approvals and home overrides into the coordinator (HMAC with a derived key id, single-use nonces and write limits in the Durable Object, strict validation, versioned history pruned to 30 days and 20 versions, operator delete); the stored record replaces the two secrets once it exists. Pre-plan security review, three plan-check rounds, owner approval, shared vectors matched by the website | 39b5997, 2ec2b8d, 50f1e10 |
+| 2026-11-07 | T1-1 | P3 | Fixed: the docs said a GCA key equal to another secret disables the signed routes but not which secret to replace; replacing only the other secret would re-enable the routes with a key its holders already have. Now: replace the GCA key; the webhook secret's distinct-from list names the GCA keys | docs |
+| 2026-11-07 | T1-1 | P4 | Accepted: a webhook secret equal to a GCA key disables the signed routes but not the webhook (the write side fails closed); unknown key ids answer faster than bad signatures (public 64-bit id); 503 before 401 reveals only whether the routes are configured; rejection logs are once per reason per isolate. Deferred: bearer routes do not refuse a secret equal to `IVAO_CLIENT_SECRET` or `DISCORD_BOT_TOKEN` (not new); the coordinator does not re-check the timestamp window (the Worker does); whether Cloudflare's own request logs keep the signing headers (replay-safe either way) | - |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
