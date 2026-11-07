@@ -165,4 +165,3 @@ All are development-only; the Worker bundle does not include them. Remove one on
 | Package | Minimum | Reason |
 | --- | --- | --- |
 | `katex` | 0.18.2 | GHSA-238p-pmpm-9mq7 (low), via markdownlint math support |
-| `re2js` | 2.9.1 | GHSA-gg6h-894w-4m9c (high, quadratic lookbehind), via markdownlint 0.42.0; no fixed markdownlint release yet |

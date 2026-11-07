@@ -27,14 +27,13 @@
     "github-slugger": "2.0.0",
     "jsonc-parser": "3.3.1",
     "markdown-it": "15.0.3",
-    "markdownlint": "0.42.0",
+    "markdownlint": "0.42.1",
     "typescript": "7.0.2",
-    "vitest": "5.0.5",
+    "vitest": "5.1.0",
     "wrangler": "4.158.0"
   },
   "overrides": {
-    "katex": "^0.18.2",
-    "re2js": "^2.9.1"
+    "katex": "^0.18.2"
   },
   "repository": {
     "type": "git",

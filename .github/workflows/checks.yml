@@ -62,7 +62,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
 
@@ -98,13 +98,19 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
 
-      - name: Install (lockfile-pinned)
-        run: npm ci
+      # Lifecycle scripts stay off: esbuild and workerd ship their binaries as
+      # optional platform packages, so typecheck, tests and the dry-run work without them.
+      - name: Install (lockfile-pinned, without lifecycle scripts)
+        run: npm ci --ignore-scripts
+
+      # Registry signatures and provenance attestations of every installed package.
+      - name: Verify registry signatures
+        run: npm audit signatures
 
       - name: Check publication privacy, deployment setup and local links
         run: npm run check:repo
@@ -143,7 +149,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
