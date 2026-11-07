@@ -39,7 +39,7 @@ Each of these changes makes the named chunk due at once, whatever its date:
 
 ## Next up
 
-**T1-5**: Secrets hygiene and privacy gates (due now: hooks, privacy checks and Gitleaks rules changed since its baseline)
+**T2-5**: CI and supply chain (due now: workflow and dependency changes since its baseline)
 
 ## Tier 1 (quarterly; due 2027-01-18)
 
@@ -49,7 +49,7 @@ Each of these changes makes the named chunk due at once, whatever its date:
 | T1-2 | IVAO webhook | `src/webhook.ts` | HMAC verification order, replay cache, body cap, no Durable Object call before verification, log privacy | 08d76ed | 2026-10-18 | clean |
 | T1-3 | IVAO API client and token cache | `src/ivao.ts`, `src/member-country.ts` | OAuth token cache and invalidation, credential exposure, feed size and shape limits | b0bcc2a | 2026-10-19 | clean |
 | T1-4 | GCA reminders and member data | `src/gca.ts`, `src/retention.ts`, `src/gca-records.ts` | Policy parsing fails closed, DM reservations and dedup ledgers, history privacy, cleanup vs polling | c06a72a | 2026-11-07 | clean |
-| T1-5 | Secrets hygiene and privacy gates | `scripts/check-privacy.mjs`, `scripts/secret-scan.sh`, `scripts/hooks/**`, `.github/actions/**`, `.gitignore`, `.gitleaks.toml`, `.dev.vars.example`, `config/**`, `src/env.d.ts` | No real IDs or secrets in history, hook coverage, optional-secret boundaries | 566364a | 2026-10-22 | clean |
+| T1-5 | Secrets hygiene and privacy gates | `scripts/check-privacy.mjs`, `scripts/secret-scan.sh`, `scripts/hooks/**`, `.github/actions/**`, `.gitignore`, `.gitleaks.toml`, `.dev.vars.example`, `config/**`, `src/env.d.ts` | No real IDs or secrets in history, hook coverage, optional-secret boundaries | 25834e6 | 2026-11-07 | clean |
 | T1-6 | Short-session reminders | `src/short-session.ts`; `src/poll.ts` and `src/coordinator.ts` call sites | Presence invariants, continuity/baseline, at-most-once and daily cap, GCA interaction, retention/purge, log privacy | 566364a | 2026-10-22 | clean |
 
 ## Tier 2 (semi-annually; due 2027-04-18)
@@ -152,6 +152,9 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-11-07 | T2-5 | P2 | CI audit red on new advisories in dev tooling (undici, zod, miniflare and wrangler via the Workers test plugin; re2js via markdownlint): `@cloudflare/vitest-plugin` 1.6.0, wrangler 4.158.0, `re2js` override 2.9.1; Worker bundle unaffected | deps |
 | 2026-11-07 | T1-4 | P3 | Fixed: stale reminder rows were pruned only while GCA reminders ran with a valid policy; the delete-only prune now runs on every poll (re-enabling still rebaselines). Docs: rollback and compromised-key runbooks turned reminders off (or restored the secrets) only after the operator delete, so a poll could use stale secrets; the order is now off first | 1241625, c06a72a |
 | 2026-11-07 | T1-4 | P4 | Fixed: at most 3 member GCA DMs per member in any 24 hours (later occurrences recorded, numbered and copied to staff with capped wording; stored as sent plus a capped marker so older versions never resend); `gca_dm_record_failed` when a delivered DM cannot be recorded; records-invalid log once per isolate while reminders are off; no digest prefix in logs; signed meta limited to 120 per hour; tests for a damaged stored version, the 64 KiB practical limit and the prune-failure log. Accepted by design: delivered, reserved, failed and capped rows are kept indefinitely for at-most-once | 1241625, c06a72a |
+| 2026-11-07 | T1-5 | P4 | Fixed: every `*.local.*` path is git-ignored and private (any path segment, any case); check:setup requires every secret-like setting name to be covered by the secret-assignment rule and its keywords; the GCA rule necessity test asserts each edit applies; callsign lists the shell joins through several quotes or blanks inside quotes next to a comma are flagged | 25834e6 |
+| 2026-11-07 | T1-1, T1-2 | P4 | Fixed: bearer routes refuse a secret equal to `IVAO_CLIENT_SECRET` or `DISCORD_BOT_TOKEN`; the coordinator re-checks the signed-request time window (360 s); the webhook refuses a secret equal to either GCA key | cb2924b |
+| 2026-11-07 | T2-5 | - | Not done: removing the `re2js` override waits for a markdownlint release that depends on re2js 2.9.1 or later (0.42.0 still pins 2.8.6) | - |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
