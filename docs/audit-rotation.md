@@ -149,6 +149,7 @@ Baseline `932364b` is `main` after the full pre-ship audit (code quality, securi
 | 2026-11-07 | T1-1, T1-4 | - | New: signed `/gca/records` routes let the division website publish GCA approvals and home overrides into the coordinator (HMAC with a derived key id, single-use nonces and write limits in the Durable Object, strict validation, versioned history pruned to 30 days and 20 versions, operator delete); the stored record replaces the two secrets once it exists. Pre-plan security review, three plan-check rounds, owner approval, shared vectors matched by the website | 39b5997, 2ec2b8d, 50f1e10 |
 | 2026-11-07 | T1-1 | P3 | Fixed: the docs said a GCA key equal to another secret disables the signed routes but not which secret to replace; replacing only the other secret would re-enable the routes with a key its holders already have. Now: replace the GCA key; the webhook secret's distinct-from list names the GCA keys | docs |
 | 2026-11-07 | T1-1 | P4 | Accepted: a webhook secret equal to a GCA key disables the signed routes but not the webhook (the write side fails closed); unknown key ids answer faster than bad signatures (public 64-bit id); 503 before 401 reveals only whether the routes are configured; rejection logs are once per reason per isolate. Deferred: bearer routes do not refuse a secret equal to `IVAO_CLIENT_SECRET` or `DISCORD_BOT_TOKEN` (not new); the coordinator does not re-check the timestamp window (the Worker does); whether Cloudflare's own request logs keep the signing headers (replay-safe either way) | - |
+| 2026-11-07 | T2-5 | P2 | CI audit red on new advisories in dev tooling (undici, zod, miniflare and wrangler via the Workers test plugin; re2js via markdownlint): `@cloudflare/vitest-plugin` 1.6.0, wrangler 4.158.0, `re2js` override 2.9.1; Worker bundle unaffected | deps |
 
 Accepted: pushed changes to `scripts/` or `.github/` are not separately noted (reviewed as code). Rejected: CI warning or re-scan with the previous Gitleaks settings (cancelled runs skip pushes and the same push can edit the workflow).
 
@@ -159,3 +160,4 @@ All are development-only; the Worker bundle does not include them. Remove one on
 | Package | Minimum | Reason |
 | --- | --- | --- |
 | `katex` | 0.18.2 | GHSA-238p-pmpm-9mq7 (low), via markdownlint math support |
+| `re2js` | 2.9.1 | GHSA-gg6h-894w-4m9c (high, quadratic lookbehind), via markdownlint 0.42.0; no fixed markdownlint release yet |

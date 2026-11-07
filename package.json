@@ -23,17 +23,18 @@
     "check:repo": "npm run check:privacy && npm run check:setup && npm run check:links"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.4.7",
+    "@cloudflare/vitest-plugin": "1.6.0",
     "github-slugger": "2.0.0",
     "jsonc-parser": "3.3.1",
     "markdown-it": "15.0.3",
     "markdownlint": "0.42.0",
     "typescript": "7.0.2",
     "vitest": "5.0.5",
-    "wrangler": "4.152.0"
+    "wrangler": "4.158.0"
   },
   "overrides": {
-    "katex": "^0.18.2"
+    "katex": "^0.18.2",
+    "re2js": "^2.9.1"
   },
   "repository": {
     "type": "git",
