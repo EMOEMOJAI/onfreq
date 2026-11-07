@@ -74,8 +74,9 @@ export interface GcaPolicy {
  * keep only one of the two entries — an approved controller could otherwise
  * be DMed, or an unapproved one could be missed.
  */
-function parseJsonRejectDuplicateKeys(text: string): unknown {
+export function parseJsonRejectDuplicateKeys(text: string, maxDepth = Infinity): unknown {
   let i = 0;
+  let depth = 0;
   const len = text.length;
   const fail = (): never => { throw new SyntaxError('invalid or duplicate-key JSON'); };
   const skipWs = () => { while (i < len && /[ \t\n\r]/.test(text[i]!)) i++; };
@@ -90,11 +91,14 @@ function parseJsonRejectDuplicateKeys(text: string): unknown {
     if (text.startsWith('null', i)) { i += 4; return null; }
     return parseNumber();
   }
+  // Only published records set a depth limit; secrets keep the unlimited parse.
+  const enter = () => { if (++depth > maxDepth) fail(); };
   function parseObject(): Record<string, unknown> {
+    enter();
     i++;
     const obj: Record<string, unknown> = {};
     skipWs();
-    if (text[i] === '}') { i++; return obj; }
+    if (text[i] === '}') { i++; depth--; return obj; }
     for (;;) {
       skipWs();
       if (text[i] !== '"') fail();
@@ -112,13 +116,15 @@ function parseJsonRejectDuplicateKeys(text: string): unknown {
       if (text[i] === '}') { i++; break; }
       fail();
     }
+    depth--;
     return obj;
   }
   function parseArray(): unknown[] {
+    enter();
     i++;
     const arr: unknown[] = [];
     skipWs();
-    if (text[i] === ']') { i++; return arr; }
+    if (text[i] === ']') { i++; depth--; return arr; }
     for (;;) {
       arr.push(parseValue());
       skipWs();
@@ -126,6 +132,7 @@ function parseJsonRejectDuplicateKeys(text: string): unknown {
       if (text[i] === ']') { i++; break; }
       fail();
     }
+    depth--;
     return arr;
   }
   function parseString(): string {
@@ -180,8 +187,10 @@ function isVid(key: string): boolean {
   return /^[1-9]\d{4,9}$/.test(key);
 }
 
+export type GcaRegions = Pick<GcaPolicy, 'regionNames' | 'regionByPrefix' | 'homeRegions'>;
+
 /** No built-in deployment policy; ambiguous or malformed coverage disables DMs. */
-function parseRegions(raw: string | undefined): Pick<GcaPolicy, 'regionNames' | 'regionByPrefix' | 'homeRegions'> | null {
+export function parseRegions(raw: string | undefined): GcaRegions | null {
   const object = parseJsonObject(raw);
   if (!object || !Object.keys(object).length) return null;
   const regionNames: Record<string, string> = {};
@@ -206,36 +215,79 @@ function parseRegions(raw: string | undefined): Pick<GcaPolicy, 'regionNames' | 
   return { regionNames, regionByPrefix, homeRegions };
 }
 
-/** `{"123456":[{"region":"AA","level":3}]}`; `{}` means nobody is approved. */
-function parseApprovals(raw: string | undefined, regionNames: Record<Region, string>): Record<number, GcaApproval[]> | null {
-  const object = parseJsonObject(raw);
-  if (!object) return null;
-  const result: Record<number, GcaApproval[]> = {};
+/** Published records only: at most this many VIDs per list and approvals per VID. */
+export const GCA_MAX_VIDS = 2000;
+export const GCA_MAX_APPROVALS = 8;
+
+/** Why a published record was refused; the secrets path only ever reports "unusable". */
+export type GcaRecordsError = 'invalid_records' | 'unknown_field' | 'too_many_vids' | 'too_many_approvals';
+export type GcaChecked<T> = { ok: true; value: T } | { ok: false; error: GcaRecordsError };
+
+/**
+ * Approvals keyed by VID string. Lenient mode is the secrets' behaviour,
+ * unchanged: no limits, and extra keys in an item are ignored. Strict mode
+ * (published records) also requires each item's exact key set and the limits.
+ */
+export function validateApprovals(
+  object: Record<string, unknown>, regionNames: Record<Region, string>, strict: boolean,
+): GcaChecked<Record<string, GcaApproval[]>> {
+  const refuse = (error: GcaRecordsError = 'invalid_records') => ({ ok: false as const, error });
+  if (strict && Object.keys(object).length > GCA_MAX_VIDS) return refuse('too_many_vids');
+  const result: Record<string, GcaApproval[]> = {};
   for (const [key, value] of Object.entries(object)) {
-    if (!isVid(key) || !Array.isArray(value)) return null;
+    if (!isVid(key) || !Array.isArray(value)) return refuse();
+    if (strict && value.length > GCA_MAX_APPROVALS) return refuse('too_many_approvals');
     const list: GcaApproval[] = [];
     for (const item of value as unknown[]) {
+      if (strict) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return refuse();
+        const keys = Object.keys(item);
+        if (keys.some((name) => name !== 'level' && name !== 'region')) return refuse('unknown_field');
+        if (keys.length !== 2) return refuse();
+      }
       const { region, level } = (item ?? {}) as { region?: unknown; level?: unknown };
-      if (typeof region !== 'string' || !Object.hasOwn(regionNames, region)) return null;
-      if (!Number.isInteger(level) || (level as number) < 1 || (level as number) > MAX_LEVEL) return null;
+      if (typeof region !== 'string' || !Object.hasOwn(regionNames, region)) return refuse();
+      if (!Number.isInteger(level) || (level as number) < 1 || (level as number) > MAX_LEVEL) return refuse();
       list.push({ region: region as Region, level: level as number });
     }
-    result[Number(key)] = list;
+    result[key] = list;
   }
+  return { ok: true, value: result };
+}
+
+/** Home overrides keyed by VID string; strict mode adds the VID limit. */
+export function validateHomeOverrides(object: Record<string, unknown>, strict: boolean): GcaChecked<Record<string, string>> {
+  if (strict && Object.keys(object).length > GCA_MAX_VIDS) return { ok: false, error: 'too_many_vids' };
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(object)) {
+    if (!isVid(key) || typeof value !== 'string' || countryCode(value) !== value) return { ok: false, error: 'invalid_records' };
+    result[key] = value;
+  }
+  return { ok: true, value: result };
+}
+
+/** VID-string keys of a validated list as the policy's numeric keys (isVid keys round-trip exactly). */
+export function byVid<T>(list: Record<string, T>): Record<number, T> {
+  const result: Record<number, T> = {};
+  for (const [key, value] of Object.entries(list)) result[Number(key)] = value;
   return result;
 }
 
+/** `{"123456":[{"region":"AA","level":3}]}`; `{}` means nobody is approved. */
+export function parseApprovals(raw: string | undefined, regionNames: Record<Region, string>): Record<number, GcaApproval[]> | null {
+  const object = parseJsonObject(raw);
+  if (!object) return null;
+  const checked = validateApprovals(object, regionNames, false);
+  return checked.ok ? byVid(checked.value) : null;
+}
+
 /** `{"123456":"AA"}`; absent is fine, malformed is not. */
-function parseHomeOverrides(raw: string | undefined): Record<number, string> | null {
+export function parseHomeOverrides(raw: string | undefined): Record<number, string> | null {
   if (raw === undefined || !trimJsonWhitespace(raw)) return {};
   const object = parseJsonObject(raw);
   if (!object) return null;
-  const result: Record<number, string> = {};
-  for (const [key, value] of Object.entries(object)) {
-    if (!isVid(key) || typeof value !== 'string' || countryCode(value) !== value) return null;
-    result[Number(key)] = value;
-  }
-  return result;
+  const checked = validateHomeOverrides(object, false);
+  return checked.ok ? byVid(checked.value) : null;
 }
 
 /**
@@ -269,6 +321,16 @@ export function parseGcaPolicy(env: Env): GcaPolicy | null {
   const approvals = parseApprovals(env.GCA_APPROVALS, regions.regionNames);
   const homeOverrides = parseHomeOverrides(env.GCA_HOME_OVERRIDES);
   if (!approvals || !homeOverrides) return null;
+  return finishGcaPolicy(env, regions, approvals, homeOverrides);
+}
+
+/**
+ * The settings shared by both record sources (secrets or a stored record):
+ * the policy link and verified role, then the complete policy.
+ */
+export function finishGcaPolicy(
+  env: Env, regions: GcaRegions, approvals: Record<number, GcaApproval[]>, homeOverrides: Record<number, string>,
+): GcaPolicy | null {
   // A link or verified role that is set but unusable disables reminders: the
   // operator configured it, so sending without it would not be what they asked.
   const policyUrl = parsePolicyUrl(env.GCA_POLICY_URL);

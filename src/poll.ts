@@ -31,9 +31,9 @@ import {
 } from './state';
 import { countryCode, enrichMemberCountries } from './member-country';
 import {
-  DM_BUDGET_MS, gcaMismatch, gcaRemindersEnabled, parseGcaPolicy, sendGcaReminders, type GcaPolicy,
-  type MemberListCache,
+  DM_BUDGET_MS, gcaMismatch, gcaRemindersEnabled, sendGcaReminders, type GcaPolicy, type MemberListCache,
 } from './gca';
+import { loadGcaPolicy } from './gca-records';
 import {
   maintainShortSessions, purgeShortSessions, recordShortSessions, shortSessionMode, trustedStateAt,
   type ShortSessionHandoff,
@@ -787,7 +787,10 @@ export async function runPoll(
   }
 
   await enrichMemberCountries(current, prev, auth);
-  const gcaPolicy = parseGcaPolicy(env);
+  // One policy per poll, for both reminders and the public marker: a stored
+  // record (else the secrets), loaded once, so a publish mid-poll applies to
+  // the next poll only. The loader never throws.
+  const gcaPolicy = await loadGcaPolicy(env, storage, Date.parse(nowIso));
 
   // Optional short-session reminders: the feature's config is checked once
   // per poll, and invalid IDs disable it (logged) without affecting cards.

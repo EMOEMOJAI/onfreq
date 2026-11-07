@@ -8,6 +8,10 @@ import { runPoll } from './poll';
 import { sendShortSessionReminders, SHORT_SESSION_DM_BUDGET_MS } from './short-session';
 import type { PendingOffline, RosterMessage, RosterPostAttempt, StateMap } from './types';
 import { cleanupGcaCopies } from './retention';
+import {
+  deleteGcaRecords, gcaRecordsMeta, purgeGcaRecordsHistory, writeGcaRecords,
+  type GcaDeleteResult, type GcaMetaResult, type GcaPurgeResult, type GcaSignedRequest, type GcaWriteResult,
+} from './gca-records';
 
 export const HEALTH_MAX_AGE_MS = 5 * 60_000;
 
@@ -241,6 +245,30 @@ export class PollCoordinator extends DurableObject<Env> {
     // itself is synchronous, so no poll can interleave with its transaction.
     if (this.inFlight) return { busy: true as const };
     return { busy: false as const, ...cleanupGcaCopies(this.ctx.storage, apply, Date.now(), this.env.GCA_COPY_USER_ID) };
+  }
+
+  /**
+   * Signed GCA records RPCs. The Worker verifies the signature, key id and
+   * timestamp window before calling; each method re-checks the request's
+   * shape, method and path, and consumes its nonce in the same transaction as
+   * any change. A poll in progress keeps the policy it loaded at its start.
+   */
+  gcaRecordsWrite(request: GcaSignedRequest): Promise<GcaWriteResult> {
+    return writeGcaRecords(this.ctx.storage, this.env, request);
+  }
+
+  /** Signed meta (`request` given) or the operator's bearer meta (omitted). */
+  gcaRecordsMeta(request?: GcaSignedRequest): Promise<GcaMetaResult> {
+    return gcaRecordsMeta(this.ctx.storage, this.env, request);
+  }
+
+  gcaRecordsPurge(request: GcaSignedRequest): GcaPurgeResult {
+    return purgeGcaRecordsHistory(this.ctx.storage, request);
+  }
+
+  /** Operator emergency delete: record and history; the version counter is kept. */
+  gcaRecordsOperatorDelete(): GcaDeleteResult {
+    return deleteGcaRecords(this.ctx.storage);
   }
 
   async getGcaHistory(after = 0) {
