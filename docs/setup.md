@@ -60,10 +60,11 @@ The public `npm run deploy` command runs `wrangler deploy --config wrangler.json
 | `GCA_DISCORD_GUILD_ID`, `GCA_MEMBER_ROLE_ID` | Limits reminders to eligible members; enable Discord **Server Members Intent** |
 | `GCA_VERIFIED_ROLE_ID` | Optional but strongly recommended staff-only role a member must also hold before their nickname VID is trusted, for GCA and short-session reminders |
 | `GCA_REGIONS` | Private region names, callsign prefixes and home-country groups |
-| `GCA_APPROVALS`, `GCA_HOME_OVERRIDES` | Operator-maintained approvals and home-region corrections |
+| `GCA_APPROVALS`, `GCA_HOME_OVERRIDES` | Operator-maintained approvals and home-region corrections; ignored once a [website-managed record](#website-managed-gca-records) is stored |
 | `GCA_COPY_USER_ID`, `GCA_POLICY_URL` | Optional staff copies and policy link |
 | `SHORT_SESSION_DM_ENABLED` | Enables optional short-session reminders with `true`; `purge` deletes their data |
 | `HISTORY_SECRET` | Separate bearer secret for private history endpoints |
+| `GCA_ADMIN_HMAC_KEY`, `GCA_ADMIN_HMAC_KEY_NEXT` | Signing key shared with a staff website that publishes [GCA records](#website-managed-gca-records); the second key only during a rotation |
 | `IVAO_WEBHOOK_SECRET` | Signing Secret for the optional IVAO webhook, which brings polls forward |
 
 GCA coverage is private configuration, with no built-in region list. Set `GCA_REGIONS` before upgrading an existing reminder deployment. Malformed or absent coverage or approval records, or a set but invalid `GCA_POLICY_URL` or `GCA_VERIFIED_ROLE_ID`, disable reminders; `{}` explicitly means no approvals. These records are not an authoritative registry. Public cards show the red country-mismatch marker, which reveals these private records, only while `GCA_DM_ENABLED` is `true` and this policy and the guild and member-role IDs are valid. A first enabled poll baselines existing connections; so does the first poll after more than 15 minutes without a reminder poll (an outage, invalid configuration or disabled reminders), for connections it sees for the first time. Possible DM deliveries are not repeated, so ambiguous failures can mean a missed reminder. See [data retention](../SECURITY.md#data-retention) before enabling this feature.
@@ -78,12 +79,110 @@ GCA coverage is private configuration, with no built-in region list. Set `GCA_RE
 
 ## Health
 
-`GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes and cron or `POST /poll` last called the bot within five minutes, otherwise 503. It does not prove optional GCA or short-session delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters, or equal to `IVAO_WEBHOOK_SECRET`, count as unset: their endpoints return 503. Authenticated routes send `Cache-Control: no-store`, and their error bodies carry a fixed `error` message. When upgrading, rotate a shorter `POLL_SECRET` and set a distinct `HISTORY_SECRET` before deploying.
+`GET /` checks HTTP reachability. Authenticated `GET /health` returns 200 when a successful poll was saved within five minutes and cron or `POST /poll` last called the bot within five minutes, otherwise 503. It does not prove optional GCA or short-session delivery. `POST /poll` runs an eligible poll; concurrent triggers are coordinated. Use `Authorization: Bearer <POLL_SECRET>` and keep tokens out of shell history, process arguments and logs. Secrets shorter than 32 characters, or equal to `IVAO_WEBHOOK_SECRET` or a [GCA records signing key](#signing-key-and-rotation), count as unset: their endpoints return 503. Authenticated routes send `Cache-Control: no-store`, and their error bodies carry a fixed `error` message. When upgrading, rotate a shorter `POLL_SECRET` and set a distinct `HISTORY_SECRET` before deploying.
 
 For failures, check `npm run tail` (CLI installations; otherwise Worker Logs in the Cloudflare dashboard). A 401 means the token is wrong; a 403 from Discord usually means channel permissions are missing. Never post unredacted logs publicly.
 
 ## Private history maintenance
 
-`GET /gca-history` and `/gca-history/cleanup` require `Authorization: Bearer <HISTORY_SECRET>`, a separate secret of at least 32 characters; `POLL_SECRET` does not grant access. Without it, or when it equals `POLL_SECRET`, these endpoints return 503. History is private member data; keep this token off monitors.
+`GET /gca-history`, `/gca-history/cleanup` and the [GCA records operator routes](#operator-routes-and-a-compromised-key) require `Authorization: Bearer <HISTORY_SECRET>`, a separate secret of at least 32 characters; `POLL_SECRET` does not grant access. Without it, or when it equals `POLL_SECRET`, these endpoints return 503. History is private member data; keep this token off monitors.
 
 Preview old staff-copy cleanup with `GET /gca-history/cleanup`. Applying it requires `POST` plus `X-Onfreq-Confirm: delete-old-copies`; it removes at most 500 eligible copies older than 30 days, plus unsent copies addressed to an account other than the current valid `GCA_COPY_USER_ID`, and may cancel pending copies. Nothing runs it automatically: run it periodically and after changing `GCA_COPY_USER_ID`. A 409 means a poll is running. It preserves reminder/occurrence ledgers and does not erase Discord messages or all member data.
+
+## Website-managed GCA records
+
+A staff website can publish GCA approvals and home overrides to the bot instead of the `GCA_APPROVALS` and `GCA_HOME_OVERRIDES` secrets. The bot verifies, validates and stores each published record in its Durable Object and uses it from the next poll; a poll already running keeps the policy it loaded. `GCA_REGIONS` stays a secret, and every stored record is checked against it again on each poll. Reminders and the public marker still need `GCA_DM_ENABLED` and the other settings above.
+
+**Source precedence:** once a stored record exists it wins and both secrets are ignored, even when they change. Without one, the secrets apply exactly as before. A stored record that no longer validates, for example after a region it uses was removed from `GCA_REGIONS`, turns reminders and the public marker off (logged as `gca_config_invalid` with reason `records`), with no fallback to the secrets; public cards continue, and publishing a valid record restores them. Both meta routes report the `source`:
+
+| `source` | Meaning |
+| --- | --- |
+| `durable-object` | A valid stored record drives the policy |
+| `secrets` | No stored record; `version`, `digest` and `updatedAt` are null and the counts are those of the secrets |
+| `invalid` | A stored record exists but fails validation or cannot be read; GCA is off and the counts are 0 |
+
+### Signing key and rotation
+
+Generate a random key of at least 32 characters with your password manager or `openssl rand -hex 32`, store it as the `GCA_ADMIN_HMAC_KEY` Worker secret, and hand it to the website only through a secure channel; never print it, paste it into chats or commit it. Surrounding whitespace is trimmed. Use one key per deployment: the signature does not cover the host name, so a key shared by two deployments lets a request for one be replayed against the other.
+
+The signed routes return 503 `endpoint disabled` while `GCA_ADMIN_HMAC_KEY` is unset, a set key is shorter than 32 characters, `GCA_ADMIN_HMAC_KEY_NEXT` equals it, or either key equals `POLL_SECRET`, `HISTORY_SECRET`, `IVAO_WEBHOOK_SECRET`, `IVAO_CLIENT_SECRET` or `DISCORD_BOT_TOKEN`. A `POLL_SECRET` or `HISTORY_SECRET` equal to either key also disables that secret's routes. Each reason is logged once per isolate as `config_invalid`, naming settings only; on a deployment without the key, any request to a signed route logs `config_invalid` with reason `GCA_ADMIN_HMAC_KEY_unset`, which is expected there.
+
+To rotate:
+
+1. Store a new key as `GCA_ADMIN_HMAC_KEY_NEXT`. Both keys now verify; each request names its key by key id.
+2. Switch the website to the new key and confirm a signed `GET /gca/records/meta` returns 200.
+3. Pause publishing, set `GCA_ADMIN_HMAC_KEY` to the new key and delete `GCA_ADMIN_HMAC_KEY_NEXT`, in one dashboard save if you can: while both hold the same key, the routes return 503 `endpoint disabled`. Confirm signed meta again.
+
+### Signed requests
+
+Routes match the exact path, with no trailing slash and no `?` anywhere in the raw URL. There is no CORS; every response is `Cache-Control: no-store` and errors carry a fixed `{"error": "<category>"}` body.
+
+| Route | Body | 200 response |
+| --- | --- | --- |
+| `PUT /gca/records` | `{"approvals":{...},"homeOverrides":{...},"baseVersion":<version or null>}`, plus `"confirmEmpty":true` to publish empty approvals | `{version, digest, updatedAt}` |
+| `GET /gca/records/meta` | Empty | `{version, digest, updatedAt, counts: {approvals, homeOverrides}, source}` |
+| `POST /gca/records/history/purge` | Empty | `{ok: true, kept}`: `kept` is 1, or 0 with no stored record |
+
+`version` and `baseVersion` are decimal strings (`"1"`, never `1`); `digest` is 64 lowercase hex; `updatedAt` is ISO 8601 UTC with milliseconds. In `approvals`, each VID (5–10 digits, no leading zero) maps to at most 8 items of exactly `{"level": 1–3, "region": "<region code from GCA_REGIONS>"}`; in `homeOverrides`, each VID maps to an uppercase two-letter country code (unknown codes such as `ZZ` are refused). Each list holds at most 2000 VIDs and the body at most 64 KiB. The digest is the SHA-256 hex of the canonical JSON `{"approvals":{...},"homeOverrides":{...}}`: no whitespace, object keys sorted by UTF-16 code units (so `"100001"` sorts before `"99999"`), items as `{"level":n,"region":"XX"}` in the given order.
+
+Each request carries four headers:
+
+| Header | Value |
+| --- | --- |
+| `X-XE-GCA-Key-Id` | The first 16 lowercase hex characters of SHA-256 over `onfreq-gca-key-id-v1`, a line feed and the trimmed key |
+| `X-XE-GCA-Timestamp` | Unix time in milliseconds, 13 digits; accepted within 300,000 ms (five minutes) of the Worker's clock, either way |
+| `X-XE-GCA-Nonce` | A lowercase UUID v4, new for every request including retries |
+| `X-XE-GCA-Signature` | Lowercase hex HMAC-SHA256, keyed by the UTF-8 bytes of the trimmed key, of `METHOD`, `PATH`, key id, timestamp, nonce and the lowercase hex SHA-256 of the raw body bytes, joined by line feeds with no trailing line feed |
+
+A nonce is single use: it is stored until 601 seconds after receipt or 360 seconds after its timestamp, whichever is later, and a replay is refused. At most 2000 unexpired nonces are kept, and at most 30 write attempts (PUT and purge, including ones then refused with 400, 409 or 503) are accepted per sliding hour. Synthetic vectors for the key id, digest and signatures are in [the HTTP tests](../test/gca-records-http.test.ts).
+
+Requests are checked in this order; the first failure decides:
+
+1. 404 for an unknown path; 405 for another method, including `OPTIONS`.
+2. 400 `query_not_allowed` for any `?` in the URL.
+3. 503 `endpoint disabled` for the key configuration above.
+4. 401 `unauthorized` for a missing or malformed header, then 413 for a body over 64 KiB, then 401 for a timestamp outside the window, an unknown key id or a wrong signature. Every authentication failure has the same 401 body. Nothing up to here touches Durable Object storage.
+5. In the coordinator: 401 for a replayed nonce or a non-empty meta or purge body; 429 `rate_limited` for a full nonce table or the hourly limit.
+6. PUT only: 503 `gca regions invalid` when `GCA_REGIONS` is unusable, then the body's 400 categories in this order: `invalid_json` (invalid UTF-8, a byte order mark, invalid JSON, duplicate keys, nesting deeper than 32 or not an object); `unknown_field` (a top-level key other than the four above); `invalid_base_version` (`baseVersion` missing, or neither null nor a decimal string); `invalid_records` (`confirmEmpty` other than `true`, or either list not an object); then each list, approvals first, with `too_many_vids`, `too_many_approvals`, `unknown_field` (an item key other than `level` and `region`) and `invalid_records` for anything else; finally `empty_requires_confirm` for `{}` approvals without `confirmEmpty`.
+7. PUT only: 409 `{currentVersion, currentDigest}` when `baseVersion` is not the current version: the first publish needs `null`, and `currentVersion` is null while nothing is stored.
+8. 503 `coordinator unavailable` if the coordinator fails.
+
+A 503 or a timeout on PUT or purge means the outcome is unknown. Reconcile with signed meta: if its `digest` equals the digest you sent, the PUT applied. Otherwise retry with a new nonce, timestamp and signature; a 409 whose `currentDigest` equals the digest you sent also means the earlier attempt applied. The bot logs `gca_records_updated` with the version, an 8-character digest prefix and the counts, and never logs VIDs, bodies, nonces, key ids or signatures.
+
+### Cutover
+
+1. Deploy with `GCA_ADMIN_HMAC_KEY` set. `GET /gca-history/records` should report `source` `secrets`.
+2. Publish the first record from the website with `baseVersion` `null`, normally matching the current secrets. Confirm meta reports `source` `durable-object` and the published digest, and that the next poll logs no `gca_config_invalid`.
+3. From now on `GCA_APPROVALS` and `GCA_HOME_OVERRIDES` are ignored. You may delete them from Cloudflare, but only while the owner keeps a private local copy current with every publish: the [rollback](#rollback) needs it.
+
+Stored records belong to the coordinator object named by `COORDINATOR_NAME` (default `onfreq`). Renaming it returns the bot to the secrets, and the old object keeps its records, which the operator routes can no longer reach; run the operator delete before renaming.
+
+### Operator routes and a compromised key
+
+With `Authorization: Bearer <HISTORY_SECRET>`, `GET /gca-history/records` returns the same meta as the signed route, and `POST /gca-history/records/delete` with `X-Onfreq-Confirm: delete-gca-records` deletes the stored record and all its history, returning `{ok: true, deleted, history}`; without the header it returns 400. The bot then uses the secrets again. The version counter is never reset, so a later publish, which needs `baseVersion` `null`, gets a higher version than any earlier one. An `invalid` record whose `version` is null cannot be replaced by a publish; delete it.
+
+If the signing key may be compromised:
+
+1. Delete `GCA_ADMIN_HMAC_KEY_NEXT` and replace or delete `GCA_ADMIN_HMAC_KEY` first, so nothing more can be signed with it.
+2. Then check `GET /gca-history/records` and, unless you can confirm the stored record, run the operator delete.
+3. Restore the secrets from the owner's copy, or give the website a new key and publish a known good record with `baseVersion` `null`.
+
+### Rollback
+
+Every step is mandatory, in this order:
+
+1. `POST /gca-history/records/delete` (`HISTORY_SECRET` bearer, `X-Onfreq-Confirm: delete-gca-records`), then `GET /gca-history/records` must report `source` `secrets` and `version` `null`. If it does not, stop this sequence and follow [If step 1 fails](#if-step-1-fails) below; no other path is documented.
+2. Restore `GCA_APPROVALS` and `GCA_HOME_OVERRIDES` from the owner's current copy. Version 2.2.12 reads only the secrets; without them reminders and the public marker are off.
+3. Redeploy 2.2.12 and check `npm run tail` or Worker Logs: polls succeed, with no exceptions and no `gca_config_invalid`.
+
+A later upgrade then starts with no stored record (`source` `secrets`) and needs a fresh first publish with `baseVersion` `null`, so an old record can never override newer secrets.
+
+#### If step 1 fails
+
+If the operator delete or its check fails, for example because the new version is broken at the coordinator, the rollback is not stuck: continue with steps 2 and 3, and record that a stale stored record remains. A rollback without step 1 is unsupported unless this re-upgrade procedure is followed before any later version with GCA records is deployed:
+
+1. Set `GCA_DM_ENABLED` to `false`. While it is not `true`, a stored record cannot drive reminders or the public marker.
+2. Deploy the new version.
+3. Run the operator delete.
+4. Confirm `GET /gca-history/records` reports `source` `secrets` and `version` `null`.
+5. Only then set `GCA_DM_ENABLED` back to `true`.
