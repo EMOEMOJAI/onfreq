@@ -7,7 +7,7 @@
  * IVAO_WEBHOOK_SECRET (the webhook's Signing Secret). Nothing reaches the
  * coordinator before the signature verifies.
  */
-import { configuredSecret, logConfigInvalidOnce } from './auth';
+import { configuredSecret, logConfigInvalidOnce, reusedGcaKey } from './auth';
 import { getCoordinator } from './config';
 import { BodyTooLargeError, errorResponse, readCapped } from './http';
 import { isDivisionCallsign, isExcludedCallsign, parseExcludedCallsigns, parsePrefixes } from './ivao';
@@ -125,8 +125,9 @@ function recordSeen(id: string, now: number): void {
 /**
  * The configured signing secret, or '' when the webhook is disabled. Unset or
  * short secrets disable it, as does reusing another secret: bearer secrets are
- * held by monitors and staff, and API credentials must never double as a
- * signing key for network events.
+ * held by monitors and staff, the GCA records signing keys by the staff
+ * website, and API credentials must never double as a signing key for network
+ * events. Cron polling does not depend on this secret.
  */
 function webhookSecret(env: Env): string {
   const secret = configuredSecret(env.IVAO_WEBHOOK_SECRET, 'IVAO_WEBHOOK_SECRET');
@@ -136,6 +137,11 @@ function webhookSecret(env: Env): string {
       logConfigInvalidOnce(`IVAO_WEBHOOK_SECRET_reuses_${other}`);
       return '';
     }
+  }
+  const gcaKey = reusedGcaKey(env, secret);
+  if (gcaKey) {
+    logConfigInvalidOnce(`IVAO_WEBHOOK_SECRET_reuses_${gcaKey}`);
+    return '';
   }
   return secret;
 }

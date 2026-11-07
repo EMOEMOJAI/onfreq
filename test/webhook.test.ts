@@ -303,6 +303,11 @@ describe('configuration and method', () => {
       ['IVAO_WEBHOOK_SECRET_reuses_IVAO_CLIENT_SECRET']],
     ['equal to DISCORD_BOT_TOKEN', { IVAO_WEBHOOK_SECRET: ` ${SECRET}`, DISCORD_BOT_TOKEN: `${SECRET} ` },
       ['IVAO_WEBHOOK_SECRET_reuses_DISCORD_BOT_TOKEN']],
+    // T1-5 F: the GCA records signing keys are held by the staff website.
+    ['equal to GCA_ADMIN_HMAC_KEY', { IVAO_WEBHOOK_SECRET: `\t${SECRET} `, GCA_ADMIN_HMAC_KEY: ` ${SECRET}\n` },
+      ['IVAO_WEBHOOK_SECRET_reuses_GCA_ADMIN_HMAC_KEY']],
+    ['equal to GCA_ADMIN_HMAC_KEY_NEXT', { IVAO_WEBHOOK_SECRET: ` ${SECRET}`, GCA_ADMIN_HMAC_KEY_NEXT: `${SECRET}\t` },
+      ['IVAO_WEBHOOK_SECRET_reuses_GCA_ADMIN_HMAC_KEY_NEXT']],
   ])('is disabled when the secret is %s, even for a matching signature', async (_label, overrides, reasons) => {
     const secret = overrides.IVAO_WEBHOOK_SECRET?.trim() || SECRET;
     for (let i = 0; i < 3; i++) {

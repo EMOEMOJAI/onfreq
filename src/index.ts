@@ -42,8 +42,9 @@ function routeFailed(url: URL, err: unknown): Response {
  * POLL_SECRET also disables the history routes, since the poll token is held
  * by monitors. A bearer secret equal to IVAO_WEBHOOK_SECRET disables its
  * routes, since that signing secret is also held by IVAO's webhook service,
- * and so does one equal to either GCA records signing key, which the staff
- * website holds.
+ * as does one equal to IVAO_CLIENT_SECRET or DISCORD_BOT_TOKEN (API
+ * credentials held by IVAO and Discord) or to either GCA records signing key,
+ * which the staff website holds.
  */
 async function requireSecret(request: Request, env: Env, name: Route['secret']): Promise<Response | null> {
   let expected = configuredSecret(env[name], name);
@@ -55,6 +56,12 @@ async function requireSecret(request: Request, env: Env, name: Route['secret']):
   if (expected && expected === env.IVAO_WEBHOOK_SECRET?.trim()) {
     logConfigInvalidOnce(`${name}_reuses_IVAO_WEBHOOK_SECRET`);
     expected = '';
+  }
+  for (const other of ['IVAO_CLIENT_SECRET', 'DISCORD_BOT_TOKEN'] as const) {
+    if (expected && expected === env[other]?.trim()) {
+      logConfigInvalidOnce(`${name}_reuses_${other}`);
+      expected = '';
+    }
   }
   const gcaKey = reusedGcaKey(env, expected);
   if (gcaKey) {

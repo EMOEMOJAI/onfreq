@@ -257,12 +257,18 @@ describe('write RPC', () => {
       .map((row) => [row.nonce, row.expires_at])));
     expect(expiry[late.nonce]).toBe(now + 290_000 + 360_000);
     expect(expiry[early.nonce]).toBe(now + 601_000);
-    now += 600_999;
+    // T1-5 E: each nonce outlives the coordinator's own timestamp window, so a
+    // timestamp is refused before its nonce could expire.
+    now = START + 359_999 - 290_000;
     expect(await write(early)).toEqual({ ok: false, error: 'replay' });
-    now += 1;
-    // Expired at the DO level (the Worker's window refuses its timestamp long before).
-    expect(await write(early)).not.toEqual({ ok: false, error: 'replay' });
+    now = START + 360_000 - 290_000;
+    expect(await write(early)).toEqual({ ok: false, error: 'timestamp_out_of_window' });
+    now = START + 600_999;
     expect(await write(late)).toEqual({ ok: false, error: 'replay' });
+    now = START + 290_000 + 359_999;
+    expect(await write(late)).toEqual({ ok: false, error: 'replay' });
+    now = START + 290_000 + 360_000;
+    expect(await write(late)).toEqual({ ok: false, error: 'timestamp_out_of_window' });
   });
 
   it('refuses at the nonce cap without recording, while an old replay is still a replay', async () => {
@@ -323,6 +329,47 @@ describe('write RPC', () => {
   ])('refuses %s without touching storage', async (_name, make) => {
     expect(await write(make())).toEqual({ ok: false, error: 'invalid_request' });
     expect(await recordsTables()).toEqual([]);
+  });
+
+  describe('T1-5 E: the coordinator re-checks the timestamp window, touching no table', () => {
+    /** Every row of every records table, so a refusal is shown to change nothing at all. */
+    const dump = () => withCoordinator((_c, ctx) => {
+      const sql = ctx.storage.sql;
+      const names = sql.exec<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'gca_records%' ORDER BY name").toArray().map((r) => r.name);
+      return Object.fromEntries(names.map((name) => [name, sql.exec(`SELECT * FROM ${name} ORDER BY rowid`).toArray()]));
+    });
+    let version = '1';
+    const kinds = {
+      write: async (ts: number) => {
+        const result = await write(publish(version, RECORD, { ts }));
+        if (result.ok) version = result.version;
+        return result;
+      },
+      meta: (ts: number) => meta(request('GET', '/gca/records/meta', '', { ts })),
+      purge: (ts: number) => purge(request('POST', '/gca/records/history/purge', '', { ts })),
+    };
+
+    it.each(Object.keys(kinds) as (keyof typeof kinds)[])('%s: refuses out-of-window timestamps and admits those within', async (kind) => {
+      version = '1';
+      expect(await write(publish(null))).toMatchObject({ ok: true, version: '1' });
+      expect(await meta(metaRequest())).toMatchObject({ ok: true });
+      // Rows that admission would expire, so a check placed after its DELETEs would show.
+      await withCoordinator((_c, ctx) => {
+        ctx.storage.sql.exec('INSERT INTO gca_records_nonces (nonce, expires_at) VALUES (?, ?)', crypto.randomUUID(), now);
+        ctx.storage.sql.exec('INSERT INTO gca_records_writes (at) VALUES (?)', now - 3_600_000);
+        ctx.storage.sql.exec('INSERT INTO gca_records_meta_reads (at) VALUES (?)', now - 3_600_000);
+      });
+      const before = await dump();
+      expect(Object.keys(before)).toEqual(expect.arrayContaining(['gca_records_meta_reads', 'gca_records_nonces', 'gca_records_writes']));
+      for (const ts of [now + 360_001, now - 360_000, 9_999_999_999_999]) {
+        expect(await kinds[kind](ts), String(ts - now)).toEqual({ ok: false, error: 'timestamp_out_of_window' });
+        expect(await dump()).toEqual(before);
+      }
+      for (const ts of [now - 359_999, now + 359_999, now + 360_000]) {
+        expect(await kinds[kind](ts), String(ts - now)).toMatchObject({ ok: true });
+      }
+    });
   });
 
   it('logs only the version and counts, no part of the digest (T1-4 F9a)', async () => {
@@ -563,7 +610,8 @@ describe('T1-4 F9b: signed meta has its own hourly budget', () => {
     expect(await meta()).toMatchObject({ ok: true, source: 'durable-object' });
     // The first request leaves the window one hour after it was made; a refused nonce was not kept.
     now = START + 1000 + 3_600_000;
-    expect(await meta(refused)).toMatchObject({ ok: true, source: 'durable-object' });
+    // Same nonce, with a fresh timestamp: the coordinator refuses the hour-old one (T1-5 E).
+    expect(await meta({ ...refused, ts: now })).toMatchObject({ ok: true, source: 'durable-object' });
     expect(await meta(metaRequest())).toEqual({ ok: false, error: 'rate_limited' });
   });
 

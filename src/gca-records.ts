@@ -21,8 +21,9 @@ export interface GcaRecords {
 
 /**
  * A request the Worker has already authenticated (signature, key id and
- * timestamp window checked). The coordinator re-checks its shape, binds it to
- * the method and path of the RPC it reached, and enforces the nonce and rate.
+ * timestamp window checked). The coordinator re-checks its shape and, against
+ * its own clock, a slightly wider timestamp window, binds it to the method and
+ * path of the RPC it reached, and enforces the nonce and rate.
  */
 export interface GcaSignedRequest {
   method: string;
@@ -34,8 +35,11 @@ export interface GcaSignedRequest {
   bodyBytes: ArrayBuffer | Uint8Array;
 }
 
-/** Refusals before any record change: replay or a malformed request (both 401), rate or nonce cap (429). */
-export type GcaAdmissionError = 'replay' | 'invalid_request' | 'rate_limited';
+/**
+ * Refusals before any record change: replay, a malformed request or a
+ * timestamp outside the coordinator's own window (all 401), rate or nonce cap (429).
+ */
+export type GcaAdmissionError = 'replay' | 'invalid_request' | 'timestamp_out_of_window' | 'rate_limited';
 /** 400 categories of the PUT body. */
 export type GcaBodyError = GcaRecordsError | 'invalid_json' | 'empty_requires_confirm' | 'invalid_base_version';
 
@@ -357,12 +361,16 @@ const BUDGETS = {
 } as const;
 
 /**
- * Inside the caller's transaction: refuse a replayed nonce (401), a full nonce
- * table or a spent hourly budget of this kind (429) without recording
- * anything; otherwise record the nonce until max(now + 601 s, ts + 360 s) and
- * the attempt. A refusal after this point (400, 409, 503) keeps them.
+ * Inside the caller's transaction: refuse a timestamp more than 360 s ahead
+ * of, or 360 s or more behind, the coordinator's clock (401) before touching
+ * any table, so a nonce is never needed past its expiry; then a replayed
+ * nonce (401), a full nonce table or a spent hourly budget of this kind (429)
+ * without recording anything; otherwise record the nonce until
+ * max(now + 601 s, ts + 360 s) and the attempt. A refusal after this point
+ * (400, 409, 503) keeps them.
  */
 function admit(sql: SqlStorage, request: Admitted, now: number, kind: keyof typeof BUDGETS): GcaAdmissionError | null {
+  if (request.ts - now > 360_000 || now - request.ts >= 360_000) return 'timestamp_out_of_window';
   sql.exec('DELETE FROM gca_records_nonces WHERE expires_at <= ?', now);
   if (sql.exec('SELECT 1 FROM gca_records_nonces WHERE nonce = ?', request.nonce).toArray().length) return 'replay';
   if (sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM gca_records_nonces').one().n >= GCA_NONCE_CAP) return 'rate_limited';

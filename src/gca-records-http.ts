@@ -10,9 +10,10 @@
  * unauthenticated traffic never touches Durable Object storage:
  *   method (405) -> raw `?` (400) -> key configuration (503) -> header formats
  *   (401) -> body size (413) -> timestamp window (401) -> key id and signature
- *   (401) -> coordinator RPC (nonce, rate, validation, version). The rate is
- *   per sliding hour: 30 writes (PUT and purge) and, separately, 120 signed
- *   meta requests; either beyond its budget is 429.
+ *   (401) -> coordinator RPC (its own timestamp window, nonce, rate,
+ *   validation, version). The rate is per sliding hour: 30 writes (PUT and
+ *   purge) and, separately, 120 signed meta requests; either beyond its
+ *   budget is 429.
  *
  * Nothing here logs a nonce, key id, signature, body or key: rejections log a
  * fixed reason once per isolate.
@@ -221,6 +222,7 @@ function refused(result: RpcError): Response {
   switch (result.error) {
     case 'replay':
     case 'invalid_request':
+    case 'timestamp_out_of_window':
       return unauthorized(result.error);
     case 'rate_limited':
       logRejectionOnce('rate_limited');

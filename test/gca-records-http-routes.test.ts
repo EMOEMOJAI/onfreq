@@ -272,6 +272,21 @@ describe('HTTP policy: methods, OPTIONS, queries, paths, no-store', () => {
     expect(JSON.stringify(errors.mock.calls)).not.toContain('synthetic-detail');
   });
 
+  it('T1-5 E: a coordinator timestamp refusal is the standard 401, logged with the Worker\'s reason', async () => {
+    // The coordinator's clock may differ from the Worker's: a refusal there maps like the Worker's own.
+    const refusal = () => Promise.resolve({ ok: false, error: 'timestamp_out_of_window' });
+    const config = recordsEnv();
+    config.POLL_COORDINATOR = { getByName: () => ({ gcaRecordsWrite: refusal, gcaRecordsMeta: refusal, gcaRecordsPurge: refusal }) } as
+      unknown as Env['POLL_COORDINATOR'];
+    for (const signed of [await put(recordBody()), await meta(), await purge(), await meta()]) {
+      const response = await viaWorker(signed, config);
+      expect(response.status).toBe(401);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(await response.json()).toEqual({ error: 'unauthorized' });
+    }
+    expect(reasons()).toEqual(['timestamp_out_of_window']);
+  });
+
   it('every status of the signed and operator routes is no-store without CORS', async () => {
     const responses: Response[] = [
       await publish(null), // 200
