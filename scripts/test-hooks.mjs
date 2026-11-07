@@ -14,6 +14,10 @@ import {
   syntheticKeyLines, lineMarker, longLine,
 } from './hook-test-helpers.mjs';
 
+const hasSshKeygen = !spawnSync('ssh-keygen', ['-?'], { stdio: 'ignore' }).error;
+// Locally a missing ssh-keygen skips the signed-commit tests; in CI they run and fail.
+const sshKeygenSkip = !hasSshKeygen && !process.env.CI && 'ssh-keygen is not installed';
+
 test('pre-push runs range, privacy and setup checks when the pushed commit is the clean HEAD', (t) => {
   const f = fixture(t);
   for (const lines of [[ref(f.head)], [ref(f.head).trimEnd()], [ref(f.head), ref(zero, 'refs/heads/old', f.first)]]) {
@@ -179,7 +183,7 @@ test('CI and pre-push share scripts/secret-scan.sh; it reports unreadable histor
 });
 
 test('privacy checks ignore log.showSignature on signed commits (C45)',
-  { skip: spawnSync('ssh-keygen', ['-?'], { stdio: 'ignore' }).error && 'ssh-keygen is not installed' }, (t) => {
+  { skip: sshKeygenSkip }, (t) => {
     const f = fixture(t, { realRange: true });
     // An SSH-signed synthetic commit; no GPG agent or real key is involved.
     const key = join(f.repo, '..', 'signing-key');
@@ -497,6 +501,10 @@ test('pre-push blocks when a check fails', (t) => {
 
 test('Gitleaks is installed when tests run in CI', { skip: !process.env.CI && 'not running in CI' }, () => {
   assert.ok(hasGitleaks, 'CI must install Gitleaks; the real-scan tests would otherwise be skipped');
+});
+
+test('ssh-keygen is installed when tests run in CI', { skip: !process.env.CI && 'not running in CI' }, () => {
+  assert.ok(hasSshKeygen, 'CI must provide ssh-keygen; the signed-commit tests would otherwise be skipped');
 });
 
 test('pre-commit passes a clean commit, directly and as an installed hook (S19-31)', (t) => {
@@ -1059,7 +1067,7 @@ test('the stream filter neutralizes the allow marker in commit and diff headers 
 });
 
 test('the secret scan ignores log.showSignature, so signature checks add no header lines (NX-7 #11)',
-  { skip: spawnSync('ssh-keygen', ['-?'], { stdio: 'ignore' }).error && 'ssh-keygen is not installed' }, (t) => {
+  { skip: sshKeygenSkip }, (t) => {
     const f = fixture(t);
     const key = join(f.repo, '..', 'signing-key');
     assert.equal(spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'synthetic', '-f', key]).status, 0);

@@ -7,20 +7,21 @@ import { ensureGcaRecordsSchema, GCA_NONCE_CAP } from '../src/gca-records';
 import { gcaKeyId, resetGcaRecordsHttpForTests } from '../src/gca-records-http';
 import { HISTORY_AUTH_HEADERS } from './helpers';
 import {
-  KEY, NEXT_KEY, ORIGIN, recordBody, recordRows, recordsEnv, sign, START, viaSelf, viaWorker, type Signed,
+  KEY, NEXT_KEY, ORIGIN, recordBody, recordRows, recordsEnv, sha256, sign, START, viaSelf, viaWorker, type Signed,
 } from './gca-signing';
 
-// The plan's fixed shared vectors (Revision 1), copied verbatim.
+// The fixed shared vectors with synthetic regions AA-AD (plan R234), copied verbatim. They
+// were computed independently with Node crypto; the Web Crypto test signer reproduces them.
 const VECTOR = {
   keyId: '839683debc9ccbd0',
   ts: '1767225600000',
   nonce: '3f1c2b4a-5d6e-4f70-8a9b-0c1d2e3f4a5b',
-  putBody: '{"approvals":{"100001":[{"level":3,"region":"HK"}],"100002":[{"level":1,"region":"PH"},' +
-    '{"level":2,"region":"KR"}],"4294967297":[],"99999":[{"level":1,"region":"TW"}]},"baseVersion":null,' +
-    '"homeOverrides":{"100002":"PH"}}',
-  putBodySha256: 'f5dd6b515f82b27c95117c6c45436260f43a723df632aec78047942228e725bb',
-  digest: 'e043e384c114c723818cfdb61df29ec0dcc76ed834bceb76ea6ff60ffaa8d68c',
-  put: '101ec41fd3f58c16f8f32c140d0deab212b8a92f36efa828c0b1cee2eabeff06',
+  putBody: '{"approvals":{"100001":[{"level":3,"region":"AA"}],"100002":[{"level":1,"region":"AB"},' +
+    '{"level":2,"region":"AC"}],"4294967297":[],"99999":[{"level":1,"region":"AD"}]},"baseVersion":null,' +
+    '"homeOverrides":{"100002":"AB"}}',
+  putBodySha256: '61490ab28c8d1f54312a2ee12cae59aea452822e8c2de7abadc62d1df4eab8ee',
+  digest: 'cb3fc08995ac559f69196f1a11c2fdf9204f869b6dfd744a6db7e4d83caafb7b',
+  put: '126c1478b4d0e5ba50b59b81a84c183c92120282815f64ceaf82cbaacfe410c3',
   meta: '051c715e692615e079cf78065210834f1a0a258471163fc0fd54a60e6f244054',
   purge: '3a638cc7bd5f92661a2339f2a68eca7f457dc981de015dd8b29f1959cad57b9c',
 };
@@ -71,6 +72,7 @@ describe('fixed shared vectors, end to end with the synthetic key binding and a 
   it('derives key id 839683debc9ccbd0 from the bound key', async () => {
     expect(await gcaKeyId(KEY)).toBe(VECTOR.keyId);
     expect((env as { GCA_ADMIN_HMAC_KEY?: string }).GCA_ADMIN_HMAC_KEY).toBe(KEY);
+    expect(await sha256(VECTOR.putBody)).toBe(VECTOR.putBodySha256);
     // The test signer reproduces every published signature from the contract.
     const signed = await put(VECTOR.putBody, { ts: Number(VECTOR.ts), nonce: VECTOR.nonce });
     expect(signed.signature).toBe(VECTOR.put);
@@ -116,7 +118,7 @@ describe('fixed shared vectors, end to end with the synthetic key binding and a 
   it('refuses each vector signature on another route, body, time or nonce', async () => {
     const cases: Signed[] = [
       vectorRequest('POST', '/gca/records/history/purge', VECTOR.meta),
-      vectorRequest('PUT', '/gca/records', VECTOR.put, VECTOR.putBody.replace('"HK"', '"KR"')),
+      vectorRequest('PUT', '/gca/records', VECTOR.put, VECTOR.putBody.replace('"AA"', '"AC"')),
       { ...vectorRequest('GET', '/gca/records/meta', VECTOR.meta) },
     ];
     (cases[2]!.init.headers as Record<string, string>)['x-xe-gca-nonce'] = '3f1c2b4a-5d6e-4f70-8a9b-0c1d2e3f4a5c';

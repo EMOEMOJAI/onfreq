@@ -23,7 +23,7 @@ const operator = (path: string, method: string, headers: Record<string, string> 
 const confirmDelete = () => operator('/gca-history/records/delete', 'POST', { 'x-onfreq-confirm': 'delete-gca-records' });
 const reasons = () => errors.mock.calls.map(([line]) => JSON.parse(String(line)).reason as string);
 
-async function publish(baseVersion: string | null, approvals: object = { 100001: [{ level: 3, region: 'HK' }] }) {
+async function publish(baseVersion: string | null, approvals: object = { 100001: [{ level: 3, region: 'AA' }] }) {
   return viaWorker(await put(recordBody({ approvals, baseVersion })));
 }
 
@@ -52,13 +52,13 @@ describe('validation through HTTP', () => {
     ['an extra field', recordBody({ extra: 1 }), 'unknown_field'],
     ['a bad VID', recordBody({ approvals: { '0100001': [] } }), 'invalid_records'],
     ['an unknown region', recordBody({ approvals: { 100001: [{ level: 1, region: 'ZZ' }] } }), 'invalid_records'],
-    ['level 0', recordBody({ approvals: { 100001: [{ level: 0, region: 'HK' }] } }), 'invalid_records'],
-    ['level 4', recordBody({ approvals: { 100001: [{ level: 4, region: 'HK' }] } }), 'invalid_records'],
-    ['level 1.5', recordBody({ approvals: { 100001: [{ level: 1.5, region: 'HK' }] } }), 'invalid_records'],
-    ['override "ph"', recordBody({ homeOverrides: { 100001: 'ph' } }), 'invalid_records'],
+    ['level 0', recordBody({ approvals: { 100001: [{ level: 0, region: 'AA' }] } }), 'invalid_records'],
+    ['level 4', recordBody({ approvals: { 100001: [{ level: 4, region: 'AA' }] } }), 'invalid_records'],
+    ['level 1.5', recordBody({ approvals: { 100001: [{ level: 1.5, region: 'AA' }] } }), 'invalid_records'],
+    ['override "ab"', recordBody({ homeOverrides: { 100001: 'ab' } }), 'invalid_records'],
     ['override "ZZ"', recordBody({ homeOverrides: { 100001: 'ZZ' } }), 'invalid_records'],
     ['> 2000 VIDs', recordBody({ approvals: vids(2001) }), 'too_many_vids'],
-    ['> 8 approvals', recordBody({ approvals: { 100001: Array(9).fill({ level: 1, region: 'HK' }) } }), 'too_many_approvals'],
+    ['> 8 approvals', recordBody({ approvals: { 100001: Array(9).fill({ level: 1, region: 'AA' }) } }), 'too_many_approvals'],
     ['{} without confirmEmpty', recordBody({ approvals: {} }), 'empty_requires_confirm'],
     ['baseVersion 1 (a number)', recordBody({ baseVersion: 1 }), 'invalid_base_version'],
   ];
@@ -118,7 +118,7 @@ describe('versioning and response JSON types', () => {
     expect(stored.version).toMatch(VERSION);
     expect(stored.digest).toMatch(DIGEST);
     expect(stored.updatedAt).toBe(new Date(START).toISOString());
-    expect(stored.digest).toBe(await sha256('{"approvals":{"100001":[{"level":3,"region":"HK"}]},"homeOverrides":{}}'));
+    expect(stored.digest).toBe(await sha256('{"approvals":{"100001":[{"level":3,"region":"AA"}]},"homeOverrides":{}}'));
     // The success log: version and counts only, no part of the digest (T1-4 F9a).
     expect(infos.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual({
       event: 'gca_records_updated', version: stored.version, counts: { approvals: 1, homeOverrides: 0 },
@@ -128,7 +128,7 @@ describe('versioning and response JSON types', () => {
     expect(retry.status).toBe(409);
     expect(await retry.json()).toEqual({ currentVersion: stored.version, currentDigest: stored.digest });
     now += 1000;
-    const next = await publish(stored.version, { 100002: [{ level: 1, region: 'PH' }] });
+    const next = await publish(stored.version, { 100002: [{ level: 1, region: 'AB' }] });
     expect(next.status).toBe(200);
     const updated = await next.json() as { version: string };
     expect(BigInt(updated.version)).toBeGreaterThan(BigInt(stored.version));
@@ -150,7 +150,7 @@ describe('versioning and response JSON types', () => {
     });
     expect(Object.keys(body).sort()).toEqual(['counts', 'digest', 'source', 'updatedAt', 'version']);
     now += 1000;
-    await publish('1', { 100002: [{ level: 1, region: 'PH' }] });
+    await publish('1', { 100002: [{ level: 1, region: 'AB' }] });
     const purged = await viaWorker(await purge());
     expect(await purged.json()).toEqual({ ok: true, kept: 1 });
     expect(await recordRows()).toMatchObject({ current: 1, history: 1 });
@@ -319,7 +319,7 @@ describe('T1-4 F7: the 64 KiB body cap before the VID cap', () => {
     const stored = await first.json() as { version: string; digest: string };
     const before = await (await viaWorker(await meta())).json();
     // 1,800 synthetic VIDs with one approval each: within the VID cap, over the byte cap.
-    const approvals = Object.fromEntries(Array.from({ length: 1800 }, (_, i) => [String(1_000_001 + i), [{ level: 3, region: 'HK' }]]));
+    const approvals = Object.fromEntries(Array.from({ length: 1800 }, (_, i) => [String(1_000_001 + i), [{ level: 3, region: 'AA' }]]));
     const body = recordBody({ approvals, baseVersion: stored.version });
     expect(Object.keys(approvals).length).toBeLessThan(2000);
     expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(64 * 1024);

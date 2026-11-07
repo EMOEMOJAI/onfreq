@@ -97,7 +97,7 @@ beforeEach(() => {
     if (url === 'https://api.ivao.aero/v2/oauth/token') return Response.json({ access_token: 'test-ivao-token', expires_in: 1800 });
     if (url.startsWith('https://api.ivao.aero/v2/users/')) return Response.json({ countryId: 'US' });
     // An unmonitored controller distinguishes zero regional coverage from a feed outage.
-    if (url === IVAO_ATC_SUMMARY_URL) return Response.json([entry('EGLL_TWR', 100, 1), ...feed]);
+    if (url === IVAO_ATC_SUMMARY_URL) return Response.json([entry('JZZZ_TWR', 100, 1), ...feed]);
     if (url.includes('/guilds/') && url.includes('/members?')) {
       await onMemberList?.();
       return Response.json([VID, OTHER].map((vid, i) => ({

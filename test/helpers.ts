@@ -5,6 +5,12 @@ import worker from '../src/index';
 import { COORDINATOR_NAME } from '../src/config';
 import { ensureGcaSchema } from '../src/gca';
 
+/**
+ * Options for `vi.waitFor` on real timers: its default 1 s limit is too short
+ * for a loaded machine, so a wait fails only well inside the 30 s test timeout.
+ */
+export const WAIT = { timeout: 10_000 } as const;
+
 /** Bearer header matching the synthetic POLL_SECRET binding in vitest.config.ts (/poll, /health). */
 export const AUTH_HEADERS = { authorization: 'Bearer synthetic-poll-secret-for-vitest-only' } as const;
 

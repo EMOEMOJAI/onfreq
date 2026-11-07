@@ -2,8 +2,12 @@ import { cloudflareTest } from '@cloudflare/vitest-plugin';
 import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
-  // Scratch work under the ignored .local/ must never change the test gate.
-  test: { exclude: [...configDefaults.exclude, '.local/**', '.wrangler/**'] },
+  test: {
+    // Scratch work under the ignored .local/ must never change the test gate.
+    exclude: [...configDefaults.exclude, '.local/**', '.wrangler/**'],
+    // Durable Object scenarios run many polls each; a loaded machine must not time them out at 5 s.
+    testTimeout: 30_000,
+  },
   plugins: [cloudflareTest({
     wrangler: { configPath: './wrangler.jsonc' },
     remoteBindings: false,

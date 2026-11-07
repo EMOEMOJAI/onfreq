@@ -11,7 +11,7 @@ import {
 import { runPoll } from '../src/poll';
 import { loadPendingOffline, loadSessions } from '../src/state';
 import type { IvaoAtcSummaryEntry, PendingOffline, StateMap, TrackedAtc } from '../src/types';
-import { seedGca } from './helpers';
+import { seedGca, WAIT } from './helpers';
 
 // Entirely synthetic members, connections and Discord IDs.
 const START = Date.parse('2026-10-01T10:00:00Z');
@@ -280,12 +280,16 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  if (!injectsFailure) expect(pollFailures).toEqual([]);
-  // A test may leave a due alarm (a webhook hint), which must not fire in the next one.
-  await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.deleteAlarm());
-  vi.restoreAllMocks();
-  vi.unstubAllGlobals();
-  await reset();
+  try {
+    if (!injectsFailure) expect(pollFailures).toEqual([]);
+  } finally {
+    // Cleanup runs even when that assertion fails, so no mock or storage leaks into the next test.
+    // A test may leave a due alarm (a webhook hint), which must not fire in the next one.
+    await runInDurableObject(stub(), (_instance, ctx) => ctx.storage.deleteAlarm());
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    await reset();
+  }
 });
 
 describe('short-session reminders: sending', () => {
@@ -1277,7 +1281,7 @@ describe('ROT-1: the coordinator around the DM step', () => {
     dmGate = hold.promise;
     const results = await withCoordinator(15, [], async (coordinator) => {
       const first = coordinator.poll();
-      await vi.waitFor(() => expect(held).toEqual(['dm']));
+      await vi.waitFor(() => expect(held).toEqual(['dm']), WAIT);
       dmGate = undefined;
       const joined = coordinator.poll();
       now += wait;
@@ -1296,7 +1300,7 @@ describe('ROT-1: the coordinator around the DM step', () => {
     injectsFailure = true;
     const results = await withCoordinator(5, [], async (coordinator) => {
       const first = coordinator.poll().catch((err: Error) => err.message);
-      await vi.waitFor(() => expect(held).toEqual(['feed']));
+      await vi.waitFor(() => expect(held).toEqual(['feed']), WAIT);
       const joined = coordinator.poll().catch((err: Error) => err.message);
       hold.resolve();
       return Promise.all([first, joined]);
@@ -1312,7 +1316,7 @@ describe('ROT-1: the coordinator around the DM step', () => {
     const before = feedCalls;
     const results = await withCoordinator(15, [entry('QCZZ_CTR', 700001, 125.1, 9)], async (coordinator) => {
       const first = coordinator.poll().catch((err: Error) => err.message);
-      await vi.waitFor(() => expect(held).toEqual(['dm']));
+      await vi.waitFor(() => expect(held).toEqual(['dm']), WAIT);
       dmGate = undefined;
       const joined = coordinator.poll().catch((err: Error) => err.message);
       now += 60_000;
@@ -1329,25 +1333,32 @@ describe('ROT-1: the coordinator around the DM step', () => {
     const dmHold = deferred();
     feedGate = feedHold.promise;
     dmGate = dmHold.promise;
+    const scheduled: number[] = [];
     const [beforeSave, duringDm, alarm] = await withCoordinator(15, [], async (coordinator, ctx) => {
+      // Recorded, not set: this simulated time is past on workerd's real clock, which would fire the alarm at once.
+      vi.spyOn(ctx.storage, 'setAlarm').mockImplementation((async (at: number | Date) => {
+        scheduled.push(Number(at));
+      }) as typeof ctx.storage.setAlarm);
       const first = coordinator.poll();
-      await vi.waitFor(() => expect(held).toEqual(['feed']));
+      await vi.waitFor(() => expect(held).toEqual(['feed']), WAIT);
       const dropped = await coordinator.requestEarlyPoll();
+      expect(scheduled).toEqual([]);
       feedGate = undefined;
       feedHold.resolve();
-      await vi.waitFor(() => expect(held).toEqual(['feed', 'dm']));
-      const scheduled = await coordinator.requestEarlyPoll();
+      await vi.waitFor(() => expect(held).toEqual(['feed', 'dm']), WAIT);
+      const hinted = await coordinator.requestEarlyPoll();
       const stored = await ctx.storage.getAlarm();
       dmGate = undefined;
       dmHold.resolve();
       await first;
-      return [dropped, scheduled, stored];
+      return [dropped, hinted, stored];
     });
     expect(beforeSave).toBeNull();
     // Scheduled, but reported as null while the poll is in flight, so the webhook starts no debounce (W2).
     expect(duringDm).toBeNull();
-    // Workerd moves an alarm already due on its real clock to now, so only its presence is compared.
-    expect(alarm).toEqual(expect.any(Number));
+    // Exactly one early poll, 30 s after the saved poll; no real alarm was left behind.
+    expect(scheduled).toEqual([ms(15) + 30_000]);
+    expect(alarm).toBeNull();
   });
 
   it.each([
@@ -1366,7 +1377,7 @@ describe('ROT-1: the coordinator around the DM step', () => {
       }) as typeof ctx.storage.setAlarm);
       await ctx.storage.put(EARLY_POLL_KEY, { hourStart: START, count: spent });
       const running = coordinator.alarm();
-      await vi.waitFor(() => expect(held).toEqual(['dm']));
+      await vi.waitFor(() => expect(held).toEqual(['dm']), WAIT);
       dmGate = undefined;
       const result = await coordinator.requestEarlyPoll();
       hold.resolve();
@@ -1410,7 +1421,7 @@ describe('ROT-1: the coordinator around the DM step', () => {
     dmGate = hold.promise;
     const busy = await withCoordinator(15, [], async (coordinator) => {
       const first = coordinator.poll();
-      await vi.waitFor(() => expect(held).toEqual(['dm']));
+      await vi.waitFor(() => expect(held).toEqual(['dm']), WAIT);
       const during = coordinator.cleanupGcaHistory(false);
       dmGate = undefined;
       hold.resolve();

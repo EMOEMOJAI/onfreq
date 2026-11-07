@@ -8,7 +8,7 @@ import {
 import { PollCoordinator, resetEarlyPollLogForTests, type PollSnapshot } from '../src/coordinator';
 import { resetTokenCache } from '../src/ivao';
 import { resetWebhookDebounceForTests, resetWebhookLogForTests, resetWebhookSeenEventsForTests } from '../src/webhook';
-import { AUTH_HEADERS } from './helpers';
+import { AUTH_HEADERS, WAIT } from './helpers';
 
 // Simulated time stays well ahead of the real clock and starts on an hour, so
 // a scheduled alarm only ever runs through runDurableObjectAlarm.
@@ -44,7 +44,7 @@ beforeEach(() => {
     }
     // One unmonitored controller: a reachable feed with nothing to announce.
     return Response.json([{
-      id: 1, userId: 100, callsign: 'EGLL_TWR', atcSession: { frequency: 118.1, position: 'TWR' },
+      id: 1, userId: 100, callsign: 'JZZZ_TWR', atcSession: { frequency: 118.1, position: 'TWR' },
       atcPosition: { atcCallsign: 'Test Station' }, subcenter: null,
     }]);
   });
@@ -321,9 +321,12 @@ function holdFirstCardPost(): { posting: Promise<void>; release: () => void } {
   return { posting: ready, release };
 }
 
-/** Resolves to 'blocked' if `promise` has not settled within a second. */
+/**
+ * Resolves to 'blocked' if `promise` has not settled within 5 s: a call that
+ * waits on the held poll never settles, so only a slow machine is tolerated.
+ */
 const settlesSoon = <T>(promise: Promise<T>) =>
-  Promise.race([promise, new Promise<'blocked'>((resolve) => { setTimeout(() => resolve('blocked'), 1_000); })]);
+  Promise.race([promise, new Promise<'blocked'>((resolve) => { setTimeout(() => resolve('blocked'), 5_000); })]);
 
 describe('a hint while a poll is in flight', () => {
   it.each([
@@ -499,7 +502,7 @@ describe('early poll alarm', () => {
       try {
         await ready;
         const scheduled = instance.poll({ recordHeartbeat: true });
-        await vi.waitFor(async () => expect(await ctx.storage.get(SCHEDULER_SEEN_KEY)).toBe(T0));
+        await vi.waitFor(async () => expect(await ctx.storage.get(SCHEDULER_SEEN_KEY)).toBe(T0), WAIT);
         release!();
         await expect(scheduled).resolves.toEqual({ skipped: true });
       } finally {

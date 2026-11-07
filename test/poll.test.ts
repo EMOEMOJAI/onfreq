@@ -16,7 +16,7 @@ import { buildOnlineEmbed, messageNonce, type DiscordEmbed } from '../src/discor
 import { REQUEST_TIMEOUT_MS } from '../src/http';
 import { resetTokenCache } from '../src/ivao';
 import type { IvaoAtcSummaryEntry, PendingOffline, StateMap, TrackedAtc } from '../src/types';
-import { AUTH_HEADERS, BOT_ID, BOT_TOKEN, snowflakeAt } from './helpers';
+import { AUTH_HEADERS, BOT_ID, BOT_TOKEN, snowflakeAt, WAIT } from './helpers';
 
 const START = Date.parse('2026-09-06T10:00:00Z');
 const stub = () => env.POLL_COORDINATOR.getByName(COORDINATOR_NAME);
@@ -1371,7 +1371,7 @@ describe('polling through the Durable Object', () => {
     // Hold the feed request until the second trigger has reached the coordinator.
     const calls = vi.spyOn(PollCoordinator.prototype, 'poll');
     const results = Promise.all([stub().poll(), stub().poll()]);
-    await vi.waitFor(() => expect(calls).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(calls).toHaveBeenCalledTimes(2), WAIT);
     release();
     expect(await results).toEqual([{ skipped: false }, { skipped: true }]);
     expect(network.mock.calls.filter(([url]) => url === IVAO_ATC_SUMMARY_URL)).toHaveLength(1);
@@ -1724,14 +1724,15 @@ describe('polling through the Durable Object', () => {
       }
       return original(input, init);
     });
+    // Only the run with the injected failure may reject; every later run must resolve.
     const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
       ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
-    }).poll().catch(() => undefined));
+    }).poll());
     await seed({});
     feed = [entry(a)];
     failures.add('POST');
     failureStatus = 503;
-    await run();
+    await run().catch(() => undefined);
     failures.clear();
     feed = [];
     for (let i = 0; i < 3; i++) {
@@ -1774,14 +1775,15 @@ describe('polling through the Durable Object', () => {
       }
       return original(input, init);
     });
+    // Only the run with the injected failure may reject; every later run must resolve.
     const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
       ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
-    }).poll().catch(() => undefined));
+    }).poll());
     await seed({});
     feed = [entry(a)];
     failures.add('POST');
     failureStatus = 503;
-    await run();
+    await run().catch(() => undefined);
     failures.clear();
     now += 60_000;
     await run();
@@ -1877,7 +1879,7 @@ describe('polling through the Durable Object', () => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
       const pending = run().catch((err: unknown) => err);
       // Run the in-request 5xx retry backoff in the object's I/O context.
-      await vi.waitFor(() => expect(lookups()).toBe(1));
+      await vi.waitFor(() => expect(lookups()).toBe(1), WAIT);
       for (let i = 1; i < 4; i++) {
         await runInDurableObject(stub(), () => vi.advanceTimersByTimeAsync(2_000).then(() => undefined));
       }
@@ -2218,9 +2220,10 @@ describe('polling through the Durable Object', () => {
       }
       return original(input, init);
     });
+    // Only the run with the injected failure may reject; every later run must resolve.
     const run = () => runInDurableObject(stub(), (_instance, ctx) => new PollCoordinator(ctx, {
       ...env, DISCORD_BOT_TOKEN: BOT_TOKEN,
-    }).poll().catch(() => undefined));
+    }).poll());
     await seed({
       [a]: session(a), [b]: { ...session(b, START - 30_000), messages: [{ channelId: channel, messageId: cardB }] },
       [c]: session(c, START - 90_000),
@@ -2233,7 +2236,7 @@ describe('polling through the Durable Object', () => {
     failureStatus = 403;
     feed = [entry(a, 121.7), entry(b), entry(c)];
     now += 60_000;
-    await run();
+    await run().catch(() => undefined);
     expect((await stub().getState())?.[b]?.messages).toEqual([]);
     expect(Object.keys((await stub().getState())?.[b]?.uncertainPosts ?? {})).toEqual([channel]);
     expect(cards.has(cardB)).toBe(true);
@@ -2666,7 +2669,7 @@ describe('polling through the Durable Object', () => {
       init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason));
     }));
     const pending = poll();
-    await vi.waitFor(() => expect(network).toHaveBeenCalled());
+    await vi.waitFor(() => expect(network).toHaveBeenCalled(), WAIT);
     // Run the timeout callback in the object's I/O context, just as a real
     // timer does; advancing it from the test's context cannot abort its fetch.
     await runInDurableObject(stub(), () => vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS).then(() => undefined));

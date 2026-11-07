@@ -527,6 +527,8 @@ describe('messageNonce', () => {
 
 describe('REST calls', () => {
   afterEach(() => {
+    // Restores spies such as the setTimeout spy, which would otherwise outlive its test.
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 

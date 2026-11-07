@@ -720,6 +720,8 @@ test('public deploy guard checks every worktree Git lists, in any layout, and fa
 
 test('public deploy guard refuses entries it cannot read (T2-4 B5)', (t) => {
   if (typeof process.getuid !== 'function' || process.getuid() === 0) {
+    // In CI a skip would hide that the guard's permission checks never ran.
+    assert.ok(!process.env.CI, 'CI must run this test as a non-root user on a POSIX platform');
     t.skip('permissions cannot be simulated on this platform or as root');
     return;
   }

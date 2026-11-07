@@ -19,12 +19,12 @@ export const NEXT_KEY = 'synthetic-gca-admin-next-key-0002-abcdef';
 export const START = 1_767_225_600_000;
 export const ORIGIN = 'https://example.com';
 
-/** Fictional coverage naming the fixed vectors' regions. */
+/** Fictional coverage naming the fixed vectors' synthetic regions. */
 export const VECTOR_REGIONS = JSON.stringify({
-  HK: { name: 'Example One', prefixes: ['XA'] },
-  KR: { name: 'Example Two', prefixes: ['XB'] },
-  PH: { name: 'Example Three', prefixes: ['XC'] },
-  TW: { name: 'Example Four', prefixes: ['XD'] },
+  AA: { name: 'Example One', prefixes: ['XA'] },
+  AB: { name: 'Example Three', prefixes: ['XC'] },
+  AC: { name: 'Example Two', prefixes: ['XB'] },
+  AD: { name: 'Example Four', prefixes: ['XD'] },
 });
 
 const encode = (text: string) => new TextEncoder().encode(text);
@@ -116,5 +116,5 @@ export function recordRows() {
 
 /** A PUT body: the vector record by default, with overrides. */
 export const recordBody = (overrides: Record<string, unknown> = {}) => JSON.stringify({
-  approvals: { 100001: [{ level: 3, region: 'HK' }] }, homeOverrides: {}, baseVersion: null, ...overrides,
+  approvals: { 100001: [{ level: 3, region: 'AA' }] }, homeOverrides: {}, baseVersion: null, ...overrides,
 });

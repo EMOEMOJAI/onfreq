@@ -99,15 +99,15 @@ describe('canonical JSON and digest', () => {
   it('reproduces the fixed shared vector exactly', async () => {
     const record: GcaRecords = {
       approvals: {
-        '100001': [{ level: 3, region: 'HK' }], '100002': [{ level: 1, region: 'PH' }, { level: 2, region: 'KR' }],
-        '4294967297': [], '99999': [{ level: 1, region: 'TW' }],
+        '100001': [{ level: 3, region: 'AA' }], '100002': [{ level: 1, region: 'AB' }, { level: 2, region: 'AC' }],
+        '4294967297': [], '99999': [{ level: 1, region: 'AD' }],
       },
-      homeOverrides: { '100002': 'PH' },
+      homeOverrides: { '100002': 'AB' },
     };
     const canonical = canonicalGcaRecords(record);
-    expect(canonical).toBe('{"approvals":{"100001":[{"level":3,"region":"HK"}],"100002":[{"level":1,"region":"PH"},' +
-      '{"level":2,"region":"KR"}],"4294967297":[],"99999":[{"level":1,"region":"TW"}]},"homeOverrides":{"100002":"PH"}}');
-    expect(await sha256Hex(canonical)).toBe('e043e384c114c723818cfdb61df29ec0dcc76ed834bceb76ea6ff60ffaa8d68c');
+    expect(canonical).toBe('{"approvals":{"100001":[{"level":3,"region":"AA"}],"100002":[{"level":1,"region":"AB"},' +
+      '{"level":2,"region":"AC"}],"4294967297":[],"99999":[{"level":1,"region":"AD"}]},"homeOverrides":{"100002":"AB"}}');
+    expect(await sha256Hex(canonical)).toBe('cb3fc08995ac559f69196f1a11c2fdf9204f869b6dfd744a6db7e4d83caafb7b');
   });
 
   it('sorts keys by UTF-16 code units whatever the input order, with the exact item shape', async () => {
@@ -158,7 +158,7 @@ describe('strict body validation', () => {
     ['level 4', body({ approvals: { 100001: [{ level: 4, region: 'AA' }] } }), 'invalid_records'],
     ['level 1.5', body({ approvals: { 100001: [{ level: 1.5, region: 'AA' }] } }), 'invalid_records'],
     ['a string level', body({ approvals: { 100001: [{ level: '1', region: 'AA' }] } }), 'invalid_records'],
-    ['override "ph"', body({ homeOverrides: { 100001: 'ph' } }), 'invalid_records'],
+    ['override "ab"', body({ homeOverrides: { 100001: 'ab' } }), 'invalid_records'],
     ['override "ZZ"', body({ homeOverrides: { 100001: 'ZZ' } }), 'invalid_records'],
     ['missing homeOverrides', JSON.stringify({ approvals: RECORD.approvals, baseVersion: null }), 'invalid_records'],
     ['confirmEmpty false', body({ confirmEmpty: false }), 'invalid_records'],
