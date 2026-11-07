@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { reset, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { COORDINATOR_NAME, IVAO_ATC_SUMMARY_URL, POLL_SNAPSHOT_KEY } from '../src/config';
+import { COORDINATOR_NAME, EARLY_POLL_KEY, IVAO_ATC_SUMMARY_URL, POLL_SNAPSHOT_KEY } from '../src/config';
 import { PollCoordinator, type PollSnapshot } from '../src/coordinator';
 import type { DiscordEmbed } from '../src/discord';
 import { DiscordRateLimits } from '../src/discord-rate-limit';
@@ -1344,9 +1344,45 @@ describe('ROT-1: the coordinator around the DM step', () => {
       return [dropped, scheduled, stored];
     });
     expect(beforeSave).toBeNull();
-    expect(duringDm).toEqual(expect.any(Number));
+    // Scheduled, but reported as null while the poll is in flight, so the webhook starts no debounce (W2).
+    expect(duringDm).toBeNull();
     // Workerd moves an alarm already due on its real clock to now, so only its presence is compared.
     expect(alarm).toEqual(expect.any(Number));
+  });
+
+  it.each([
+    [0, true],
+    [19, false],
+  ])('C4: a webhook hint during the DM step of an alarm-started poll (%i early polls spent this hour)', async (spent, schedules) => {
+    await shortSession();
+    const hold = deferred();
+    dmGate = hold.promise;
+    const before = feedCalls;
+    const scheduled: number[] = [];
+    const hint = await withCoordinator(15, [], async (coordinator, ctx) => {
+      // Recorded, not set: this simulated time is past on workerd's real clock, which would fire the alarm at once.
+      vi.spyOn(ctx.storage, 'setAlarm').mockImplementation((async (at: number | Date) => {
+        scheduled.push(Number(at));
+      }) as typeof ctx.storage.setAlarm);
+      await ctx.storage.put(EARLY_POLL_KEY, { hourStart: START, count: spent });
+      const running = coordinator.alarm();
+      await vi.waitFor(() => expect(held).toEqual(['dm']));
+      dmGate = undefined;
+      const result = await coordinator.requestEarlyPoll();
+      hold.resolve();
+      await running;
+      return result;
+    });
+    expect(hint).toBeNull();
+    // 30 s after the saved alarm poll; none when that poll is the hour's 20th early poll.
+    expect(scheduled).toEqual(schedules ? [ms(15) + 30_000] : []);
+    expect(feedCalls - before).toBe(1);
+    expect(await storageGet(EARLY_POLL_KEY)).toEqual({ hourStart: START, count: spent + 1 });
+    if (!schedules) return;
+    // The scheduled early poll runs when its alarm fires.
+    await withCoordinator(15.5, [], (coordinator) => coordinator.alarm());
+    expect(feedCalls - before).toBe(2);
+    expect(await storageGet(EARLY_POLL_KEY)).toEqual({ hourStart: START, count: spent + 2 });
   });
 
   it('a throw from short-session delivery is logged, leaving the poll result and snapshot intact', async () => {

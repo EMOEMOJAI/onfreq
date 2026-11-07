@@ -29,14 +29,14 @@ export const SIGNATURE_TOLERANCE_SECONDS = 300;
 export const WEBHOOK_DEBOUNCE_MS = 15_000;
 
 /**
- * Handled event ids are remembered this long: a signature stays acceptable for
+ * Handled events are remembered this long: a signature stays acceptable for
  * SIGNATURE_TOLERANCE_SECONDS on either side of its timestamp, so a request
  * accepted now can be replayed for up to twice that. Hook0 timestamps are
  * whole seconds, so add one second.
  */
 export const WEBHOOK_SEEN_EVENT_TTL_MS = (2 * SIGNATURE_TOLERANCE_SECONDS + 1) * 1000;
 
-/** At most this many remembered event ids per isolate; the oldest is evicted first. */
+/** At most this many remembered event ids, and as many signatures, per isolate; the oldest is evicted first. */
 export const WEBHOOK_SEEN_EVENTS_MAX = 1_000;
 
 /** The headers every accepted signature must cover. */
@@ -91,35 +91,41 @@ function debounced(now: number): boolean {
 }
 
 /**
- * Handled event ids and their expiry (epoch ms), in insertion order. A replay
- * within the signature window is acknowledged without another coordinator
+ * Handled event ids and the verified `v1` values (hex) of their signatures,
+ * each with its expiry (epoch ms), in insertion order. Only events that asked
+ * for an early poll are remembered, so other network-wide traffic cannot push
+ * them out. A replay within the signature window, by event id or by a
+ * signature already used (the same signed content with its signed header
+ * values split differently), is acknowledged without another coordinator
  * call. Per isolate only, so another isolate may still handle a replay once.
- * Event ids are never logged.
+ * Neither is ever logged.
  */
 const seenEvents = new Map<string, number>();
+const seenSignatures = new Map<string, number>();
 
-/** Test-only: forget every handled event id. */
+/** Test-only: forget every handled event id and signature. */
 export function resetWebhookSeenEventsForTests(): void {
   seenEvents.clear();
+  seenSignatures.clear();
 }
 
-function seenRecently(id: string, now: number): boolean {
-  const expiry = seenEvents.get(id);
+function seenRecently(seen: Map<string, number>, key: string, now: number): boolean {
+  const expiry = seen.get(key);
   return expiry !== undefined && expiry > now;
 }
 
-function recordSeen(id: string, now: number): void {
-  for (const [seenId, expiry] of seenEvents) {
-    if (expiry <= now) seenEvents.delete(seenId);
+function recordSeen(seen: Map<string, number>, key: string, now: number): void {
+  for (const [seenKey, expiry] of seen) {
+    if (expiry <= now) seen.delete(seenKey);
   }
-  // Re-inserting moves an id to the newest position.
-  seenEvents.delete(id);
-  while (seenEvents.size >= WEBHOOK_SEEN_EVENTS_MAX) {
-    const oldest = seenEvents.keys().next().value;
+  // Re-inserting moves a key to the newest position.
+  seen.delete(key);
+  while (seen.size >= WEBHOOK_SEEN_EVENTS_MAX) {
+    const oldest = seen.keys().next().value;
     if (oldest === undefined) break;
-    seenEvents.delete(oldest);
+    seen.delete(oldest);
   }
-  seenEvents.set(id, now + WEBHOOK_SEEN_EVENT_TTL_MS);
+  seen.set(key, now + WEBHOOK_SEEN_EVENT_TTL_MS);
 }
 
 /**
@@ -188,7 +194,8 @@ export function parseHook0Signature(headers: Headers, nowSeconds: number): Signe
   }
   // Hook0's dot-joined format is ambiguous by design: values may contain '.',
   // so different header values can sign the same content. Accepted here
-  // because a verified request only ever causes one capped early poll.
+  // because a verified request only ever causes one capped early poll, and
+  // the replay cache also remembers the verified signature itself.
   return { prefix: `${t}.${h}.${values.join('.')}.`, signatures: signatures.map(hexBytes) };
 }
 
@@ -213,19 +220,29 @@ function hmacKey(secret: string): Promise<CryptoKey> {
 }
 
 /**
- * True when any `v1` value is the HMAC-SHA256 of the signed prefix followed
- * by the raw body bytes. `crypto.subtle.verify` compares in constant time.
+ * The first `v1` value that is the HMAC-SHA256 of the signed prefix followed
+ * by the raw body bytes, or null when none is. `crypto.subtle.verify`
+ * compares in constant time.
  */
-export async function verifyHook0Signature(secret: string, signed: SignedRequest, body: Uint8Array): Promise<boolean> {
+async function verifiedSignature(secret: string, signed: SignedRequest, body: Uint8Array): Promise<Uint8Array | null> {
   const prefix = new TextEncoder().encode(signed.prefix);
   const content = new Uint8Array(prefix.byteLength + body.byteLength);
   content.set(prefix);
   content.set(body, prefix.byteLength);
   const key = await hmacKey(secret);
   for (const signature of signed.signatures) {
-    if (await crypto.subtle.verify('HMAC', key, signature, content)) return true;
+    if (await crypto.subtle.verify('HMAC', key, signature, content)) return signature;
   }
-  return false;
+  return null;
+}
+
+/** True when any `v1` value verifies (see verifiedSignature). */
+export async function verifyHook0Signature(secret: string, signed: SignedRequest, body: Uint8Array): Promise<boolean> {
+  return (await verifiedSignature(secret, signed, body)) !== null;
+}
+
+function bytesHex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 /** The raw body, or null when it exceeds the cap, declared or streamed. */
@@ -267,8 +284,8 @@ function wantsEarlyPoll(eventType: string | null, body: Uint8Array, env: Env): b
  * configured secret, signature header, timestamp, signed headers, body size,
  * then the HMAC. Every verified event is acknowledged with 204, so IVAO does
  * not retry events this bot ignores. A coordinator failure is thrown, for the
- * caller's generic 503. Only an acknowledged event id is remembered: IVAO
- * retries a failed delivery with the same id.
+ * caller's generic 503. Only an acknowledged event that asked for an early
+ * poll is remembered: IVAO retries a failed delivery with the same id.
  */
 export async function handleWebhook(request: Request, env: Env): Promise<Response> {
   const secret = webhookSecret(env);
@@ -289,15 +306,20 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     logRejectionOnce('payload_too_large');
     return errorResponse('payload too large', 413);
   }
-  if (!(await verifyHook0Signature(secret, signed, body))) {
+  const verified = await verifiedSignature(secret, signed, body);
+  if (!verified) {
     logRejectionOnce('signature_mismatch');
     return errorResponse('unauthorized', 401);
   }
   // A signed required header, so always present.
   const eventId = request.headers.get('x-event-id') ?? '';
+  const signature = bytesHex(verified);
   const now = Date.now();
-  if (seenRecently(eventId, now)) return new Response(null, { status: 204 });
-  if (wantsEarlyPoll(request.headers.get('x-event-type'), body, env) && !debounced(now)) {
+  if (seenRecently(seenEvents, eventId, now) || seenRecently(seenSignatures, signature, now) ||
+      !wantsEarlyPoll(request.headers.get('x-event-type'), body, env)) {
+    return new Response(null, { status: 204 });
+  }
+  if (!debounced(now)) {
     // Cleared first, so a failed call never debounces the next event.
     earlyPollDebounce = undefined;
     const alarmAt = await getCoordinator(env).requestEarlyPoll();
@@ -305,6 +327,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
       earlyPollDebounce = { from: now, until: Math.min(now + WEBHOOK_DEBOUNCE_MS, alarmAt) };
     }
   }
-  recordSeen(eventId, now);
+  recordSeen(seenEvents, eventId, now);
+  recordSeen(seenSignatures, signature, now);
   return new Response(null, { status: 204 });
 }

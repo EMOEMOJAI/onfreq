@@ -4,7 +4,7 @@ import {
   MIN_POLL_INTERVAL_MS, MIN_POLL_SPACING_MS, MIN_SCHEDULED_POLL_SPACING_MS, POLL_SNAPSHOT_KEY, SCHEDULER_SEEN_KEY, SCHEDULER_SEEN_MIN_WRITE_MS,
   STATE_KEY,
 } from './config';
-import { runPoll } from './poll';
+import { runPoll, type PollOutcome } from './poll';
 import { sendShortSessionReminders, SHORT_SESSION_DM_BUDGET_MS } from './short-session';
 import type { PendingOffline, RosterMessage, RosterPostAttempt, StateMap } from './types';
 import { cleanupGcaCopies } from './retention';
@@ -32,6 +32,15 @@ export interface PollSnapshot {
   lastSuccessfulPollAt?: number;
   error?: string;
 }
+
+/**
+ * Compile-time check: every PollOutcome field except the never-persisted
+ * short-session handoff is a PollSnapshot field. persist() lists every
+ * PollSnapshot key, so together no outcome field can be dropped silently.
+ */
+type Assert<T extends true> = T;
+export type OutcomeFieldsPersisted = Assert<
+  [Exclude<keyof PollOutcome, keyof PollSnapshot | 'shortSession'>] extends [never] ? true : false>;
 
 export interface PollResult {
   skipped: boolean;
@@ -75,13 +84,18 @@ function within(at: unknown, now: number, windowMs: number): boolean {
   return typeof at === 'number' && now - at >= 0 && now - at < windowMs;
 }
 
-/** One object owns this bot's session state and serializes both trigger sources. */
 /** The poll in progress; `saved` once its snapshot is persisted (its DM step may still run). */
 interface InFlightPoll {
   promise: Promise<PollResult>;
+  kind: PollKind;
+  /** The division feed has been fetched: a later hint is not covered by this poll. */
+  fetched: boolean;
+  /** A hint arrived after the feed fetch and before the save: schedule an early poll once saved. */
+  hintAfterFetch: boolean;
   saved: boolean;
 }
 
+/** One object owns this bot's session state and serializes both trigger sources. */
 export class PollCoordinator extends DurableObject<Env> {
   private inFlight?: InFlightPoll;
 
@@ -113,20 +127,34 @@ export class PollCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * A verified webhook hint: schedule one earlier poll through the alarm, at
-   * least EARLY_POLL_DELAY_MS from now and MIN_POLL_SPACING_MS after the last
-   * poll. A pending alarm that a later poll has made a guaranteed skip is
-   * recomputed, and cleared when nothing should be scheduled. No-op while a poll runs, when a live cron's next poll that will
-   * actually run is about as soon, or once this hour's early-poll budget is
-   * spent. Without a recent heartbeat (a stopped cron) the early poll always
-   * helps. Resolves to the pending alarm's time (epoch ms), whether just set
-   * or already set, or null for every no-op.
+   * A verified webhook hint. While a poll is in flight this never waits for
+   * it and always resolves to null, so the webhook starts no debounce: before
+   * the poll's feed fetch, that fetch covers the hint; after the fetch but
+   * before the save, the poll schedules an early poll once it has saved; after
+   * the save (its DM step may still run), one is scheduled now. Otherwise see
+   * scheduleEarlyPoll, whose result this resolves to.
    */
   async requestEarlyPoll(): Promise<number | null> {
+    const running = this.inFlight;
+    if (!running) return this.scheduleEarlyPoll();
+    if (running.saved) await this.scheduleEarlyPoll(running.kind === 'early' ? 1 : 0);
+    else if (running.fetched) running.hintAfterFetch = true;
+    return null;
+  }
+
+  /**
+   * Schedule one earlier poll through the alarm, at least EARLY_POLL_DELAY_MS
+   * from now and MIN_POLL_SPACING_MS after the last poll. A pending alarm that
+   * a later poll has made a guaranteed skip is recomputed, and cleared when
+   * nothing should be scheduled. No-op when a live cron's next poll that will
+   * actually run is about as soon, or once this hour's early-poll budget is
+   * spent, counting `uncounted` early polls that ran but are not yet recorded
+   * (an in-flight alarm poll). Without a recent heartbeat (a stopped cron) the
+   * early poll always helps. Resolves to the pending alarm's time (epoch ms),
+   * whether just set or already set, or null for every no-op.
+   */
+  private async scheduleEarlyPoll(uncounted = 0): Promise<number | null> {
     const pending = await this.ctx.storage.getAlarm();
-    // Before the in-flight poll saves, its feed fetch still covers this hint;
-    // once it has saved (its DM step may still run), the hint is scheduled.
-    if (this.inFlight && !this.inFlight.saved) return pending;
     const snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
     const now = Date.now();
     // Future start times are not trusted, as in runOnce's throttle.
@@ -155,7 +183,7 @@ export class PollCoordinator extends DurableObject<Env> {
     }
     const budget = readBudget(await this.ctx.storage.get<EarlyPollBudget>(EARLY_POLL_KEY));
     const hour = hourStart(now);
-    if (budget?.hourStart === hour && budget.count >= EARLY_POLLS_PER_HOUR) {
+    if ((budget?.hourStart === hour ? budget.count : 0) + uncounted >= EARLY_POLLS_PER_HOUR) {
       if (loggedEarlyPollCappedHour !== hour) {
         loggedEarlyPollCappedHour = hour;
         console.error(JSON.stringify({ event: 'early_poll_capped' }));
@@ -207,7 +235,7 @@ export class PollCoordinator extends DurableObject<Env> {
       if (!retry || !joinedAfterSave) return { skipped: true };
       return this.serialized(kind, attempt, false);
     }
-    const run = { saved: false } as InFlightPoll;
+    const run = { kind, fetched: false, hintAfterFetch: false, saved: false } as InFlightPoll;
     // Cleared as soon as the poll settles, before any waiter resumes.
     run.promise = this.runOnce(kind, attempt, run).finally(() => {
       if (this.inFlight === run) this.inFlight = undefined;
@@ -251,7 +279,8 @@ export class PollCoordinator extends DurableObject<Env> {
    * Signed GCA records RPCs. The Worker verifies the signature, key id and
    * timestamp window before calling; each method re-checks the request's
    * shape, method and path, and consumes its nonce in the same transaction as
-   * any change. A poll in progress keeps the policy it loaded at its start.
+   * any change. A poll in progress keeps the policy it loaded once, after
+   * its feed fetch; a change applies from the next poll.
    */
   gcaRecordsWrite(request: GcaSignedRequest): Promise<GcaWriteResult> {
     return writeGcaRecords(this.ctx.storage, this.env, request);
@@ -304,7 +333,7 @@ export class PollCoordinator extends DurableObject<Env> {
     return { records, nextCursor: rows.length > 100 ? String(rows[99]!.cursor) : null };
   }
 
-  private async runOnce(kind: PollKind, attempt?: { ran: boolean }, run?: { saved: boolean }): Promise<PollResult> {
+  private async runOnce(kind: PollKind, attempt: { ran: boolean } | undefined, run: InFlightPoll): Promise<PollResult> {
     let snapshot = await this.ctx.storage.get<PollSnapshot>(POLL_SNAPSHOT_KEY);
     if (!snapshot) {
       snapshot = { state: await this.env.ATC_STATE.get<StateMap>(STATE_KEY, 'json') };
@@ -346,6 +375,7 @@ export class PollCoordinator extends DurableObject<Env> {
         previousRolePings: snapshot.rolePings,
         previousStateAt: snapshot.stateAt,
         previousPollStartedAt: snapshot.lastPollStartedAt,
+        onFetched: () => { run.fetched = true; },
       });
     } catch (err) {
       // runPoll threw (a config/precondition failure or any other error), so
@@ -368,7 +398,16 @@ export class PollCoordinator extends DurableObject<Env> {
     // No successful response or in-memory checkpoint precedes persistence.
     await this.persist({ ...outcome, stateAt: nowIso }, startedAt, scheduledAt,
       outcome.error ? snapshot.lastSuccessfulPollAt : Date.now(), outcome.error);
-    if (run) run.saved = true;
+    run.saved = true;
+    // A hint that arrived after the feed fetch: scheduled from the snapshot
+    // just saved, so the poll that just ran cannot make the alarm a skip.
+    if (run.hintAfterFetch) {
+      try {
+        await this.scheduleEarlyPoll(kind === 'early' ? 1 : 0);
+      } catch (err) {
+        console.error(JSON.stringify({ event: 'early_poll_schedule_failed', error: err instanceof Error ? err.name : typeof err }));
+      }
+    }
     // Optional short-session DMs run only after the snapshot is saved, still
     // inside the serialized poll, with a budget of their own.
     if (outcome.shortSession) {

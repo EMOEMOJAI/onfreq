@@ -32,6 +32,7 @@ let feed: IvaoAtcSummaryEntry[];
 let cards: { method: string; title: string }[];
 let dms: DiscordEmbed[];
 let onMemberList: (() => Promise<void>) | undefined;
+let onCardPost: (() => void) | undefined;
 let messageNumber: number;
 
 function entry(callsign: string, userId: number, id: number): IvaoAtcSummaryEntry {
@@ -88,6 +89,7 @@ beforeEach(() => {
   cards = [];
   dms = [];
   onMemberList = undefined;
+  onCardPost = undefined;
   messageNumber = 0;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input, init) => {
@@ -112,6 +114,7 @@ beforeEach(() => {
     }
     if (url.startsWith(`https://discord.com/api/v10/channels/${PUBLIC_CHANNEL}/messages`)) {
       const method = init?.method ?? 'GET';
+      if (method === 'POST') onCardPost?.();
       const payload = JSON.parse(String(init?.body)) as { embeds: DiscordEmbed[] };
       cards.push({ method, title: payload.embeds[0]!.title ?? '' });
       messageNumber += 1;
@@ -213,6 +216,64 @@ describe('stored GCA records in the poll', () => {
     await poll();
     expect(dms).toHaveLength(1);
     expect(postedTitle('XDBB_APP')).toMatch(/^🟢 .*XDBB_APP is now ONLINE/);
+  });
+
+  it('C4: a signed write on the live instance while its poll is in flight applies only from the next poll', async () => {
+    await poll();
+    const first = await publish({}, null);
+    let published: string | undefined;
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      pollCtx = ctx;
+      const live = new PollCoordinator(ctx, config());
+      onMemberList = async () => {
+        if (published) return;
+        // Mid-poll, after the policy was loaded: approve the controller through the live instance.
+        const result = await live.gcaRecordsWrite(signedPut({
+          approvals: { [VID]: [{ region: 'AD', level: 3 }] }, homeOverrides: {}, baseVersion: first,
+        }));
+        published = result.ok ? result.version : result.error;
+      };
+      feed = [entry('XDAA_APP', VID, 999)];
+      now += 60_000;
+      await expect(live.poll()).resolves.toEqual({ skipped: false });
+    });
+    expect(published).toBe('2');
+    expect(dms).toHaveLength(1);
+    expect(lastTitle()).toMatch(/^🔴 .*XDAA_APP/);
+    expect(await meta()).toMatchObject({ source: 'durable-object', version: '2' });
+    feed = [entry('XDBB_APP', VID, 1000)];
+    now += 60_000;
+    await poll();
+    expect(dms).toHaveLength(1);
+    expect(postedTitle('XDBB_APP')).toMatch(/^🟢 .*XDBB_APP is now ONLINE/);
+  });
+
+  it('C4: an operator delete on the live instance while its poll is in flight applies only from the next poll', async () => {
+    // The secrets would warn; the stored record approves the controller.
+    const secrets = { GCA_APPROVALS: '{}' };
+    await poll(secrets);
+    await publish({ [VID]: [{ region: 'AD', level: 3 }] }, null, secrets);
+    let deleted: unknown;
+    await runInDurableObject(stub(), async (_instance, ctx) => {
+      pollCtx = ctx;
+      const live = new PollCoordinator(ctx, config(secrets));
+      // Mid-poll, after the policy was loaded (the card carries its marker).
+      onCardPost = () => { deleted ??= live.gcaRecordsOperatorDelete(); };
+      feed = [entry('XDAA_APP', VID, 999)];
+      now += 60_000;
+      await expect(live.poll()).resolves.toEqual({ skipped: false });
+    });
+    expect(deleted).toEqual({ ok: true, deleted: 1, history: 1 });
+    // This poll kept the deleted record's approval.
+    expect(dms).toHaveLength(0);
+    expect(lastTitle()).toMatch(/^🟢 .*XDAA_APP/);
+    expect(await meta(secrets)).toMatchObject({ source: 'secrets', version: null });
+    // The next poll uses the secrets, which warn.
+    feed = [entry('XDBB_APP', VID, 1000)];
+    now += 60_000;
+    await poll(secrets);
+    expect(dms).toHaveLength(1);
+    expect(postedTitle('XDBB_APP')).toMatch(/^🔴 .*XDBB_APP is now ONLINE/);
   });
 
   it.each(['false', '', 'TRUE'])('with GCA_DM_ENABLED=%j a stored record drives neither reminders nor the marker', async (enabled) => {

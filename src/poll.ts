@@ -730,6 +730,8 @@ export interface RunPollOptions {
   previousStateAt?: string;
   /** Start of the coordinator's last poll (epoch ms), bounding `previousStateAt`. */
   previousPollStartedAt?: number;
+  /** Called once the division feed has been fetched: a later webhook hint is not covered by this poll. */
+  onFetched?: () => void;
 }
 
 /** Called only by the coordinator; all network and notification work is one poll. */
@@ -752,6 +754,7 @@ export async function runPoll(
   const presentVids: number[] = [];
   const presentSessions: { userId: number; sessionId: number }[] = [];
   const currentAll = await fetchDivisionAtc(prefixes, auth, presentVids, presentSessions);
+  options.onFetched?.();
 
   // Excluded callsigns (the EXCLUDED_CALLSIGNS list plus `xxxx_X_yyy`
   // special positions) never enter the notification pipeline. Prune them

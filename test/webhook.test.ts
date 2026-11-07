@@ -207,6 +207,54 @@ describe('Hook0 signature', () => {
     expect(rejectionLines()).toEqual([{ event: 'webhook_rejected', reason: 'signed_header_missing' }]);
   });
 
+  it.each([
+    ['signature_header_invalid', { header: (v1: string, t: string) => `t=${t},v1=${v1}` }],
+    ['signature_expired', { t: NOW_S - SIGNATURE_TOLERANCE_SECONDS - 1 }],
+    ['signed_headers_invalid', { h: 'content-type x-event-id' }],
+    ['signed_header_missing', { h: `${SIGNED} x-missing` }],
+  ])('W6: rejects %s without reading the body', async (reason, options) => {
+    const request = await signed(options as Signing);
+    await expectError(await send(request), 401, 'unauthorized');
+    expect(request.bodyUsed).toBe(false);
+    expect(rejectionLines()).toEqual([{ event: 'webhook_rejected', reason }]);
+  });
+
+  it('W6: reads the body of a request that passes the header checks (control)', async () => {
+    const request = await signed();
+    await expectAccepted(await send(request), 1);
+    expect(request.bodyUsed).toBe(true);
+  });
+
+  it('W6: verifies with the current secret after it changes, never with a cached key for the previous one', async () => {
+    const rotated = 'synthetic-ivao-webhook-rotated-secret-0001';
+    const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    await expectAccepted(await send(await signed({ eventId: id(1) })), 1);
+    const config = { IVAO_WEBHOOK_SECRET: rotated };
+    expect((await send(await signed({ eventId: id(2) }), config)).status).toBe(401);
+    expect((await send(await signed({ eventId: id(3), secret: rotated }), config)).status).toBe(204);
+    // And back again.
+    expect((await send(await signed({ eventId: id(4), secret: rotated }))).status).toBe(401);
+    expect((await send(await signed({ eventId: id(5) }))).status).toBe(204);
+    expect(rejectionLines()).toEqual([{ event: 'webhook_rejected', reason: 'signature_mismatch' }]);
+  });
+
+  it('W6: answers a generic 503 when the key import fails, and imports it again for the next request', async () => {
+    // A secret no earlier test used, so no key for it is cached.
+    const fresh = 'synthetic-ivao-webhook-import-failure-0001';
+    const config = { IVAO_WEBHOOK_SECRET: fresh };
+    const first = await signed({ secret: fresh });
+    const second = await signed({ secret: fresh, eventId: '00000000-0000-4000-8000-000000000002' });
+    const importKey = vi.spyOn(crypto.subtle, 'importKey').mockRejectedValueOnce(new Error('synthetic private import detail'));
+    const response = await send(first, config);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'coordinator unavailable' });
+    expect(requestEarlyPoll).not.toHaveBeenCalled();
+    await expectAccepted(await send(second, config), 1);
+    expect(importKey).toHaveBeenCalledTimes(2);
+    expect(rejectionLines()).toEqual([{ event: 'route_failed', route: '/ivao/webhook', error: 'Error' }]);
+    expect(JSON.stringify(log.mock.calls)).not.toContain('synthetic private');
+  });
+
   it('rejects a body changed by one byte', async () => {
     const tampered = STARTED.replace('"userId":100', '"userId":101');
     expect(tampered).toHaveLength(STARTED.length);
@@ -423,11 +471,37 @@ describe('replayed event ids', () => {
     await expectAccepted(await send(await signedAt(WEBHOOK_SEEN_EVENT_TTL_MS)), 2);
   });
 
-  it('also remembers ids of events that needed no early poll', async () => {
+  it('W4: does not remember ids of events that needed no early poll', async () => {
     const ended = { eventType: 'tracker.session.ended' };
     await expectAccepted(await send(await signed(ended)), 0);
-    // Same id, now signed as a start: still a replay.
-    await expectAccepted(await send(await signedAt(1_000)), 0);
+    // Same id, now signed as a start: a different signed event, handled.
+    await expectAccepted(await send(await signedAt(1_000)), 1);
+  });
+
+  it('W4: network-wide events that need no early poll cannot push a remembered id out', async () => {
+    await expectAccepted(await send(await signed({ eventId: id(0) })), 1);
+    const ended = { eventType: 'tracker.session.ended' };
+    for (let n = 1; n <= WEBHOOK_SEEN_EVENTS_MAX; n++) {
+      expect((await send(await signed({ ...ended, eventId: id(n) }))).status).toBe(204);
+    }
+    // Past the debounce: only the replay cache stops the replay.
+    await expectAccepted(await send(await signedAt(WEBHOOK_DEBOUNCE_MS, { eventId: id(0) })), 1);
+  });
+
+  it('W3: treats a verified signature already used, with its signed header values split differently, as a replay', async () => {
+    const h = 'x-event-type x-event-id x-extra';
+    const original = await signed({ h, eventId: id(1), extraHeaders: { 'x-extra': 'synthetic.value' } });
+    // Same signed content: "tracker.session.started.<id>.synthetic.value.", so the same v1 verifies.
+    const headers = new Headers(original.headers);
+    headers.set('x-event-id', `${id(1)}.synthetic`);
+    headers.set('x-extra', 'value');
+    await expectAccepted(await send(original), 1);
+    // Past the debounce, with a new event id: only the remembered signature stops it.
+    vi.spyOn(Date, 'now').mockReturnValue(NOW_S * 1000 + WEBHOOK_DEBOUNCE_MS);
+    await expectAccepted(await send(new Request(WEBHOOK_URL, { method: 'POST', headers, body: STARTED })), 1);
+    // A newly signed event is still handled.
+    await expectAccepted(await send(await signed({ eventId: id(2) })), 2);
+    expect(log).not.toHaveBeenCalled();
   });
 
   it('processes a retry with the same id after a 503, then remembers it', async () => {
@@ -439,9 +513,9 @@ describe('replayed event ids', () => {
 
   it(`keeps at most ${WEBHOOK_SEEN_EVENTS_MAX} ids, evicting the oldest first`, async () => {
     await expectAccepted(await send(await signed({ eventId: id(0) })), 1);
-    const ended = { eventType: 'tracker.session.ended' };
+    // Within the debounce: remembered without coordinator calls.
     for (let n = 1; n <= WEBHOOK_SEEN_EVENTS_MAX; n++) {
-      expect((await send(await signed({ ...ended, eventId: id(n) }))).status).toBe(204);
+      expect((await send(await signed({ eventId: id(n) }))).status).toBe(204);
     }
     // id(0) was evicted, so it is handled again; recording it evicts id(1).
     await expectAccepted(await send(await signedAt(WEBHOOK_DEBOUNCE_MS, { eventId: id(0) })), 2);

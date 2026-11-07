@@ -290,6 +290,123 @@ describe('requestEarlyPoll', () => {
   });
 });
 
+/**
+ * The feed shows one new monitored controller, so the poll posts a card after
+ * fetching the feed. The first card POST waits until `release` is called.
+ */
+function holdFirstCardPost(): { posting: Promise<void>; release: () => void } {
+  let posting!: () => void;
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => { posting = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let held = false;
+  network.mockImplementation(async (input, init) => {
+    const url = String(input);
+    if (url === IVAO_ATC_SUMMARY_URL) {
+      return Response.json([{
+        id: 2, userId: 101, callsign: 'QCTT_TWR', atcSession: { frequency: 118.1, position: 'TWR' },
+        atcPosition: { atcCallsign: 'Test Station' }, subcenter: null,
+      }]);
+    }
+    if (url.startsWith('https://discord.com/api/v10/channels/900000000000000001/messages')) {
+      if ((init?.method ?? 'GET') === 'POST' && !held) {
+        held = true;
+        posting();
+        await gate;
+      }
+      return Response.json({ id: '800000000000000001' });
+    }
+    throw new Error('Unexpected network request');
+  });
+  return { posting: ready, release };
+}
+
+/** Resolves to 'blocked' if `promise` has not settled within a second. */
+const settlesSoon = <T>(promise: Promise<T>) =>
+  Promise.race([promise, new Promise<'blocked'>((resolve) => { setTimeout(() => resolve('blocked'), 1_000); })]);
+
+describe('a hint while a poll is in flight', () => {
+  it.each([
+    ['no alarm pending', null],
+    ['a pending alarm the poll will make a skip', T0 + 10_000],
+  ])('W1: after the feed fetch (with %s), schedules an early poll once the poll saves, and it runs', async (_label, pending) => {
+    await seed({ state: {} });
+    if (pending !== null) await storage((ctx) => ctx.storage.setAlarm(pending));
+    const card = holdFirstCardPost();
+    await storage(async (ctx) => {
+      const instance = coordinator()(ctx);
+      const target = { ...env, POLL_COORDINATOR: { getByName: () => instance } as unknown as Env['POLL_COORDINATOR'] };
+      let settled = false;
+      const running = instance.poll({ recordHeartbeat: true }).finally(() => { settled = true; });
+      try {
+        await card.posting;
+        expect(feedFetches()).toBe(1);
+        now = T0 + 2_000;
+        // The webhook returns while the poll is still held, and starts no debounce.
+        const response = await settlesSoon(webhook(target));
+        expect(response).not.toBe('blocked');
+        expect((response as Response).status).toBe(204);
+        await expect(settlesSoon(instance.requestEarlyPoll())).resolves.toBeNull();
+        expect(settled).toBe(false);
+        expect(await ctx.storage.getAlarm()).toBe(pending);
+      } finally {
+        card.release();
+        await running;
+      }
+      // Scheduled from the saved poll start (T0), not from the stale pending alarm.
+      expect(await ctx.storage.getAlarm()).toBe(T0 + 30_000);
+    });
+    now = T0 + 30_000;
+    expect(await fireDueAlarm()).toBe(true);
+    expect(feedFetches()).toBe(2);
+    expect(await budget()).toEqual({ hourStart: T0, count: 1 });
+    expect(await snapshot()).toMatchObject({ lastPollStartedAt: T0 + 30_000, lastScheduledPollStartedAt: T0 });
+  });
+
+  it.each(['before', 'after'])('W2: resolves to null with an alarm pending, %s the feed fetch', async (when) => {
+    await seed({ state: {} });
+    await storage((ctx) => ctx.storage.setAlarm(T0 + 20_000));
+    const card = when === 'after' ? holdFirstCardPost() : undefined;
+    await storage(async (ctx) => {
+      const instance = coordinator()(ctx);
+      const ready = when === 'after' ? card!.posting : new Promise<void>((resolve) => { entered = resolve; });
+      const running = instance.poll();
+      try {
+        await ready;
+        await expect(instance.requestEarlyPoll()).resolves.toBeNull();
+        expect(await ctx.storage.getAlarm()).toBe(T0 + 20_000);
+      } finally {
+        if (card) card.release();
+        else release!();
+        await running;
+      }
+    });
+  });
+
+  it.each([
+    [18, T0 + 30_000, []],
+    [19, null, [{ event: 'early_poll_capped' }]],
+  ])('W1: a hint after the feed fetch of an alarm poll counts that poll against the budget (%i spent)', async (spent, expected, logged) => {
+    await seed({ state: {} });
+    await storage((ctx) => ctx.storage.put(EARLY_POLL_KEY, { hourStart: T0, count: spent }));
+    const card = holdFirstCardPost();
+    await storage(async (ctx) => {
+      const instance = coordinator()(ctx);
+      const running = instance.alarm();
+      try {
+        await card.posting;
+        await expect(instance.requestEarlyPoll()).resolves.toBeNull();
+      } finally {
+        card.release();
+        await running;
+      }
+      expect(await ctx.storage.getAlarm()).toBe(expected);
+    });
+    expect(await budget()).toEqual({ hourStart: T0, count: spent + 1 });
+    expect(lines()).toEqual(logged);
+  });
+});
+
 describe('early poll alarm', () => {
   it('runs a poll 30 s after a cron poll that the 55 s throttle would skip', async () => {
     await cron();
